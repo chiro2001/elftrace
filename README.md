@@ -57,6 +57,7 @@ make                          # 需要 gcc/as/ld/objcopy
 | DWARF 修补 | `src/dwarf.c` | PIE 程序的调试节地址加加载偏置（DWARF v4/v5） |
 | 查看器 | `src/dump.c` | `.elftrace` 人读 |
 | 检查点采集 | `src/trace.c` | perf 指令计数，每 N 条指令冻结采集一个检查点 + manifest |
+| COW 注入器 | `src/inject.c` | 冻结目标时注入 fork（两阶段：mmap 专用页+自跳转），目标停顿 ~100ns，内存快照从自旋的镜像代理异步读取 |
 
 ### 恢复流程（x86_64 stub）
 
@@ -98,6 +99,9 @@ tests/test_cpp.sh      # 进阶6/7：C++ 程序 real/baremetal/区间切片
 ## 已知限制
 
 - 单线程进程；不支持多线程（可采集但语义未定义）。
+- trace 的 COW 检查点：注入 fork 创建的镜像代理保持自旋（退出会破坏
+  perf 事件对目标的计数），由 trace 结束时统一回收；每检查点目标地址
+  空间增加一个 ~4KB 专用页。
 - baremetal 退出点为检查点粒度（trace 间隔），"第 N 条指令"取最近检查点
   PC，误差 < 间隔；若退出点恰在循环内，进程在首次执行到该指令时退出。
 - baremetal 的 brk 模拟只允许在冻结时堆边界内移动；mmap 返回 -ENOMEM，

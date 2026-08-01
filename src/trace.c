@@ -31,6 +31,8 @@
 #include "collect.h"
 #include "util.h"
 
+int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child);
+
 #define TRACE_DEFAULT_EVERY 100000000ULL   /* 每 1e8 条指令一个检查点 */
 #define RING_PAGES 5                        /* (1 + 2^k) 页 */
 
@@ -44,6 +46,9 @@ struct trace_ctx {
     size_t ring_size;
     uint64_t count;             /* 已记录的指令计数 */
     size_t ckpt_no;
+    size_t cow_ok, cow_fail;
+    pid_t *cow_children;
+    size_t n_cow_children;
 };
 
 static void perf_open(struct trace_ctx *tc)
@@ -111,11 +116,32 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
     char manifest[PATH_MAX];
     struct collect_snapshot sn = {.pid = tc->pid};
     FILE *f;
+    pid_t child = -1;
 
     if (!already_stopped && collect_interrupt(tc->pid) < 0)
         return;                 /* tracee 已退出 */
 
-    collect_state(tc->pid, &sn);
+    /* 轻量采集 (冻结 ~us): 寄存器/掩码/xstate/fds/段表 */
+    collect_state_light(tc->pid, &sn);
+
+    /* COW 注入: 目标 fork 镜像代理后立即恢复运行 */
+    if (inject_fork(tc->pid, &sn.regs, &child) == 0) {
+        tc->cow_ok++;
+        /* 从代理 (fork 时刻快照, 稳定) 读内存, 目标不受影响。
+           注意: 子进程保持 spin (退出会破坏 perf 事件对目标的计数),
+           由 trace 结束时统一回收 */
+        collect_memory(child, &sn);
+        tc->cow_children = xrealloc(tc->cow_children,
+                                    (tc->n_cow_children + 1) *
+                                    sizeof(pid_t));
+        tc->cow_children[tc->n_cow_children++] = child;
+        child = -1;
+    } else {
+        tc->cow_fail++;
+        /* 回退: 冻结期间读全量内存 (tracee 已在 ptrace-stop) */
+        collect_memory(tc->pid, &sn);
+        collect_resume(tc->pid);
+    }
 
     snprintf(path, sizeof(path), "%s/ckpt_%06zu.elftrace", tc->out, tc->ckpt_no);
     collect_write(&sn, path);
@@ -135,7 +161,9 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
             (unsigned long long)tc->count, (unsigned long long)sn.regs.rip);
 
     collect_free(&sn);
-    collect_resume(tc->pid);
+    if (tc->ckpt_no > 0 && tc->ckpt_no % 10 == 0)
+        fprintf(stderr, "trace: %zu checkpoints (cow %zu/%zu)\n",
+                tc->ckpt_no, tc->cow_ok, tc->cow_ok + tc->cow_fail);
     tc->ckpt_no++;
     tc->count += tc->every;
 }
@@ -195,6 +223,12 @@ int trace_main(int argc, char **argv)
                 ckpt_take(&tc, 0);
         } else if (r < 0 && errno != EINTR) {
             die("poll");
+        } else if (r == 0) {
+            uint64_t cnt = 0;
+            read(tc.perf_fd, &cnt, 8);
+            fprintf(stderr, "dbg: timeout cnt=%llu head=%llu\n",
+                    (unsigned long long)cnt,
+                    (unsigned long long)tc.meta->data_head);
         }
         /* tracee 是否还活着 */
         if (kill(pid, 0) < 0 && errno == ESRCH)
@@ -203,7 +237,11 @@ int trace_main(int argc, char **argv)
 
     collect_detach_run(pid);
     close(tc.perf_fd);
-    fprintf(stderr, "trace: done, %zu checkpoints in %s\n", tc.ckpt_no,
-            tc.out);
+    /* 回收所有 COW 代理 (此时 perf 已无用) */
+    for (size_t i = 0; i < tc.n_cow_children; i++)
+        kill(tc.cow_children[i], SIGKILL);
+    fprintf(stderr, "trace: done, %zu checkpoints (cow %zu/%zu, %zu agents) "
+            "in %s\n", tc.ckpt_no, tc.cow_ok, tc.cow_ok + tc.cow_fail,
+            tc.n_cow_children, tc.out);
     return 0;
 }

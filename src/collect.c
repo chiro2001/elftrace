@@ -142,7 +142,7 @@ static void collect_fds(struct collect_snapshot *sn)
 }
 
 /* ---- 采集内存段 ---- */
-static void collect_segments(struct collect_snapshot *sn)
+void collect_segments(struct collect_snapshot *sn)
 {
     char path[64];
     char line[1024];
@@ -599,7 +599,7 @@ int collect_freeze(pid_t pid)
     return 0;
 }
 
-void collect_state(pid_t pid, struct collect_snapshot *sn)
+void collect_state_light(pid_t pid, struct collect_snapshot *sn)
 {
     struct iovec iov;
     char path[64];
@@ -661,17 +661,8 @@ void collect_state(pid_t pid, struct collect_snapshot *sn)
     if (ptrace(PTRACE_GETSIGMASK, pid, sizeof(sn->sigmask), &iov) < 0)
         die("ptrace(GETSIGMASK) on %d", pid);
 
-    /* 内存段 */
+    /* 内存段 (仅解析 maps, 不读取) */
     collect_segments(sn);
-    sn->payload_offs = xcalloc(sn->nsegs, sizeof(uint64_t));
-    for (size_t i = 0; i < sn->nsegs; i++) {
-        uint8_t *tmp = xmalloc(sn->segs[i].memsz ? sn->segs[i].memsz : 1);
-        sn->segs[i].filesz = read_mem(pid, sn->segs[i].vaddr,
-                                      sn->segs[i].memsz, tmp, 1);
-        sn->payload_offs[i] = sn->payload.size;
-        cbuf_append(&sn->payload, tmp, sn->segs[i].filesz);
-        free(tmp);
-    }
 
     /* fd */
     collect_fds(sn);
@@ -688,6 +679,25 @@ void collect_state(pid_t pid, struct collect_snapshot *sn)
 
     /* 系统调用检测 */
     detect_in_syscall(sn);
+}
+
+void collect_memory(pid_t pid, struct collect_snapshot *sn)
+{
+    sn->payload_offs = xcalloc(sn->nsegs, sizeof(uint64_t));
+    for (size_t i = 0; i < sn->nsegs; i++) {
+        uint8_t *tmp = xmalloc(sn->segs[i].memsz ? sn->segs[i].memsz : 1);
+        sn->segs[i].filesz = read_mem(pid, sn->segs[i].vaddr,
+                                      sn->segs[i].memsz, tmp, 1);
+        sn->payload_offs[i] = sn->payload.size;
+        cbuf_append(&sn->payload, tmp, sn->segs[i].filesz);
+        free(tmp);
+    }
+}
+
+void collect_state(pid_t pid, struct collect_snapshot *sn)
+{
+    collect_state_light(pid, sn);
+    collect_memory(pid, sn);
 }
 
 int collect_interrupt(pid_t pid)

@@ -77,6 +77,11 @@ int collect_interrupt(pid_t pid);
 void collect_detach_run(pid_t pid);
 /* 采集全部状态 (要求 tracee 已冻结) */
 void collect_state(pid_t pid, struct collect_snapshot *sn);
+/* 采集轻量状态 (寄存器/掩码/xstate/fds/段表, 不含内存) */
+void collect_state_light(pid_t pid, struct collect_snapshot *sn);
+void collect_segments(struct collect_snapshot *sn);
+/* 采集内存段内容 (从指定进程读, 通常为 COW 代理) */
+void collect_memory(pid_t pid, struct collect_snapshot *sn);
 /* 写出 .elftrace */
 void collect_write(const struct collect_snapshot *sn, const char *out);
 /* 分离并保持冻结 (SIGSTOP + detach), 之后 SIGCONT 可唤醒 */
