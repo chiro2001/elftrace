@@ -194,8 +194,8 @@ void collect_segments(struct collect_snapshot *sn)
 }
 
 /* 从 /proc/<pid>/mem 读取一段内存, 返回实际读取字节数 (页粒度, 失败截断) */
-static size_t read_mem(pid_t pid, uint64_t vaddr, uint64_t size,
-                       uint8_t *out, int warn_on_partial)
+static size_t read_mem_dbg(pid_t pid, uint64_t vaddr, uint64_t size,
+                           uint8_t *out, int warn_on_partial, const char *tag)
 {
     char path[64];
     size_t got = 0;
@@ -218,10 +218,31 @@ static size_t read_mem(pid_t pid, uint64_t vaddr, uint64_t size,
         got += n;
     }
     close(fd);
-    if (warn_on_partial && got < size)
-        warn("segment %#llx read %zu of %llu bytes",
-             (unsigned long long)vaddr, got, (unsigned long long)size);
+    if (warn_on_partial && got < size) {
+        warn("segment %#llx read %zu of %llu bytes (from pid %d, tag %s)",
+             (unsigned long long)vaddr, got, (unsigned long long)size, pid,
+             tag);
+        char mp[64];
+        snprintf(mp, sizeof(mp), "/proc/%d/maps", pid);
+        FILE *mf = fopen(mp, "r");
+        if (mf) {
+            char ml[512];
+            while (fgets(ml, sizeof(ml), mf)) {
+                unsigned long long ms, me;
+                if (sscanf(ml, "%llx-%llx", &ms, &me) == 2 &&
+                    vaddr >= ms && vaddr < me)
+                    fprintf(stderr, "  proc map: %s", ml);
+            }
+            fclose(mf);
+        }
+    }
     return got;
+}
+
+static size_t read_mem(pid_t pid, uint64_t vaddr, uint64_t size,
+                       uint8_t *out, int warn_on_partial)
+{
+    return read_mem_dbg(pid, vaddr, size, out, warn_on_partial, "normal");
 }
 
 /* ---- 提取主可执行文件的调试节 + 分配节 ---- */
@@ -707,8 +728,8 @@ void collect_memory(pid_t pid, struct collect_snapshot *sn)
     sn->payload_offs = xcalloc(sn->nsegs, sizeof(uint64_t));
     for (size_t i = 0; i < sn->nsegs; i++) {
         uint8_t *tmp = xmalloc(sn->segs[i].memsz ? sn->segs[i].memsz : 1);
-        sn->segs[i].filesz = read_mem(pid, sn->segs[i].vaddr,
-                                      sn->segs[i].memsz, tmp, 1);
+        sn->segs[i].filesz = read_mem_dbg(pid, sn->segs[i].vaddr,
+                                          sn->segs[i].memsz, tmp, 1, "agent");
         sn->payload_offs[i] = sn->payload.size;
         cbuf_append(&sn->payload, tmp, sn->segs[i].filesz);
         free(tmp);

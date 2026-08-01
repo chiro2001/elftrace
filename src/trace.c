@@ -161,9 +161,9 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
             (unsigned long long)tc->count, (unsigned long long)sn.regs.rip);
 
     collect_free(&sn);
-    if (tc->ckpt_no > 0 && tc->ckpt_no % 10 == 0)
-        fprintf(stderr, "trace: %zu checkpoints (cow %zu/%zu)\n",
-                tc->ckpt_no, tc->cow_ok, tc->cow_ok + tc->cow_fail);
+    if (tc->ckpt_no > 0 && tc->ckpt_no % 5 == 0)
+        fprintf(stderr, "trace: %zu checkpoints (cow ok %zu, fail %zu)\n",
+                tc->ckpt_no, tc->cow_ok, tc->cow_fail);
     tc->ckpt_no++;
     tc->count += tc->every;
 }

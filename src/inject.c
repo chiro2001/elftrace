@@ -262,6 +262,20 @@ int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child)
     for (int i = 0; i < STAGE1_SIZE; i++)
         backup[i] = ptrace(PTRACE_PEEKDATA, pid, page1 + i, 0) & 0xff;
 
+    /* 记录已有子进程 (旧代理), 轮询时排除 */
+    pid_t old_children[32];
+    int n_old = 0;
+    {
+        char cpath[64];
+        snprintf(cpath, sizeof(cpath), "/proc/%d/task/%d/children", pid, pid);
+        FILE *cf = fopen(cpath, "r");
+        if (cf) {
+            while (n_old < 32 && fscanf(cf, "%d", &old_children[n_old]) == 1)
+                n_old++;
+            fclose(cf);
+        }
+    }
+
     /* 写入 stage1 代码 + stage2 副本 (页内偏移 0x80 起) */
     for (int i = 0; i < STAGE1_SIZE + STAGE2_SIZE; i += 8) {
         unsigned long w = 0;
@@ -285,7 +299,13 @@ int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child)
         FILE *f = fopen(path, "r");
         if (f) {
             int c;
-            if (fscanf(f, "%d", &c) == 1) {
+            while (fscanf(f, "%d", &c) == 1) {
+                int is_old = 0;
+                for (int k = 0; k < n_old; k++)
+                    if (old_children[k] == c)
+                        is_old = 1;
+                if (is_old)
+                    continue;       /* 旧代理: 跳过 */
                 char mpath[64];
                 snprintf(mpath, sizeof(mpath), "/proc/%d/mem", c);
                 int mfd = open(mpath, O_RDONLY);
@@ -302,7 +322,10 @@ int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child)
                     close(mfd);
                 }
             }
-            fclose(f);
+            if (!got)
+                fclose(f);
+            if (got)
+                break;
         }
         usleep(1000);
     }
