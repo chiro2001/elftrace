@@ -26,7 +26,7 @@
 #include <stdint.h>
 
 #define ELFTRACE_MAGIC          0x4554464C  /* "ELFT" (LE) */
-#define ELFTRACE_VERSION        1
+#define ELFTRACE_VERSION        2
 
 /* 架构 ID */
 #define ELFTRACE_ARCH_X86_64    1
@@ -72,6 +72,8 @@ typedef struct {
 
     uint64_t payload_off;       /* payload 偏移 */
     uint64_t payload_size;      /* payload 大小 */
+    uint64_t exe_bias;          /* PIE 加载偏置 (运行时基址 - 文件 p_vaddr),
+                                   用于调试节地址修正; 非 PIE 为 0 */
 } elftrace_hdr;
 
 /* 内存段 (40 字节) */

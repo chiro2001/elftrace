@@ -77,6 +77,7 @@ int dump_main(const char *path)
     printf("  sigacts      off=%#llx (%s)\n", (unsigned long long)h.sigacts_off,
            h.sigacts_off ? "present" : "none");
     printf("  exe          %s\n", h.exe_off ? str_at(f, &h, h.exe_off) : "<?>");
+    printf("  exe_bias     %#llx\n", (unsigned long long)h.exe_bias);
     printf("  segments     %llu\n", (unsigned long long)h.nsegs);
     printf("  fds          %llu\n", (unsigned long long)h.nfds);
     printf("  aux          %llu\n", (unsigned long long)h.aux_n);

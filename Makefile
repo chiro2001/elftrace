@@ -12,7 +12,7 @@ STUB_LD := $(SRC)/stub.ld
 
 TOOLS   := $(BUILD)/elftrace
 OBJS    := $(BUILD)/main.o $(BUILD)/util.o $(BUILD)/freeze.o \
-           $(BUILD)/build.o $(BUILD)/dump.o \
+           $(BUILD)/build.o $(BUILD)/dump.o $(BUILD)/dwarf.o \
            $(BUILD)/stub_blob_x86_64.o
 
 all: $(TOOLS)

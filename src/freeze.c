@@ -108,6 +108,7 @@ struct snapshot {
     size_t nfds;
 
     char *exe_path;
+    uint64_t exe_bias;          /* PIE 加载偏置 */
 
     struct auxent *aux;
     size_t naux;
@@ -215,14 +216,14 @@ static void collect_segments(struct snapshot *sn)
     while (fgets(line, sizeof(line), f)) {
         unsigned long long start, end;
         char perms[8], name[512];
-        int n = 0;
+        int n;
 
-        if (sscanf(line, "%llx-%llx %7s %*s %*s %*s %511[^\n]", &start, &end,
-                   perms, name) < 3) {
+        n = sscanf(line, "%llx-%llx %7s %*s %*s %*s %511[^\n]", &start, &end,
+                   perms, name);
+        if (n < 3)
             continue;
-        }
-        if (sscanf(line, "%llx-%llx %7s", &start, &end, perms) < 3)
-            continue;
+        if (n == 4 && name[0] == ' ')
+            memmove(name, name + 1, strlen(name));  /* 去掉路径前导空格 */
 
         /* 跳过内核管理区域 */
         if (strstr(name, "[vdso]") || strstr(name, "[vvar") ||
@@ -281,7 +282,10 @@ static size_t read_mem(pid_t pid, uint64_t vaddr, uint64_t size,
     return got;
 }
 
-/* ---- 提取主可执行文件的调试节 ---- */
+/* ---- 提取主可执行文件的调试节 + 分配节 ---- */
+int dwarf_patch_bias(uint8_t *data, size_t size, const char *name,
+                     uint64_t bias, const uint8_t *abbrev, size_t abbrev_size);
+
 static void collect_aux(struct snapshot *sn)
 {
     int fd;
@@ -289,7 +293,12 @@ static void collect_aux(struct snapshot *sn)
     Elf64_Shdr *sh = NULL;
     Elf64_Shdr shstr_sh;
     char *shstr = NULL;
+    uint8_t *debug_abbrev = NULL;
+    size_t debug_abbrev_size = 0;
     int cap = 8;
+    uint64_t file_base = 0;     /* 文件中第一个 PT_LOAD 的 p_vaddr */
+    uint64_t runtime_base = 0;  /* exe 在目标进程中的基址 */
+    int nph;
 
     if (!sn->exe_path)
         return;
@@ -310,6 +319,32 @@ static void collect_aux(struct snapshot *sn)
         return;
     }
 
+    /* 计算 PIE 加载偏置: runtime 基址 (最低 exe 映射) - 文件第一个 LOAD p_vaddr */
+    nph = eh.e_phnum;
+    for (int i = 0; i < nph; i++) {
+        Elf64_Phdr ph;
+        if (pread(fd, &ph, sizeof(ph), eh.e_phoff + i * sizeof(ph)) !=
+            sizeof(ph))
+            break;
+        if (ph.p_type == PT_LOAD) {
+            file_base = ph.p_vaddr;
+            break;
+        }
+    }
+    for (size_t i = 0; i < sn->nsegs; i++) {
+        if (sn->segs[i].name &&
+            strcmp(sn->segs[i].name, sn->exe_path) == 0 &&
+            (!runtime_base || sn->segs[i].vaddr < runtime_base))
+            runtime_base = sn->segs[i].vaddr;
+    }
+    if (runtime_base)
+        sn->exe_bias = runtime_base - file_base;
+    else
+        sn->exe_bias = 0;
+    fprintf(stderr, "aux: exe=%s file_base=%#llx runtime_base=%#llx bias=%#llx\n",
+            sn->exe_path, (unsigned long long)file_base,
+            (unsigned long long)runtime_base, (unsigned long long)sn->exe_bias);
+
     sh = xcalloc(eh.e_shnum, sizeof(Elf64_Shdr));
     if (pread(fd, sh, sizeof(Elf64_Shdr) * eh.e_shnum, eh.e_shoff) !=
         (ssize_t)(sizeof(Elf64_Shdr) * eh.e_shnum)) {
@@ -319,6 +354,31 @@ static void collect_aux(struct snapshot *sn)
     }
 
     sn->aux = xcalloc(cap, sizeof(struct auxent));
+
+    /* 预读 .debug_abbrev (供 .debug_info 解析) */
+    for (int i = 0; i < eh.e_shnum; i++) {
+        const char *name;
+        if (i == eh.e_shstrndx)
+            continue;
+        if (pread(fd, &shstr_sh, sizeof(shstr_sh), eh.e_shoff +
+                  eh.e_shstrndx * sizeof(Elf64_Shdr)) != sizeof(shstr_sh))
+            break;
+        shstr = xrealloc(shstr, shstr_sh.sh_size);
+        if (pread(fd, shstr, shstr_sh.sh_size, shstr_sh.sh_offset) !=
+            (ssize_t)shstr_sh.sh_size)
+            break;
+        if (sh[i].sh_name >= shstr_sh.sh_size)
+            continue;
+        name = shstr + sh[i].sh_name;
+        if (strcmp(name, ".debug_abbrev") == 0 && sh[i].sh_size) {
+            debug_abbrev = xmalloc(sh[i].sh_size);
+            if (pread(fd, debug_abbrev, sh[i].sh_size, sh[i].sh_offset) ==
+                (ssize_t)sh[i].sh_size)
+                debug_abbrev_size = sh[i].sh_size;
+            break;
+        }
+    }
+
     for (int i = 0; i < eh.e_shnum; i++) {
         const char *name;
         int keep = 0;
@@ -339,27 +399,62 @@ static void collect_aux(struct snapshot *sn)
         if (strncmp(name, ".debug", 6) == 0 || strcmp(name, ".symtab") == 0 ||
             strcmp(name, ".strtab") == 0 || strcmp(name, ".comment") == 0)
             keep = 1;
+        /* 运行时分配节: 供 gdb 对齐地址。跳过动态链接器相关节
+           (切片是静态的, 这些节只会让 gdb 困惑) */
+        if (sh[i].sh_flags & SHF_ALLOC) {
+            if (strncmp(name, ".note", 5) == 0 ||
+                strncmp(name, ".gnu", 4) == 0 ||
+                strncmp(name, ".rel", 4) == 0 ||
+                strncmp(name, ".dyn", 4) == 0 ||
+                strncmp(name, ".tdata", 6) == 0 ||
+                strncmp(name, ".tbss", 5) == 0 ||
+                strcmp(name, ".interp") == 0 || strcmp(name, ".plt") == 0 ||
+                strcmp(name, ".plt.got") == 0 || strcmp(name, ".plt.sec") == 0 ||
+                strcmp(name, ".got") == 0 || strcmp(name, ".got.plt") == 0 ||
+                strcmp(name, ".dynamic") == 0)
+                keep = 0;
+            else
+                keep = 1;
+        }
 
         if (!keep)
             continue;
 
         struct auxent a = {0};
         a.name = xstrdup(name);
-        a.addr = sh[i].sh_addr;
+        a.addr = sh[i].sh_addr + sn->exe_bias;
         a.size = sh[i].sh_size;
         a.type = sh[i].sh_type;
         a.flags = sh[i].sh_flags;
         a.align = sh[i].sh_addralign;
         a.entsize = sh[i].sh_entsize;
-        a.link = sh[i].sh_link;
+        /* 仅 SYMTAB 节需要 sh_link (指向 .strtab, 组装时重映射);
+           其余节在原文件中的 link 索引在新 ELF 中无效, 清零 */
+        a.link = (sh[i].sh_type == SHT_SYMTAB) ? sh[i].sh_link : 0;
         a.info = sh[i].sh_info;
         a.data = xmalloc(a.size ? a.size : 1);
-        if (a.size && pread(fd, a.data, a.size, sh[i].sh_offset) !=
-            (ssize_t)a.size) {
+        if (a.size && sh[i].sh_type != SHT_NOBITS &&
+            pread(fd, a.data, a.size, sh[i].sh_offset) != (ssize_t)a.size) {
             warn("short read on section %s", name);
             free(a.data);
             free(a.name);
             continue;
+        }
+        if (sh[i].sh_type == SHT_NOBITS)
+            memset(a.data, 0, a.size);
+        /* DWARF 地址偏置修补 (PIE) */
+        if (strncmp(name, ".debug", 6) == 0)
+            dwarf_patch_bias(a.data, a.size, name, sn->exe_bias,
+                             debug_abbrev, debug_abbrev_size);
+        /* symtab: 已定义符号地址加 bias */
+        if (sh[i].sh_type == SHT_SYMTAB && sn->exe_bias) {
+            for (uint64_t s = 0; s + sizeof(Elf64_Sym) <= a.size;
+                 s += sizeof(Elf64_Sym)) {
+                Elf64_Sym *sym = (Elf64_Sym *)(a.data + s);
+                if (sym->st_shndx != SHN_UNDEF && sym->st_shndx != SHN_ABS &&
+                    sym->st_shndx != SHN_COMMON)
+                    sym->st_value += sn->exe_bias;
+            }
         }
         if (sn->naux == (size_t)cap) {
             cap *= 2;
@@ -370,6 +465,7 @@ static void collect_aux(struct snapshot *sn)
     close(fd);
     free(sh);
     free(shstr);
+    free(debug_abbrev);
 }
 
 /* ---- 判断目标是否处于系统调用中 (rip-2 为 syscall 指令) ---- */
@@ -447,6 +543,7 @@ static void write_snapshot(const struct snapshot *sn, const char *out)
     h.flags = ELFTRACE_FLAG_NONE;
     h.entry_pc = sn->regs.rip;
     h.task_tid = sn->pid;
+    h.exe_bias = sn->exe_bias;
 
     off = sizeof(elftrace_hdr);
     h.regs_off = off;

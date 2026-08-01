@@ -136,6 +136,7 @@ int build_main(int argc, char **argv)
     const char *in = NULL;
     const char *out = "sliced.elf";
     uint64_t ipc_period = 0;
+    uint64_t breakpoint = 0;    /* 注入 int3 的地址 (0 = 无) */
     struct snap s = {0};
     int fd;
     struct buf blob;            /* 最终 blob (stub + 追加数据) */
@@ -153,14 +154,18 @@ int build_main(int argc, char **argv)
             out = argv[++i];
         } else if (strcmp(argv[i], "--ipc") == 0 && i + 1 < argc) {
             ipc_period = strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--breakpoint") == 0 && i + 1 < argc) {
+            breakpoint = strtoull(argv[++i], NULL, 0);
         } else if (argv[i][0] != '-') {
             in = argv[i];
         } else {
-            die("usage: elftrace build <file.elftrace> [-o out.elf] [--ipc N]");
+            die("usage: elftrace build <file.elftrace> [-o out.elf] "
+                "[--ipc N] [--breakpoint ADDR]");
         }
     }
     if (!in)
-        die("usage: elftrace build <file.elftrace> [-o out.elf] [--ipc N]");
+        die("usage: elftrace build <file.elftrace> [-o out.elf] "
+            "[--ipc N] [--breakpoint ADDR]");
     s.ipc_period = ipc_period;
 
     /* 1. 读入 .elftrace */
@@ -259,6 +264,27 @@ int build_main(int argc, char **argv)
     blob_patch_u64(blob.data, RST_DESC_FPU_SIZE, s.h.fpu_size);
     blob_patch_u64(blob.data, RST_DESC_IPC_PERIOD, ipc_period);
     blob_patch_u64(blob.data, RST_DESC_IPC_FD, (uint64_t)-1);
+
+    /* 可选: 在目标地址注入 int3 (gdb 无法在 stub 恢复前插入断点,
+       此法在构建期直接修改内存映像, 恢复时自动生效) */
+    if (breakpoint) {
+        int hit = 0;
+        for (size_t i = 0; i < s.h.nsegs; i++) {
+            if (breakpoint >= segs[i].vaddr &&
+                breakpoint < segs[i].vaddr + segs[i].filesz) {
+                size_t off = payload_off + segs[i].payload_off +
+                             (breakpoint - segs[i].vaddr);
+                blob.data[off] = 0xcc;
+                hit = 1;
+                break;
+            }
+        }
+        if (!hit)
+            die("breakpoint %#llx not in any captured segment",
+                (unsigned long long)breakpoint);
+        fprintf(stderr, "build: int3 injected at %#llx\n",
+                (unsigned long long)breakpoint);
+    }
 
     /* FPU 状态拷贝到 blob 固定区 */
     memcpy(blob.data + STUB_FPU_OFF, s.file + s.h.fpu_off, s.h.fpu_size);
