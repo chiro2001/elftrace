@@ -24,12 +24,25 @@
 make                          # 需要 gcc/as/ld/objcopy
 ./build/elftrace freeze <pid> -o snap.elftrace   # 冻结并采集
 ./build/elftrace dump snap.elftrace              # 查看中间文件
-./build/elftrace build snap.elftrace -o sliced.elf [--ipc N] [--breakpoint ADDR]
+./build/elftrace build snap.elftrace -o sliced.elf     [--mode real|baremetal] [--ipc N] [--breakpoint ADDR]
 ./sliced.elf                  # 恢复执行
+
+# 指令区间切片 (功能 7): 先采集检查点, 再从任意检查点恢复/退出
+./build/elftrace trace <pid> --every 200000000 --out ckpts/
+./build/elftrace build -o slice.elf --checkpoints ckpts/ --from 2 --to 5     [--mode real|baremetal]
 ```
 
-- `--ipc N`：恢复后在运行约 N 条指令时自动退出（perf_event_open 指令计数，
-  溢出触发 SIGIO，处理器打印 `IPC: <count> instructions` 后退出，返回 0）。
+- `--mode baremetal`：生成裸机切片——目标代码中的 syscall 指令被替换为
+  int3，运行时由 stub 的 SIGTRAP 模拟器 mock（read/write/open/close/
+  mmap/mprotect/munmap/brk/getpid/kill/arch_prctl/exit 等），不支持的
+  syscall 打印后以退出码 0x5e 退出；退出不用 perf，而是把退出点指令
+  替换为 int3。默认 real 模式（真实系统调用）。
+- `--ipc N`：real 模式为 perf_event_open 指令计数退出（溢出触发 SIGIO，
+  打印 `IPC: <count> instructions` 后退出，返回 0）；baremetal 模式需
+  配合 `--checkpoints` 确定第 N 条指令的地址。
+- `--checkpoints DIR --from K --to M`：从 trace 检查点 K 恢复、在检查点
+  M 处退出（real 用 perf 计数，baremetal 用指令替换）；区间指令数 =
+  (M-K)×检查点间隔。
 - `--breakpoint ADDR`：在构建期向内存映像注入 int3（gdb 无法在 stub 恢复
   内存前插入软件断点；此方法在恢复时自动生效，配合 gdb 调试切片）。
 
@@ -43,6 +56,7 @@ make                          # 需要 gcc/as/ld/objcopy
 | 组装器 | `src/build.c` | 解析 `.elftrace`，把 stub blob 放入目标地址空间空闲 gap，组装 ET_EXEC |
 | DWARF 修补 | `src/dwarf.c` | PIE 程序的调试节地址加加载偏置（DWARF v4/v5） |
 | 查看器 | `src/dump.c` | `.elftrace` 人读 |
+| 检查点采集 | `src/trace.c` | perf 指令计数，每 N 条指令冻结采集一个检查点 + manifest |
 
 ### 恢复流程（x86_64 stub）
 
@@ -76,6 +90,7 @@ tests/test_basic.sh    # 基础：循环程序冻结→切片→输出/退出码
 tests/test_dbg.sh      # 进阶2：调试符号（bias、行号、gdb 回溯）
 tests/test_fd.sh       # 进阶3：fd 重开 + 偏移续写
 tests/test_ipc.sh      # 进阶4：指令计数自动退出
+tests/test_cpp.sh      # 进阶6/7：C++ 程序 real/baremetal/区间切片
 ```
 
 需要 `kernel.yama.ptrace_scope=0`（或目标进程允许被跟踪）。
@@ -83,6 +98,11 @@ tests/test_ipc.sh      # 进阶4：指令计数自动退出
 ## 已知限制
 
 - 单线程进程；不支持多线程（可采集但语义未定义）。
+- baremetal 退出点为检查点粒度（trace 间隔），"第 N 条指令"取最近检查点
+  PC，误差 < 间隔；若退出点恰在循环内，进程在首次执行到该指令时退出。
+- baremetal 的 brk 模拟只允许在冻结时堆边界内移动；mmap 返回 -ENOMEM，
+  冻结点之后的新增堆分配会失败（测试程序约定启动阶段完成分配）。
+- 指令流精确到单条（Intel PT/dynamorio 级）留作增强；当前检查点粒度 = N。
 - 冻结在系统调用中途时，该次 in-flight syscall 会丢失（检测到会告警）。
 - vdso/vvar/vsyscall 为内核管理区域，不采集不恢复；程序若在冻结后
   依赖 vdso 内已有指针可能出错（常见库调用不受影响，因为 vdso 由内核

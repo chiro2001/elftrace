@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <limits.h>
 #include <elf.h>
 
 #include "elftrace.h"
@@ -137,6 +138,9 @@ int build_main(int argc, char **argv)
     const char *out = "sliced.elf";
     uint64_t ipc_period = 0;
     uint64_t breakpoint = 0;    /* 注入 int3 的地址 (0 = 无) */
+    int mode_baremetal = 0;
+    const char *ckpts = NULL;   /* trace 检查点目录 */
+    long from_ckpt = -1, to_ckpt = -1;
     struct snap s = {0};
     int fd;
     struct buf blob;            /* 最终 blob (stub + 追加数据) */
@@ -148,6 +152,8 @@ int build_main(int argc, char **argv)
 
     uint64_t segs_off, fds_off, strings_off, payload_off;
     uint64_t blob_total;
+    uint64_t exit_override = 0; /* baremetal 退出点地址 (0 = 无) */
+    uint64_t heap_end = 0;      /* baremetal brk 模拟边界 */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -156,16 +162,101 @@ int build_main(int argc, char **argv)
             ipc_period = strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--breakpoint") == 0 && i + 1 < argc) {
             breakpoint = strtoull(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+            if (strcmp(argv[++i], "real") == 0)
+                mode_baremetal = 0;
+            else if (strcmp(argv[i], "baremetal") == 0)
+                mode_baremetal = 1;
+            else
+                die("--mode must be real or baremetal");
+        } else if (strcmp(argv[i], "--checkpoints") == 0 && i + 1 < argc) {
+            ckpts = argv[++i];
+        } else if (strcmp(argv[i], "--from") == 0 && i + 1 < argc) {
+            from_ckpt = strtol(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--to") == 0 && i + 1 < argc) {
+            to_ckpt = strtol(argv[++i], NULL, 10);
         } else if (argv[i][0] != '-') {
             in = argv[i];
         } else {
             die("usage: elftrace build <file.elftrace> [-o out.elf] "
-                "[--ipc N] [--breakpoint ADDR]");
+                "[--mode real|baremetal] [--ipc N] [--checkpoints DIR] "
+                "[--from K] [--to M] [--breakpoint ADDR]");
         }
     }
     if (!in)
         die("usage: elftrace build <file.elftrace> [-o out.elf] "
-            "[--ipc N] [--breakpoint ADDR]");
+            "[--mode real|baremetal] [--ipc N] [--checkpoints DIR] "
+            "[--from K] [--to M] [--breakpoint ADDR]");
+
+    /* --from/--to: 用 trace 检查点替代基础镜像并确定退出点 */
+    if (ckpts) {
+        char path[PATH_MAX];
+        FILE *f;
+        uint64_t count0 = 0, ip0 = 0;
+        uint64_t count_to = 0, ip_to = 0;
+        long idx = 0, found_from = -1;
+
+        if (from_ckpt < 0)
+            from_ckpt = 0;
+        snprintf(path, sizeof(path), "%s/manifest.txt", ckpts);
+        f = fopen(path, "r");
+        if (!f)
+            die("cannot open %s", path);
+        char line[1024];
+        while (fgets(line, sizeof(line), f)) {
+            uint64_t cnt, ip;
+            char file[PATH_MAX];
+            if (sscanf(line, "%llu 0x%llx %511s", &cnt, &ip, file) != 3)
+                continue;
+            if (idx == from_ckpt) {
+                snprintf(path, sizeof(path), "%s/%s", ckpts, file);
+                in = xstrdup(path);
+                found_from = idx;
+                count0 = cnt;
+                ip0 = ip;
+            }
+            if (to_ckpt >= 0 && idx == to_ckpt) {
+                count_to = cnt;
+                ip_to = ip;
+            }
+            idx++;
+        }
+        fclose(f);
+        if (found_from < 0)
+            die("checkpoint %ld not found in %s", from_ckpt, path);
+        if (to_ckpt >= 0 && idx <= to_ckpt)
+            die("checkpoint %ld not found (have %ld)", to_ckpt, idx);
+        fprintf(stderr, "build: base = checkpoint %ld (count %llu, pc %#llx)\n",
+                found_from, (unsigned long long)count0,
+                (unsigned long long)ip0);
+
+        if (to_ckpt >= 0) {
+            if (mode_baremetal) {
+                /* 退出地址 = 检查点 to 的 pc (替换该处指令) */
+                exit_override = ip_to;
+                if (ipc_period == 0)
+                    ipc_period = count_to - count0;
+            } else {
+                /* real: 用 perf 计数 (ipc_period = 区间指令数) */
+                if (ipc_period == 0)
+                    ipc_period = count_to - count0;
+                else
+                    warn("--ipc overridden by --to (%llu instructions)",
+                         (unsigned long long)(count_to - count0));
+            }
+            fprintf(stderr, "build: exit at checkpoint %ld (count %llu)\n",
+                    to_ckpt, (unsigned long long)count_to);
+        }
+    }
+    /* baremetal 的 --ipc: 需要检查点来确定第 N 条指令的地址 */
+    if (mode_baremetal && ipc_period && !exit_override) {
+        die("baremetal --ipc N requires --checkpoints DIR (to locate the "
+            "N-th instruction); use --to M or --checkpoints instead");
+    }
+    if (mode_baremetal && !ipc_period && !exit_override) {
+        warn("baremetal without exit point: slice will run until the "
+             "target exits or hits an unsupported syscall");
+    }
     s.ipc_period = ipc_period;
 
     /* 1. 读入 .elftrace */
@@ -242,6 +333,57 @@ int build_main(int argc, char **argv)
     fprintf(stderr, "build: blob %llu bytes at base %#llx\n",
             (unsigned long long)blob_total, (unsigned long long)base);
 
+    /* 3.5 baremetal: 段表加载后确定 brk 边界与退出地址的 blob 位置 */
+    if (mode_baremetal) {
+        /* brk_base = 冻结时 [heap] 段的 end */
+        for (size_t i = 0; i < s.h.nsegs; i++) {
+            if (segs[i].flags & (ET_SEG_W)) {
+                const char *nm = sn_str(&s, segs[i].name_off);
+                if (strstr(nm, "heap") || strstr(nm, "[heap]"))
+                    heap_end = segs[i].vaddr + segs[i].memsz;
+            }
+        }
+        if (exit_override) {
+            int hit = 0;
+            for (size_t i = 0; i < s.h.nsegs; i++) {
+                if (exit_override >= segs[i].vaddr &&
+                    exit_override < segs[i].vaddr + segs[i].filesz) {
+                    size_t off = payload_off + segs[i].payload_off +
+                                 (exit_override - segs[i].vaddr);
+                    blob.data[off] = 0xcc;      /* int3 */
+                    hit = 1;
+                    break;
+                }
+            }
+            if (!hit)
+                die("exit point %#llx not in any captured segment",
+                    (unsigned long long)exit_override);
+        }
+        fprintf(stderr, "build: baremetal mode (brk_base=%#llx%s)\n",
+                (unsigned long long)heap_end,
+                exit_override ? ", exit at " : "");
+        if (exit_override)
+            fprintf(stderr, "        exit addr %#llx (int3)\n",
+                    (unsigned long long)exit_override);
+        /* syscall 替换: PF_X 段内 0f 05 -> cc 90 */
+        size_t replaced = 0;
+        for (size_t i = 0; i < s.h.nsegs; i++) {
+            if (!(segs[i].flags & ET_SEG_X))
+                continue;
+            size_t base = payload_off + segs[i].payload_off;
+            for (uint64_t j = 0; j + 1 < segs[i].filesz; j++) {
+                if (blob.data[base + j] == 0x0f &&
+                    blob.data[base + j + 1] == 0x05) {
+                    blob.data[base + j] = 0xcc;
+                    blob.data[base + j + 1] = 0x90;
+                    replaced++;
+                }
+            }
+        }
+        fprintf(stderr, "        %zu syscall instructions replaced by "
+                "int3 (mocked)\n", replaced);
+    }
+
     /* 4. 补丁 desc */
     if (memcmp(blob.data + RST_DESC_MAGIC, &(uint64_t){RST_DESC_MAGIC_VAL},
                8) != 0) {
@@ -264,6 +406,10 @@ int build_main(int argc, char **argv)
     blob_patch_u64(blob.data, RST_DESC_FPU_SIZE, s.h.fpu_size);
     blob_patch_u64(blob.data, RST_DESC_IPC_PERIOD, ipc_period);
     blob_patch_u64(blob.data, RST_DESC_IPC_FD, (uint64_t)-1);
+    blob_patch_u64(blob.data, RST_DESC_MODE, mode_baremetal ? 1 : 0);
+    blob_patch_u64(blob.data, RST_DESC_EXIT_ADDR, exit_override);
+    blob_patch_u64(blob.data, RST_DESC_BRK_BASE, heap_end);
+    blob_patch_u64(blob.data, RST_DESC_TARGET_TID, s.h.task_tid);
 
     /* 可选: 在目标地址注入 int3 (gdb 无法在 stub 恢复前插入断点,
        此法在构建期直接修改内存映像, 恢复时自动生效) */

@@ -10,17 +10,17 @@
  * payload) 的 blob 相对偏移由 builder 填入 desc。
  *
  * 布局 (0x8000 = 32KB 固定区):
- *   [0x0000] desc         128B   恢复描述符
- *   [0x0080] fpu blob     4096B  收集到的 xstate (XSAVE 非压缩格式)
- *   [0x1080] sigmask      8B     内核 sigset_t
- *   [0x1088] sigacts      2560B  64 x elftrace_sigact (可选)
- *   [0x1A88] regs         216B   x86_64 struct pt_regs 快照
- *   [0x1B60] maps_buf     4096B  /proc/self/maps 解析缓冲
- *   [0x2B80] ipc_attr     128B   perf_event_attr
- *   [0x2C00] ipc_sigact   48B    SIGIO 处理器的 sigaction
- *   [0x2C80] stack        8KB    stub 自身栈
- *   [0x4C80] sigframe     5632B  rt_sigreturn 信号帧 (ucontext + fpstate)
- *   [0x6280] entry        代码起点
+ *   [0x0000] desc         256B   恢复描述符
+ *   [0x0100] fpu blob     4096B  收集到的 xstate (XSAVE 非压缩格式)
+ *   [0x1100] sigmask      8B     内核 sigset_t
+ *   [0x1108] sigacts      2560B  64 x elftrace_sigact (可选)
+ *   [0x1B08] regs         216B   x86_64 struct pt_regs 快照
+ *   [0x1BE0] maps_buf     4096B  /proc/self/maps 解析缓冲
+ *   [0x2BE0] ipc_attr     128B   perf_event_attr
+ *   [0x2C60] ipc_sigact   48B    SIGIO 处理器的 sigaction
+ *   [0x2CA0] stack        8KB    stub 自身栈
+ *   [0x4CC0] sigframe     5632B  rt_sigreturn 信号帧 (ucontext + fpstate)
+ *   [0x62C0] entry        代码起点
  *   [0x8000] ...          builder 追加: segs / fds / strings / payload
  */
 #ifndef ELFTRACE_STUB_H
@@ -28,26 +28,26 @@
 
 /* ---- 固定区域偏移 ---- */
 #define STUB_DESC_OFF       0x0000
-#define STUB_FPU_OFF        0x0080
+#define STUB_FPU_OFF        0x0100
 #define STUB_FPU_CAP        0x1000       /* xstate 最大容量 4096B */
-#define STUB_SIGMASK_OFF    0x1080
-#define STUB_SIGACTS_OFF    0x1088
+#define STUB_SIGMASK_OFF    0x1100
+#define STUB_SIGACTS_OFF    0x1108
 #define STUB_SIGACTS_SIZE   (64 * 40)    /* 64 x elftrace_sigact */
-#define STUB_REGS_OFF       0x1A88
+#define STUB_REGS_OFF       0x1B08
 #define STUB_REGS_SIZE      (27 * 8)     /* x86_64 struct pt_regs */
-#define STUB_MAPS_BUF       0x1B60
+#define STUB_MAPS_BUF       0x1BE0
 #define STUB_MAPS_SIZE      0x1000
-#define STUB_IPC_ATTR       0x2B80
-#define STUB_IPC_SIGACT     0x2C00
-#define STUB_STACK_OFF      0x2C80
+#define STUB_IPC_ATTR       0x2BE0
+#define STUB_IPC_SIGACT     0x2C60
+#define STUB_STACK_OFF      0x2CA0
 #define STUB_STACK_SIZE     0x2000       /* 8KB */
 #define STUB_STACK_TOP      (STUB_STACK_OFF + STUB_STACK_SIZE)
-#define STUB_FRAME_OFF      0x4C80       /* rt_sigreturn 信号帧 */
+#define STUB_FRAME_OFF      0x4CC0       /* rt_sigreturn 信号帧 */
 #define STUB_FRAME_SIZE     0x1600       /* 5632B: ucontext + fpstate 区 */
-#define STUB_ENTRY_OFF      0x6280
+#define STUB_ENTRY_OFF      0x62C0
 #define STUB_FIXED_SIZE     0x8000
 
-/* ---- rst_desc 字段偏移 (128B, 全 u64) ---- */
+/* ---- rst_desc 字段偏移 (256B, 全 u64) ---- */
 #define RST_DESC_MAGIC      0x00
 #define RST_DESC_VERSION    0x08
 #define RST_DESC_FLAGS      0x10
@@ -64,12 +64,17 @@
 #define RST_DESC_IPC_PERIOD 0x68
 #define RST_DESC_IPC_FD     0x70
 #define RST_DESC_IPC_BUF_OFF 0x78
+#define RST_DESC_MODE       0x80   /* 0=real, 1=baremetal */
+#define RST_DESC_EXIT_ADDR  0x88   /* baremetal 退出点 (0=无) */
+#define RST_DESC_BRK_BASE   0x90   /* baremetal brk 模拟初始边界 */
+#define RST_DESC_TARGET_TID 0x98   /* getpid 模拟值 */
 
 #define RST_DESC_MAGIC_VAL  0x5253544452455354  /* "RESTDSTR" */
 
 #define RST_FLAG_RESTORE_FDS      (1 << 0)
 #define RST_FLAG_RESTORE_SIGACTS  (1 << 1)
 #define RST_FLAG_IPC              (1 << 2)
+#define RST_FLAG_BAREMETAL        (1 << 3)
 
 /* ---- 工具常量 ---- */
 #define PERF_EVENT_IOC_ENABLE   0x2400

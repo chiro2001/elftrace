@@ -123,10 +123,12 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
     snprintf(manifest, sizeof(manifest), "%s/manifest.txt", tc->out);
     f = fopen(manifest, "a");
     if (f) {
-        /* count 用冻结时刻的精确 PC (entry_pc) */
+        /* 记录文件名 (相对目录), 供 build --checkpoints 拼接 */
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
         fprintf(f, "%llu 0x%llx %s\n",
                 (unsigned long long)tc->count,
-                (unsigned long long)sn.regs.rip, path);
+                (unsigned long long)sn.regs.rip, base);
         fclose(f);
     }
     fprintf(stderr, "trace: ckpt %zu @ count %llu pc %#llx\n", tc->ckpt_no,

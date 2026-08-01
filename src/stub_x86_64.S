@@ -104,6 +104,11 @@ rst_desc:
     .quad 0                    /* ipc_period @0x68 (builder 填) */
     .quad 0                    /* ipc_fd @0x70 (stub 运行时填) */
     .quad 0                    /* ipc_buf_off @0x78 (stub 运行时填) */
+    .quad 0                    /* mode @0x80 (builder 填: 0=real 1=baremetal) */
+    .quad 0                    /* exit_addr @0x88 (builder 填) */
+    .quad 0                    /* brk_base @0x90 (builder 填) */
+    .quad 0                    /* target_tid @0x98 (builder 填) */
+    .space 0x100 - (.-rst_desc)  /* 补足 256B */
 
 /* ===================== FPU 状态 ===================== */
 .org STUB_FPU_OFF
@@ -330,6 +335,13 @@ sa_done:
     call setup_ipc
 
 ipc_done:
+
+    /* ======== 6.5 (可选) baremetal: 安装 SIGTRAP syscall 模拟器 ======== */
+    movq rst_desc+RST_DESC_MODE(%rip), %rax
+    testq %rax, %rax
+    jz bm_setup_skip
+    call setup_baremetal
+bm_setup_skip:
 
     /* ======== 7. 构建 rt_sigreturn 信号帧 ======== */
     call build_sigframe            /* r14 = sigframe base, r13 = fpstate */
@@ -671,6 +683,234 @@ ipc_restorer:
     movq $SYS_rt_sigreturn, %rax
     syscall
 
+/* ===================== baremetal SIGTRAP 模拟器 ===================== */
+/*
+ * baremetal 模式: 构建期把目标代码中的 syscall 指令替换为 int3,
+ * 处理器按被中断上下文 (sigframe) 的 rax 分派模拟; 触发地址等于
+ * desc.exit_addr 时跳转退出代码。不支持的 syscall 打印后退出 0x5e。
+ *
+ * 入口 rsp = 信号帧 frame 地址 (pretcode 槽, 即 uc-8);
+ * push x10 后 uc = rsp + 8 + 0x50 = rsp + 0x58,
+ * sigcontext = uc + 0x28 = rsp + 0x80。
+ */
+#define BMS_SC      0x80
+#define BMS_RAX     (BMS_SC + SIGFRAME_SC_RAX)
+#define BMS_RDI     (BMS_SC + SIGFRAME_SC_RDI)
+#define BMS_RDX     (BMS_SC + SIGFRAME_SC_RDX)
+#define BMS_RIP     (BMS_SC + SIGFRAME_SC_RIP)
+
+bm_handler:
+    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+
+    /* 触发地址 = sc->rip - 1; 与退出点比较 */
+    movq BMS_RIP(%rsp), %rax
+    decq %rax
+    movq rst_desc+RST_DESC_EXIT_ADDR(%rip), %rbx
+    cmpq %rbx, %rax
+    je bm_goto_exit
+
+    /* 分派 syscall 号 */
+    movq BMS_RAX(%rsp), %rax
+    cmpq $231, %rax
+    je bm_do_exit
+    cmpq $60, %rax
+    je bm_do_exit
+    cmpq $0, %rax
+    je bm_read
+    cmpq $1, %rax
+    je bm_write
+    cmpq $20, %rax
+    je bm_writev
+    cmpq $2, %rax
+    je bm_open
+    cmpq $257, %rax
+    je bm_open
+    cmpq $3, %rax
+    je bm_close
+    cmpq $9, %rax
+    je bm_mmap
+    cmpq $10, %rax
+    je bm_mprotect
+    cmpq $11, %rax
+    je bm_munmap
+    cmpq $12, %rax
+    je bm_brk
+    cmpq $39, %rax
+    je bm_getpid
+    cmpq $62, %rax
+    je bm_kill
+    cmpq $158, %rax
+    je bm_arch_prctl
+    jmp bm_unsupported
+
+bm_read:
+    movq $0, BMS_RAX(%rsp)          /* EOF */
+    jmp bm_done
+bm_write:
+    movq BMS_RDX(%rsp), %rbx        /* 假装写入全部 */
+    movq %rbx, BMS_RAX(%rsp)
+    jmp bm_done
+bm_writev:
+    movq $0, BMS_RAX(%rsp)
+    jmp bm_done
+bm_open:
+    movq $-2, BMS_RAX(%rsp)         /* -ENOENT */
+    jmp bm_done
+bm_close:
+    movq $0, BMS_RAX(%rsp)
+    jmp bm_done
+bm_mmap:
+    movq $-12, BMS_RAX(%rsp)        /* -ENOMEM */
+    jmp bm_done
+bm_mprotect:
+    movq $0, BMS_RAX(%rsp)
+    jmp bm_done
+bm_munmap:
+    movq $0, BMS_RAX(%rsp)
+    jmp bm_done
+bm_kill:
+    movq $0, BMS_RAX(%rsp)
+    jmp bm_done
+bm_arch_prctl:
+    movq $-22, BMS_RAX(%rsp)        /* -EINVAL */
+    jmp bm_done
+bm_getpid:
+    movq rst_desc+RST_DESC_TARGET_TID(%rip), %rbx
+    movq %rbx, BMS_RAX(%rsp)
+    jmp bm_done
+bm_brk:
+    movq BMS_RDI(%rsp), %rdi        /* addr */
+    movq rst_desc+RST_DESC_BRK_BASE(%rip), %rsi   /* 游标 */
+    testq %rdi, %rdi
+    jz bm_brk_ret
+    cmpq %rsi, %rdi
+    ja bm_brk_ret                   /* 超出: 失败返回当前 */
+    movq %rdi, %rsi
+    movq %rdi, rst_desc+RST_DESC_BRK_BASE(%rip)
+bm_brk_ret:
+    movq %rsi, BMS_RAX(%rsp)
+    jmp bm_done
+
+bm_goto_exit:
+    lea bm_exit(%rip), %rbx
+    movq %rbx, BMS_RIP(%rsp)
+    jmp bm_done
+
+bm_done:
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    ret                             /* -> restorer -> rt_sigreturn */
+
+bm_do_exit:
+    movq BMS_RDI(%rsp), %rdi        /* 退出码 */
+    movq $SYS_exit_group, %rax
+    syscall
+
+bm_unsupported:
+    /* write(2, "elftrace baremetal: unsupported syscall ", len) */
+    lea bm_err_prefix(%rip), %rsi
+    movq $bm_err_prefix_len, %rdx
+    movq $2, %rdi
+    movq $SYS_write, %rax
+    syscall
+    /* 数字 */
+    movq BMS_RAX(%rsp), %rbx
+    call utoa
+    movq %rdi, %r8
+    lea bm_out_end(%rip), %rax
+    subq %r8, %rax
+    movq %rax, %rdx
+    movq %r8, %rsi
+    movq $2, %rdi
+    movq $SYS_write, %rax
+    syscall
+    /* write(2, "\n", 1) */
+    movq $2, %rdi
+    lea bm_err_newline(%rip), %rsi
+    movq $1, %rdx
+    movq $SYS_write, %rax
+    syscall
+    /* exit(0x5e) */
+    movq $0x5e, %rdi
+    movq $SYS_exit_group, %rax
+    syscall
+
+/* 退出点: 打印指令数后退出 (baremetal 无 perf 计数, 数量为构建期静态值) */
+bm_exit:
+    lea bm_exit_prefix(%rip), %rsi
+    movq $bm_exit_prefix_len, %rdx
+    movq $2, %rdi
+    movq $SYS_write, %rax
+    syscall
+    movq rst_desc+RST_DESC_IPC_PERIOD(%rip), %rbx
+    call utoa
+    movq %rdi, %r8
+    lea bm_out_end(%rip), %rax
+    subq %r8, %rax
+    movq %rax, %rdx
+    movq %r8, %rsi
+    movq $2, %rdi
+    movq $SYS_write, %rax
+    syscall
+    lea bm_exit_suffix(%rip), %rsi
+    movq $bm_exit_suffix_len, %rdx
+    movq $2, %rdi
+    movq $SYS_write, %rax
+    syscall
+    xorq %rdi, %rdi
+    movq $SYS_exit_group, %rax
+    syscall
+
+/*
+ * utoa: rbx = 无符号值; 返回 rdi = 数字串指针 (len = bm_out_end - rdi)。
+ * 破坏 rax rcx rdx rdi。
+ */
+utoa:
+    lea bm_out_end(%rip), %rdi
+    movq $10, %rcx
+1:  xorq %rdx, %rdx
+    movq %rbx, %rax
+    divq %rcx
+    movq %rax, %rbx
+    addb $'0', %dl
+    decq %rdi
+    movb %dl, (%rdi)
+    testq %rbx, %rbx
+    jnz 1b
+    ret
+
+setup_baremetal:
+    lea bm_handler(%rip), %rax
+    movq %rax, ipc_sigact+SA_HANDLER(%rip)
+    movq $SA_RESTORER, ipc_sigact+SA_FLAGS(%rip)
+    lea ipc_restorer(%rip), %rax
+    movq %rax, ipc_sigact+SA_RESTORER_FIELD(%rip)
+    movq $0, ipc_sigact+SA_MASK(%rip)
+    movq $5, %rdi                   /* SIGTRAP */
+    lea ipc_sigact(%rip), %rsi
+    xorq %rdx, %rdx
+    movq $8, %r10
+    movq $SYS_rt_sigaction, %rax
+    syscall
+    ret
+
 /*
  * SIGIO 处理器: 读取指令计数, 打印后退出。
  * 运行在目标代码的栈上 (内核信号帧), 仅使用 syscall。
@@ -749,6 +989,22 @@ ipc_count_buf:
 ipc_out_buf:
     .space 24
 ipc_out_end:
+
+/* baremetal 字符串 */
+bm_err_prefix:
+    .ascii "elftrace baremetal: unsupported syscall "
+.set bm_err_prefix_len, .-bm_err_prefix
+bm_err_newline:
+    .ascii "\n"
+bm_exit_prefix:
+    .ascii "baremetal: "
+.set bm_exit_prefix_len, .-bm_exit_prefix
+bm_exit_suffix:
+    .ascii " instructions\n"
+.set bm_exit_suffix_len, .-bm_exit_suffix
+bm_out_buf:
+    .space 24
+bm_out_end:
 
 .org STUB_FIXED_SIZE
 .section .note.GNU-stack,"",@progbits
