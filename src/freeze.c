@@ -93,6 +93,7 @@ struct auxent {
 
 struct snapshot {
     pid_t pid;
+    uint32_t arch;              /* ELFTRACE_ARCH_* */
     struct user_regs_struct regs;
     uint8_t *xstate;
     size_t xstate_size;
@@ -539,7 +540,7 @@ static void write_snapshot(const struct snapshot *sn, const char *out)
     /* 3. 偏移规划 */
     h.magic = ELFTRACE_MAGIC;
     h.version = ELFTRACE_VERSION;
-    h.arch = ELFTRACE_ARCH_X86_64;
+    h.arch = sn->arch;
     h.flags = ELFTRACE_FLAG_NONE;
     h.entry_pc = sn->regs.rip;
     h.task_tid = sn->pid;
@@ -663,6 +664,31 @@ int freeze_main(int argc, char **argv)
     struct iovec iov;
     char path[64];
 
+    /* 0. 架构识别: 读目标 exe 的 ELF 头 */
+    {
+        snprintf(path, sizeof(path), "/proc/%d/exe", pid);
+        int exe_fd = open(path, O_RDONLY);
+        if (exe_fd >= 0) {
+            Elf64_Ehdr eh;
+            if (read(exe_fd, &eh, sizeof(eh)) == sizeof(eh) &&
+                memcmp(eh.e_ident, ELFMAG, SELFMAG) == 0) {
+                switch (eh.e_machine) {
+                case EM_X86_64:
+                    sn.arch = ELFTRACE_ARCH_X86_64;
+                    break;
+                case EM_AARCH64:
+                    sn.arch = ELFTRACE_ARCH_AARCH64;
+                    break;
+                default:
+                    die("unsupported target machine %u", eh.e_machine);
+                }
+            }
+            close(exe_fd);
+        }
+        if (!sn.arch)
+            die("cannot determine target architecture");
+    }
+
     /* 1. 冻结: SEIZE + INTERRUPT */
     if (ptrace(PTRACE_SEIZE, pid, 0, 0) < 0)
         die("ptrace(SEIZE) on %d", pid);
@@ -675,22 +701,34 @@ int freeze_main(int argc, char **argv)
         die("tracee %d did not stop (status %#x)", pid, st);
     }
 
-    /* 2. 寄存器 */
-    if (ptrace(PTRACE_GETREGS, pid, 0, &sn.regs) < 0)
-        die("ptrace(GETREGS) on %d", pid);
+    /* 2. 寄存器: 用可移植的 PTRACE_GETREGSET NT_PRSTATUS
+       (x86_64: 返回 user_regs_struct 布局; aarch64: user_pt_regs) */
+    {
+        struct iovec rv = {.iov_base = &sn.regs, .iov_len = sizeof(sn.regs)};
+        if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &rv) < 0) {
+            /* 旧式路径 (x86_64 备用) */
+            if (ptrace(PTRACE_GETREGS, pid, 0, &sn.regs) < 0)
+                die("ptrace(GETREGS) on %d", pid);
+        }
+    }
 
-    /* 3. FPU/xstate */
+    /* 3. FPU 状态: 按架构选择 regset (x86_64: NT_X86_XSTATE;
+       aarch64: NT_FPREGSET) */
     sn.xstate = xcalloc(1, 8192);
     iov.iov_base = sn.xstate;
     iov.iov_len = 8192;
-    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_X86_XSTATE, &iov) < 0) {
-        warn("no xstate available, collecting fpregs only");
-        iov.iov_len = 512;
+    {
+        int nt = (sn.arch == ELFTRACE_ARCH_AARCH64) ? NT_FPREGSET
+                                                    : NT_X86_XSTATE;
+        if (ptrace(PTRACE_GETREGSET, pid, (void *)(long)nt, &iov) < 0) {
+            warn("no FPU regset (nt=%d), collecting legacy fpregs", nt);
+            iov.iov_len = 512;
+        }
     }
     sn.xstate_size = iov.iov_len;
     if (sn.xstate_size > 4096) {
         /* sigframe fpstate 区域容量为 4096, 超出部分截断 (AMX 等极端情况) */
-        warn("xstate size %zu exceeds stub capacity 4096, truncated",
+        warn("fpu state size %zu exceeds stub capacity 4096, truncated",
              sn.xstate_size);
         sn.xstate_size = 4096;
     }
@@ -716,7 +754,7 @@ int freeze_main(int argc, char **argv)
     /* 6. fd */
     collect_fds(&sn);
 
-    /* 7. exe + 调试节 */
+    /* 7. exe + 架构识别 + 调试节 */
     snprintf(path, sizeof(path), "/proc/%d/exe", pid);
     char exe[PATH_MAX];
     ssize_t exe_len = readlink(path, exe, sizeof(exe) - 1);

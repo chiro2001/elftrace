@@ -1,0 +1,98 @@
+# elftrace — 进程切片基础设施
+
+将指定进程**冻结**，采集其内存镜像、寄存器镜像与进程状态，打包为一个
+**可执行 ELF**；加载并执行该 ELF 时自动恢复内存与寄存器，从冻结点继续执行，
+等价于"恢复该进程的运行"。
+
+```
+  冻结点                         恢复点
+  ┌────────┐   freeze    ┌───────────┐   build    ┌──────────┐
+  │ 目标进程 │ ────────► │ .elftrace │ ─────────► │ sliced ELF │
+  └────────┘   采集快照   └───────────┘   组装      └──────────┘
+                                                         │ exec
+                                                         ▼
+                                                stub 恢复内存/寄存器/fd
+                                                跳转回冻结 PC, 继续执行
+```
+
+数据采集（freeze）与 ELF 组装（build）通过中间文件 `.elftrace` 解耦：
+采集器与组装器可独立演进，中间文件可用 `dump` 子命令人读。
+
+## 构建与使用
+
+```bash
+make                          # 需要 gcc/as/ld/objcopy
+./build/elftrace freeze <pid> -o snap.elftrace   # 冻结并采集
+./build/elftrace dump snap.elftrace              # 查看中间文件
+./build/elftrace build snap.elftrace -o sliced.elf [--ipc N] [--breakpoint ADDR]
+./sliced.elf                  # 恢复执行
+```
+
+- `--ipc N`：恢复后在运行约 N 条指令时自动退出（perf_event_open 指令计数，
+  溢出触发 SIGIO，处理器打印 `IPC: <count> instructions` 后退出，返回 0）。
+- `--breakpoint ADDR`：在构建期向内存映像注入 int3（gdb 无法在 stub 恢复
+  内存前插入软件断点；此方法在恢复时自动生效，配合 gdb 调试切片）。
+
+## 架构
+
+| 组件 | 路径 | 说明 |
+|---|---|---|
+| 采集器 | `src/freeze.c` | ptrace seize+interrupt 冻结，采集寄存器（GETREGSET NT_PRSTATUS）、FPU（NT_X86_XSTATE）、信号掩码、内存段（/proc/pid/maps + mem）、fd（/proc/pid/fd）、主可执行文件的调试节 |
+| 中间格式 | `include/elftrace.h` | `.elftrace` v2 二进制格式（小端、字段化、可扩展） |
+| 恢复 stub | `src/stub_x86_64.S` | 自包含 PIC 汇编，作为生成 ELF 的入口 |
+| 组装器 | `src/build.c` | 解析 `.elftrace`，把 stub blob 放入目标地址空间空闲 gap，组装 ET_EXEC |
+| DWARF 修补 | `src/dwarf.c` | PIE 程序的调试节地址加加载偏置（DWARF v4/v5） |
+| 查看器 | `src/dump.c` | `.elftrace` 人读 |
+
+### 恢复流程（x86_64 stub）
+
+1. 切换到 blob 自带栈（不再使用 loader 初始栈）；
+2. 逐段 `mmap(MAP_FIXED|ANON)` + 拷贝 payload + `mprotect` 恢复内存；
+3. `munmap` loader 初始栈（解析 `/proc/self/maps` 的 `[stack]`）；
+4. fd 恢复：按路径重开 + `lseek` 到冻结偏移 + `dup2` 回原 fd 号；
+5. 恢复 sigactions（格式支持，采集暂缺，见限制）；
+6. `arch_prctl` 恢复 fs_base/gs_base；
+7. （可选）perf_event_open 指令计数 + SIGIO 处理器；
+8. 在 blob 栈上构建 rt_sigreturn 信号帧（GPR + eflags + rip + rsp +
+   信号掩码 + xstate，xstate 格式与内核 sigframe 布局一致）；
+9. `rt_sigreturn`：内核一次性恢复全部寄存器、信号掩码与 FPU/AVX 状态，
+   跳转到冻结 PC。
+
+### 关键设计点
+
+- **恢复位置**：stub blob（含全部 payload）放在目标地址空间的一个空闲
+  gap（构建期扫描，避开初始栈可能出现的顶部区域），运行时不再依赖
+  loader 建映射，避免了与目标既有映射/初始栈的冲突。
+- **寄存器恢复走 rt_sigreturn**：手动恢复 GPR 无法同步内核视角的 FPU
+  状态与信号掩码；信号帧让内核原子完成全部恢复（含 AVX 等扩展状态）。
+- **PIE 调试符号**：记录加载偏置（exe 运行时基址 - 文件 p_vaddr），
+  symtab 与 DWARF 各节（info/line/aranges/ranges/rnglists）的地址统一
+  加偏置，使 gdb 在切片上可直接断点/看行号/回溯。
+
+## 测试
+
+```bash
+tests/test_basic.sh    # 基础：循环程序冻结→切片→输出/退出码与基准一致
+tests/test_dbg.sh      # 进阶2：调试符号（bias、行号、gdb 回溯）
+tests/test_fd.sh       # 进阶3：fd 重开 + 偏移续写
+tests/test_ipc.sh      # 进阶4：指令计数自动退出
+```
+
+需要 `kernel.yama.ptrace_scope=0`（或目标进程允许被跟踪）。
+
+## 已知限制
+
+- 单线程进程；不支持多线程（可采集但语义未定义）。
+- 冻结在系统调用中途时，该次 in-flight syscall 会丢失（检测到会告警）。
+- vdso/vvar/vsyscall 为内核管理区域，不采集不恢复；程序若在冻结后
+  依赖 vdso 内已有指针可能出错（常见库调用不受影响，因为 vdso 由内核
+  重新映射）。
+- sigactions 暂未采集（格式与 stub 恢复逻辑已就绪）；切片进程的信号
+  处理器为默认动作。
+- MAP_SHARED/文件后备映射按匿名副本恢复，共享语义丢失。
+- pipe/socket/anon_inode 类型 fd 跳过（path_len=0）。
+- `.debug_loc/.debug_loclists` 未做偏置修补（变量位置信息在 PIE 切片
+  中可能偏移；函数/行号信息完整）。
+- xstate 上限 4096 字节（AMX 等大状态会被截断）。
+- aarch64：格式/接口已预留（`ELFTRACE_ARCH_AARCH64`、GETREGSET 采集、
+  `src/stub_aarch64.S` 框架），stub 待有硬件后实现。
