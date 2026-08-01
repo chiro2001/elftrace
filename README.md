@@ -92,6 +92,8 @@ tests/test_dbg.sh      # 进阶2：调试符号（bias、行号、gdb 回溯）
 tests/test_fd.sh       # 进阶3：fd 重开 + 偏移续写
 tests/test_ipc.sh      # 进阶4：指令计数自动退出
 tests/test_cpp.sh      # 进阶6/7：C++ 程序 real/baremetal/区间切片
+tests/test_fd_rw.sh    # 测试2：文件读写程序（写+读回验证），real/baremetal
+tests/test_py.sh       # 测试3：CPython 进程（外部冻结/代码打桩自暂停/baremetal）
 ```
 
 需要 `kernel.yama.ptrace_scope=0`（或目标进程允许被跟踪）。

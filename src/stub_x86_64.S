@@ -748,6 +748,10 @@ bm_handler:
     je bm_getpid
     cmpq $62, %rax
     je bm_kill
+    cmpq $13, %rax
+    je bm_rt_sigaction
+    cmpq $14, %rax
+    je bm_rt_sigprocmask
     cmpq $158, %rax
     je bm_arch_prctl
     jmp bm_unsupported
@@ -782,6 +786,12 @@ bm_kill:
     jmp bm_done
 bm_arch_prctl:
     movq $-22, BMS_RAX(%rsp)        /* -EINVAL */
+    jmp bm_done
+bm_rt_sigaction:
+    movq $0, BMS_RAX(%rsp)          /* 假装安装/查询成功 */
+    jmp bm_done
+bm_rt_sigprocmask:
+    movq $0, BMS_RAX(%rsp)          /* 假装设置掩码成功 */
     jmp bm_done
 bm_getpid:
     movq rst_desc+RST_DESC_TARGET_TID(%rip), %rbx
