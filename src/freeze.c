@@ -342,9 +342,6 @@ static void collect_aux(struct snapshot *sn)
         sn->exe_bias = runtime_base - file_base;
     else
         sn->exe_bias = 0;
-    fprintf(stderr, "aux: exe=%s file_base=%#llx runtime_base=%#llx bias=%#llx\n",
-            sn->exe_path, (unsigned long long)file_base,
-            (unsigned long long)runtime_base, (unsigned long long)sn->exe_bias);
 
     sh = xcalloc(eh.e_shnum, sizeof(Elf64_Shdr));
     if (pread(fd, sh, sizeof(Elf64_Shdr) * eh.e_shnum, eh.e_shoff) !=
@@ -770,8 +767,11 @@ int freeze_main(int argc, char **argv)
     /* 9. 写出 */
     write_snapshot(&sn, out);
 
-    /* 10. 分离 (SEIZE+INTERRUPT 语义: 分离后目标保持停止) */
+    /* 10. 分离并保持冻结: SEIZE+INTERRUPT 后 detach 会唤醒 tracee,
+        先 SIGSTOP 使其进入组停止 (T 状态), 之后可用 SIGCONT 解除 */
+    kill(pid, SIGSTOP);
     ptrace(PTRACE_DETACH, pid, 0, 0);
-    fprintf(stderr, "freeze: %d detached and left frozen\n", pid);
+    fprintf(stderr, "freeze: %d detached and left frozen (SIGCONT to resume)\n",
+            pid);
     return 0;
 }

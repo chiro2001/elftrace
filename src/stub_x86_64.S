@@ -262,11 +262,16 @@ fd_loop:
     movq $SYS_dup2, %rax
     syscall
 
+    /* 若 newfd == target_fd, dup2 是 no-op, 不能 close */
+    cmpq FD_FD(%r12), %r13
+    je fd_next_keep
+
     /* close(newfd) */
     movq %r13, %rdi
     movq $SYS_close, %rax
     syscall
 
+fd_next_keep:
 fd_next:
     addq $48, %r15
     decq %r14
