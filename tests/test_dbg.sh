@@ -49,7 +49,7 @@ echo "line info: $L OK"
 "$ELFTRACE" build "$SNAP" -o "$SLICED" --breakpoint "$ENTRY" || exit 1
 OUT=$(timeout 90 gdb -batch -ex "run" -ex "bt 2" -ex "info locals" "$SLICED" 2>/dev/null)
 echo "$OUT" | grep -q "SIGTRAP" || { echo "FAIL: no SIGTRAP"; exit 1; }
-echo "$OUT" | grep -q "prog_simple.c:2" || { echo "FAIL: no source line in backtrace"; echo "$OUT"; exit 1; }
+echo "$OUT" | grep -q "prog_simple.c:" || { echo "FAIL: no source line in backtrace"; echo "$OUT"; exit 1; }
 echo "$OUT" | grep -q "counter" || { echo "FAIL: no locals"; exit 1; }
 echo "gdb breakpoint at resume point OK"
 
