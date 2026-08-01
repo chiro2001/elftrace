@@ -153,7 +153,8 @@ int build_main(int argc, char **argv)
     uint64_t segs_off, fds_off, strings_off, payload_off;
     uint64_t blob_total;
     uint64_t exit_override = 0; /* baremetal 退出点地址 (0 = 无) */
-    uint64_t heap_end = 0;      /* baremetal brk 模拟边界 */
+    uint64_t heap_end = 0;      /* 冻结时堆尾 (brk 恢复/baremetal 模拟) */
+    uint64_t stack_vaddr = 0;   /* [stack] 段 vaddr (MAP_GROWSDOWN) */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -335,14 +336,6 @@ int build_main(int argc, char **argv)
 
     /* 3.5 baremetal: 段表加载后确定 brk 边界与退出地址的 blob 位置 */
     if (mode_baremetal) {
-        /* brk_base = 冻结时 [heap] 段的 end */
-        for (size_t i = 0; i < s.h.nsegs; i++) {
-            if (segs[i].flags & (ET_SEG_W)) {
-                const char *nm = sn_str(&s, segs[i].name_off);
-                if (strstr(nm, "heap") || strstr(nm, "[heap]"))
-                    heap_end = segs[i].vaddr + segs[i].memsz;
-            }
-        }
         if (exit_override) {
             int hit = 0;
             for (size_t i = 0; i < s.h.nsegs; i++) {
@@ -384,6 +377,19 @@ int build_main(int argc, char **argv)
                 "int3 (mocked)\n", replaced);
     }
 
+    /* 3.6 堆尾/栈段定位 (real 与 baremetal 共用)
+       取第一个 [heap] 段: 真实 brk 区域 (mmap 的大块匿名段也可能被
+       内核标为 [heap], 但真实 brk 指针是第一个) */
+    for (size_t i = 0; i < s.h.nsegs; i++) {
+        const char *nm = sn_str(&s, segs[i].name_off);
+        if (segs[i].flags & ET_SEG_W) {
+            if (!heap_end && strcmp(nm, "[heap]") == 0)
+                heap_end = segs[i].vaddr + segs[i].memsz;
+        }
+        if (strstr(nm, "[stack]"))
+            stack_vaddr = segs[i].vaddr;
+    }
+
     /* 4. 补丁 desc */
     if (memcmp(blob.data + RST_DESC_MAGIC, &(uint64_t){RST_DESC_MAGIC_VAL},
                8) != 0) {
@@ -410,6 +416,9 @@ int build_main(int argc, char **argv)
     blob_patch_u64(blob.data, RST_DESC_EXIT_ADDR, exit_override);
     blob_patch_u64(blob.data, RST_DESC_BRK_BASE, heap_end);
     blob_patch_u64(blob.data, RST_DESC_TARGET_TID, s.h.task_tid);
+    blob_patch_u64(blob.data, RST_DESC_STACK_VADDR, stack_vaddr);
+    blob_patch_u64(blob.data, RST_DESC_RLIM_STACK_CUR, s.h.rlim_stack_cur);
+    blob_patch_u64(blob.data, RST_DESC_RLIM_STACK_MAX, s.h.rlim_stack_max);
 
     /* 可选: 在目标地址注入 int3 (gdb 无法在 stub 恢复前插入断点,
        此法在构建期直接修改内存映像, 恢复时自动生效) */

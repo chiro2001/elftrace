@@ -108,6 +108,9 @@ rst_desc:
     .quad 0                    /* exit_addr @0x88 (builder 填) */
     .quad 0                    /* brk_base @0x90 (builder 填) */
     .quad 0                    /* target_tid @0x98 (builder 填) */
+    .quad 0                    /* stack_vaddr @0xA0 (builder 填) */
+    .quad 0                    /* rlim_stack_cur @0xA8 (builder 填) */
+    .quad 0                    /* rlim_stack_max @0xB0 (builder 填) */
     .space 0x100 - (.-rst_desc)  /* 补足 256B */
 
 /* ===================== FPU 状态 ===================== */
@@ -174,6 +177,19 @@ _start:
     movq %rax, %rbx                /* rbx = blob base (全程保持) */
     addq %rbx, %r15                /* r15 = segs 表绝对地址 */
 
+    /* 恢复 RLIMIT_STACK (目标栈继续向下增长需要) */
+    movq rst_desc+RST_DESC_RLIM_STACK_CUR(%rip), %rax
+    testq %rax, %rax
+    jz 4f
+    movq %rax, rlimit_stack(%rip)
+    movq rst_desc+RST_DESC_RLIM_STACK_MAX(%rip), %rax
+    movq %rax, rlimit_stack+8(%rip)
+    movq $3, %rdi                  /* RLIMIT_STACK */
+    lea rlimit_stack(%rip), %rsi   /* struct rlimit {cur, max} */
+    movq $160, %rax                /* setrlimit */
+    syscall
+4:
+
 seg_loop:
     testq %r14, %r14
     jz seg_done
@@ -184,7 +200,14 @@ seg_loop:
     movq SEG_MEMSZ(%r12), %rsi
     movq $6, %rdx                  /* PROT_READ|PROT_WRITE */
     movq $(MAP_PRIVATE|MAP_ANON|MAP_FIXED), %r10
-    movq $-1, %r8
+    /* [stack] 段加 MAP_GROWSDOWN, 允许目标栈继续向下增长 */
+    movq rst_desc+RST_DESC_STACK_VADDR(%rip), %rax
+    testq %rax, %rax
+    jz 1f
+    cmpq %rax, %rdi
+    jne 1f
+    orq $0x100, %r10               /* MAP_GROWSDOWN */
+1:  movq $-1, %r8
     xorq %r9, %r9
     movq $SYS_mmap, %rax
     syscall
@@ -799,6 +822,7 @@ bm_getpid:
     jmp bm_done
 bm_brk:
     movq BMS_RDI(%rsp), %rdi        /* addr */
+    movq rst_desc+RST_DESC_BRK_BASE(%rip), %rsi
     movq rst_desc+RST_DESC_BRK_BASE(%rip), %rsi   /* 游标 */
     testq %rdi, %rdi
     jz bm_brk_ret
@@ -999,6 +1023,10 @@ ipc_count_buf:
 ipc_out_buf:
     .space 24
 ipc_out_end:
+
+/* RLIMIT_STACK 恢复缓冲 */
+rlimit_stack:
+    .space 16
 
 /* baremetal 字符串 */
 bm_err_prefix:

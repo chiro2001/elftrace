@@ -483,6 +483,8 @@ void collect_write(const struct collect_snapshot *sn, const char *out)
     h.entry_pc = sn->regs.rip;
     h.task_tid = sn->pid;
     h.exe_bias = sn->exe_bias;
+    h.rlim_stack_cur = sn->rlim_stack_cur;
+    h.rlim_stack_max = sn->rlim_stack_max;
 
     off = sizeof(elftrace_hdr);
     h.regs_off = off;
@@ -679,6 +681,25 @@ void collect_state_light(pid_t pid, struct collect_snapshot *sn)
 
     /* 系统调用检测 */
     detect_in_syscall(sn);
+
+    /* RLIMIT_STACK (切片进程恢复栈增长限制) */
+    sn->rlim_stack_cur = sn->rlim_stack_max = 0;
+    snprintf(path, sizeof(path), "/proc/%d/limits", pid);
+    FILE *lf = fopen(path, "r");
+    if (lf) {
+        char line[256];
+        while (fgets(line, sizeof(line), lf)) {
+            if (strncmp(line, "Max stack size", 14) == 0) {
+                unsigned long long cur, max;
+                if (sscanf(line + 14, "%llu %llu", &cur, &max) == 2) {
+                    sn->rlim_stack_cur = cur;
+                    sn->rlim_stack_max = (max == ~0ULL) ? 0 : max;
+                }
+                break;
+            }
+        }
+        fclose(lf);
+    }
 }
 
 void collect_memory(pid_t pid, struct collect_snapshot *sn)

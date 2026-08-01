@@ -37,7 +37,7 @@ $(BUILD)/stub_blob_x86_64.c: $(BUILD)/stub_x86_64.bin
 $(BUILD)/stub_blob_x86_64.o: $(BUILD)/stub_blob_x86_64.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/%.o: $(SRC)/%.c $(INC)/elftrace.h $(INC)/elftrace_stub.h $(INC)/elftrace.h | $(BUILD)
+$(BUILD)/%.o: $(SRC)/%.c $(wildcard $(INC)/*.h) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TOOLS): $(OBJS)

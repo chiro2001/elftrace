@@ -78,6 +78,8 @@ TPID=$!
 sleep 0.3
 timeout 8 "$ELFTRACE" trace "$TPID" --every 200000000 --out "$CKPTS" >/dev/null 2>&1
 kill -9 $TPID 2>/dev/null
+# trace 被 timeout 终止时不回收注入的 COW 镜像代理 (comm=prog_cpp), 手动清理
+pgrep -x prog_cpp | xargs -r kill -9 2>/dev/null
 NCK=$(wc -l < "$CKPTS/manifest.txt")
 [ "$NCK" -ge 6 ] || { echo "FAIL: only $NCK checkpoints"; exit 1; }
 echo "trace: $NCK checkpoints"

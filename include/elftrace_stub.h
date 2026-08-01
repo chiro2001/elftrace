@@ -66,8 +66,11 @@
 #define RST_DESC_IPC_BUF_OFF 0x78
 #define RST_DESC_MODE       0x80   /* 0=real, 1=baremetal */
 #define RST_DESC_EXIT_ADDR  0x88   /* baremetal 退出点 (0=无) */
-#define RST_DESC_BRK_BASE   0x90   /* baremetal brk 模拟初始边界 */
+#define RST_DESC_BRK_BASE   0x90   /* 冻结时堆尾 (brk 恢复/baremetal 模拟) */
 #define RST_DESC_TARGET_TID 0x98   /* getpid 模拟值 */
+#define RST_DESC_STACK_VADDR 0xA0  /* [stack] 段 vaddr (恢复时 MAP_GROWSDOWN) */
+#define RST_DESC_RLIM_STACK_CUR 0xA8  /* RLIMIT_STACK 当前值 */
+#define RST_DESC_RLIM_STACK_MAX 0xB0  /* RLIMIT_STACK 最大值 */
 
 #define RST_DESC_MAGIC_VAL  0x5253544452455354  /* "RESTDSTR" */
 
