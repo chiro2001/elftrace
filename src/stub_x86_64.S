@@ -53,11 +53,12 @@
 #define ARCH_SET_GS 0x1001
 
 #define SIGIO       29
+#define SA_RESTORER 0x04000000
 #define SIGKILL     9
 #define SIGSTOP     19
 #define SIG_SETMASK 2
 
-#define F_SETOWN    6
+#define F_SETOWN    8
 #define F_SETFL     4
 #define O_ASYNC     0x2000
 
@@ -79,7 +80,7 @@
 /* sigact 记录字段 (elftrace_sigact, 内核 k_sigaction 前 32B) */
 #define SA_HANDLER  0
 #define SA_FLAGS    8
-#define SA_RESTORER 16
+#define SA_RESTORER_FIELD 16
 #define SA_MASK     24
 
 .section .rst, "awx"
@@ -332,8 +333,8 @@ ipc_done:
     movq rst_desc+RST_DESC_IPC_FD(%rip), %rdi
     cmpq $-1, %rdi
     je 7f
-    xorq %rsi, %rsi
-    movq $PERF_EVENT_IOC_ENABLE, %rdx
+    movq $PERF_EVENT_IOC_ENABLE, %rsi
+    xorq %rdx, %rdx
     movq $SYS_ioctl, %rax
     syscall
 7:
@@ -474,11 +475,12 @@ fs_fail:
  * 破坏 rax rcx rdx rsi rdi r8 r9 r10 r11 r12。
  */
 setup_ipc:
-    /* 安装 SIGIO 处理器 */
+    /* 安装 SIGIO 处理器 (x86_64 内核要求 SA_RESTORER, 否则拒绝投递) */
     lea ipc_handler(%rip), %rax
     movq %rax, ipc_sigact+SA_HANDLER(%rip)
-    movq $0, ipc_sigact+SA_FLAGS(%rip)
-    movq $0, ipc_sigact+SA_RESTORER(%rip)
+    movq $SA_RESTORER, ipc_sigact+SA_FLAGS(%rip)
+    lea ipc_restorer(%rip), %rax
+    movq %rax, ipc_sigact+SA_RESTORER_FIELD(%rip)
     movq $0, ipc_sigact+SA_MASK(%rip)
     movq $SIGIO, %rdi
     lea ipc_sigact(%rip), %rsi
@@ -507,7 +509,7 @@ setup_ipc:
     movq $0, 120(%r12)
     movl $0, 0(%r12)               /* type = PERF_TYPE_HARDWARE */
     movl $64, 4(%r12)              /* size */
-    movq $0, 8(%r12)               /* config = PERF_COUNT_HW_INSTRUCTIONS */
+    movq $1, 8(%r12)               /* config = PERF_COUNT_HW_INSTRUCTIONS */
     movq rst_desc+RST_DESC_IPC_PERIOD(%rip), %rax
     addq $STUB_IPC_COMPENSATION, %rax
     movq %rax, 16(%r12)            /* sample_period = N + 补偿 */
@@ -528,9 +530,9 @@ setup_ipc:
     movq %rax, %r12                /* r12 = perf fd */
     movq %rax, rst_desc+RST_DESC_IPC_FD(%rip)
 
-    /* mmap 环形缓冲 (4 页) */
+    /* mmap 环形缓冲: 大小必须为 (1 + 2^k) 页 */
     xorq %rdi, %rdi
-    movq $16384, %rsi
+    movq $20480, %rsi              /* 5 页 = 1 头页 + 4 数据页 */
     movq $3, %rdx                  /* PROT_READ|PROT_WRITE */
     movq $MAP_SHARED, %r10
     movq %r12, %r8
@@ -659,6 +661,11 @@ build_sigframe:
     ret
 
 /* ===================== IPC 处理器 ===================== */
+/* 处理器返回后跳到这里: rt_sigreturn 恢复被中断的现场 */
+ipc_restorer:
+    movq $SYS_rt_sigreturn, %rax
+    syscall
+
 /*
  * SIGIO 处理器: 读取指令计数, 打印后退出。
  * 运行在目标代码的栈上 (内核信号帧), 仅使用 syscall。
