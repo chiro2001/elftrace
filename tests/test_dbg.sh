@@ -42,7 +42,7 @@ echo "symbol main: $MAIN_SLICED (bias-adjusted) OK"
 
 # 2. gdb 行号信息与运行时地址一致
 L=$(timeout 60 gdb -batch -ex "file $SLICED" -ex "info line main" 2>/dev/null | grep "starts at address")
-echo "$L" | grep -q "$EXPECT" || { echo "FAIL: line info address mismatch: $L"; exit 1; }
+echo "$L" | grep -q "$EXPECT" || { echo "FAIL: line info address mismatch: $L (expect $EXPECT)"; exit 1; }
 echo "line info: $L OK"
 
 # 3. 冻结点注入 int3, gdb 运行切片应命中并给出源码位置/栈
