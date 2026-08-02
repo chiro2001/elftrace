@@ -40,7 +40,7 @@ static const char *str_at(const uint8_t *f, const elftrace_hdr *h, uint64_t off)
     return buf;
 }
 
-int dump_main(const char *path)
+int dump_main(const char *path, int meta_only)
 {
     int fd;
     struct stat st;
@@ -85,7 +85,22 @@ int dump_main(const char *path)
            (unsigned long long)h.strings_off, (unsigned long long)h.strings_size);
     printf("  payload      off=%#llx size=%llu\n",
            (unsigned long long)h.payload_off, (unsigned long long)h.payload_size);
+    if (h.meta_off && h.meta_size) {
+        printf("  meta         off=%#llx size=%llu\n",
+               (unsigned long long)h.meta_off, (unsigned long long)h.meta_size);
+        printf("\n== meta (采集环境) ==\n");
+        const char *m = (const char *)(f + h.meta_off);
+        for (size_t i = 0; i < h.meta_size; i++)
+            putchar(m[i]);
+        if (h.meta_size && m[h.meta_size - 1] != '\n')
+            putchar('\n');
+    }
     printf("\n");
+
+    if (meta_only) {
+        free(f);
+        return 0;
+    }
 
     printf("== segments ==\n");
     printf("  %-16s %-12s %-12s %-10s %-16s %s\n", "vaddr", "filesz", "memsz",

@@ -65,7 +65,7 @@ tf_orig_finish() {  # <pid>
 # 组装切片
 tf_build() {  # <snap> <out.elf> [build 参数...]
     local snap="$1" out="$2"; shift 2
-    "$TF_ELFTRACE" build "$snap" -o "$out" "$@" >/dev/null 2>&1
+    "$TF_ELFTRACE" build "$snap" -o "$out" "$@" 2>&1
 }
 
 # 运行切片 (timeout 包裹), 退出码存 TF_SLICE_RC

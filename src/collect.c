@@ -17,6 +17,10 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/ptrace.h>
@@ -428,6 +432,188 @@ static void collect_aux(struct collect_snapshot *sn)
     free(debug_abbrev);
 }
 
+/* ---- 采集环境信息 (meta 区, trace 多检查点复用) ---- */
+
+static void meta_append(char *buf, size_t *off, size_t cap, const char *kv)
+{
+    size_t n = strlen(kv);
+    if (*off + n < cap) {
+        memcpy(buf + *off, kv, n);
+        *off += n;
+    }
+}
+
+static void meta_from_file(char *buf, size_t *off, size_t cap,
+                           const char *key, const char *path, int take_last)
+{
+    char line[512];
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "key=%s unavailable\n", key);
+        meta_append(buf, off, cap, tmp);
+        return;
+    }
+    char *last = NULL;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = 0;
+        last = xstrdup(line);
+    }
+    fclose(f);
+    char tmp[640];
+    snprintf(tmp, sizeof(tmp), "%s=%s\n", key, last ? last : "unknown");
+    meta_append(buf, off, cap, tmp);
+    free(last);
+}
+
+static void meta_from_cmd(char *buf, size_t *off, size_t cap,
+                          const char *key, const char *cmd, int first_line)
+{
+    char line[1024];
+    FILE *p = popen(cmd, "r");
+    if (!p) {
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "key=%s unavailable\n", key);
+        meta_append(buf, off, cap, tmp);
+        return;
+    }
+    int n = 0;
+    while (fgets(line, sizeof(line), p)) {
+        line[strcspn(line, "\n")] = 0;
+        char tmp[1100];
+        snprintf(tmp, sizeof(tmp), "%s=%s\n", key, line);
+        meta_append(buf, off, cap, tmp);
+        n++;
+        if (first_line)
+            break;
+    }
+    pclose(p);
+}
+
+/* 采集一次 (static 缓存), 返回指向 NUL 结尾的 key=value 文本块 */
+const char *collect_meta(size_t *out_size)
+{
+    static char meta[16384];
+    static size_t meta_size = 0;
+    static int done = 0;
+    size_t off = 0;
+    char tmp[128];
+    char line[1024];
+    FILE *f;
+
+    if (done) {
+        *out_size = meta_size;
+        return meta;
+    }
+
+    /* 1. ISA / 内核 */
+    meta_from_cmd(meta, &off, sizeof(meta), "isa", "uname -m", 1);
+    meta_from_cmd(meta, &off, sizeof(meta), "kernel", "uname -srm", 1);
+    meta_from_cmd(meta, &off, sizeof(meta), "hostname", "hostname", 1);
+
+    /* 2. OS 信息 */
+    f = fopen("/etc/os-release", "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\n")] = 0;
+            if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
+                char *v = line + 12;
+                size_t vl = strlen(v);
+                if (vl >= 2 && v[0] == '"' && v[vl - 1] == '"') {
+                    v[vl - 1] = 0;
+                    v++;
+                }
+                char tmp2[1100];
+                snprintf(tmp2, sizeof(tmp2), "os=%s\n", v);
+                meta_append(meta, &off, sizeof(meta), tmp2);
+            } else if (strncmp(line, "VERSION_ID=", 11) == 0) {
+                char tmp2[1100];
+                snprintf(tmp2, sizeof(tmp2), "os_version=%s\n", line + 11);
+                meta_append(meta, &off, sizeof(meta), tmp2);
+            }
+        }
+        fclose(f);
+    }
+
+    /* 3. libc 版本 */
+    meta_from_cmd(meta, &off, sizeof(meta), "libc", "ldd --version 2>&1 | head -1", 0);
+
+    /* 4. CPU 概要 (lscpu 关键字段, LC_ALL=C 强制英文输出) */
+    f = popen("LC_ALL=C lscpu", "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\n")] = 0;
+            if (strncmp(line, "Architecture:", 13) == 0 ||
+                strncmp(line, "Model name:", 11) == 0 ||
+                strncmp(line, "CPU(s):", 7) == 0 ||
+                strncmp(line, "CPU op-mode(s):", 15) == 0 ||
+                strncmp(line, "Virtualization:", 15) == 0) {
+                char tmp2[1100];
+                snprintf(tmp2, sizeof(tmp2), "cpu_%s\n", line);
+                meta_append(meta, &off, sizeof(meta), tmp2);
+            }
+        }
+        pclose(f);
+    }
+
+    /* 5. NUMA 拓扑 (/sys, 无需 numactl) */
+    meta_from_file(meta, &off, sizeof(meta), "numa_nodes",
+                   "/sys/devices/system/node/possible", 1);
+    DIR *nd = opendir("/sys/devices/system/node");
+    int nn = 0;
+    if (nd) {
+        struct dirent *de;
+        while ((de = readdir(nd)))
+            if (strncmp(de->d_name, "node", 4) == 0)
+                nn++;
+        closedir(nd);
+    }
+    snprintf(tmp, sizeof(tmp), "numa_node_count=%d\n", nn);
+    meta_append(meta, &off, sizeof(meta), tmp);
+
+    /* 6. dmidecode (需 root, 失败记录状态) */
+    meta_from_cmd(meta, &off, sizeof(meta), "dmidecode",
+                  "dmidecode -t system 2>&1 | head -6", 0);
+
+    /* 7. IP 列表 (getifaddrs, 无外部命令依赖) */
+    {
+        struct ifaddrs *ifa, *p;
+        if (getifaddrs(&ifa) != 0) {
+            meta_append(meta, &off, sizeof(meta), "ip=unavailable\n");
+        } else {
+            int nip = 0;
+            for (p = ifa; p; p = p->ifa_next) {
+                if (!p->ifa_addr || (p->ifa_flags & IFF_LOOPBACK))
+                    continue;
+                void *sa = NULL;
+                if (p->ifa_addr->sa_family == AF_INET)
+                    sa = &((struct sockaddr_in *)p->ifa_addr)->sin_addr;
+                else if (p->ifa_addr->sa_family == AF_INET6)
+                    sa = &((struct sockaddr_in6 *)p->ifa_addr)->sin6_addr;
+                else
+                    continue;
+                char straddr[INET6_ADDRSTRLEN] = {0};
+                inet_ntop(p->ifa_addr->sa_family, sa, straddr,
+                          sizeof(straddr));
+                char tmp2[300];
+                snprintf(tmp2, sizeof(tmp2), "ip_%s=%s\n", p->ifa_name,
+                         straddr);
+                meta_append(meta, &off, sizeof(meta), tmp2);
+                nip++;
+            }
+            if (!nip)
+                meta_append(meta, &off, sizeof(meta), "ip=none\n");
+            freeifaddrs(ifa);
+        }
+    }
+
+    meta[off] = 0;
+    meta_size = off;
+    done = 1;
+    *out_size = meta_size;
+    return meta;
+}
+
 /* ---- 判断目标是否处于系统调用中 (rip-2 为 syscall 指令) ---- */
 static void detect_in_syscall(struct collect_snapshot *sn)
 {
@@ -508,6 +694,10 @@ void collect_write(const struct collect_snapshot *sn, const char *out)
     h.rlim_stack_max = sn->rlim_stack_max;
 
     off = sizeof(elftrace_hdr);
+    h.meta_off = off;
+    h.meta_size = sn->meta_size + 1;   /* 含结尾 NUL, 与写入一致 */
+    off += sn->meta_size + 1;
+
     h.regs_off = off;
     h.regs_size = sizeof(struct user_regs_struct);
     off += h.regs_size;
@@ -540,6 +730,8 @@ void collect_write(const struct collect_snapshot *sn, const char *out)
 
     /* 4. 顺序写入 */
     cbuf_append(&file, &h, sizeof(h));
+    if (sn->meta && sn->meta_size)
+        cbuf_append(&file, sn->meta, sn->meta_size + 1);
     cbuf_append(&file, &sn->regs, sizeof(sn->regs));
     cbuf_append(&file, sn->xstate, sn->xstate_size);
     cbuf_append(&file, sn->sigmask, sizeof(sn->sigmask));
@@ -702,6 +894,9 @@ void collect_state_light(pid_t pid, struct collect_snapshot *sn)
 
     /* 系统调用检测 */
     detect_in_syscall(sn);
+
+    /* 环境信息 (meta, static 缓存只采一次) */
+    sn->meta = collect_meta(&sn->meta_size);
 
     /* RLIMIT_STACK (切片进程恢复栈增长限制) */
     sn->rlim_stack_cur = sn->rlim_stack_max = 0;

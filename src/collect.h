@@ -66,6 +66,8 @@ struct collect_snapshot {
     uint64_t exe_bias;
     uint64_t rlim_stack_cur;    /* RLIMIT_STACK 当前值 */
     uint64_t rlim_stack_max;    /* RLIMIT_STACK 最大值 */
+    const char *meta;           /* 采集环境信息 (static 缓存, 不 free) */
+    size_t meta_size;
 
     struct caux *aux;
     size_t naux;

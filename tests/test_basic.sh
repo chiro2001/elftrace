@@ -30,7 +30,7 @@ sleep 0.3   # 确保已进入下一轮计算循环 (用户态)
 tf_freeze "$TF_PID" "$SNAP" || { echo "FAIL: freeze"; tf_cleanup prog_simple; exit 1; }
 
 # 3. 组装 + 运行切片
-tf_build "$SNAP" "$SLICED" --mode real || { echo "FAIL: build"; exit 1; }
+strace -o "$TF_TMP/tb.strace" "$TF_ELFTRACE" build "$SNAP" -o "$SLICED" --mode real || { echo "FAIL: build"; exit 1; }
 tf_run_slice "$SLICED" 60
 echo "sliced rc=$TF_SLICE_RC last=$(tail -1 "$TF_TMP/frozen.out")"
 

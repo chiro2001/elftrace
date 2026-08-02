@@ -10,7 +10,7 @@
 
 int freeze_main(int argc, char **argv);
 int build_main(int argc, char **argv);
-int dump_main(const char *path);
+int dump_main(const char *path, int meta_only);
 int trace_main(int argc, char **argv);
 
 static void usage(void)
@@ -21,7 +21,7 @@ static void usage(void)
             "usage:\n"
             "  elftrace freeze <pid> [-o out.elftrace]\n"
             "  elftrace build <in.elftrace> [-o out.elf] [--ipc N]\n"
-            "  elftrace dump <in.elftrace>\n"
+            "  elftrace dump <in.elftrace> [--meta]\n"
             "  elftrace trace <pid> [--every N] [--out DIR]\n"
             "\n"
             "freeze 采集一个冻结进程的内存/寄存器/fd 快照到中间文件;\n"
@@ -41,8 +41,10 @@ int main(int argc, char **argv)
         return freeze_main(argc - 1, argv + 1);
     if (strcmp(argv[1], "build") == 0)
         return build_main(argc - 1, argv + 1);
-    if (strcmp(argv[1], "dump") == 0)
-        return dump_main(argv[2]);
+    if (strcmp(argv[1], "dump") == 0) {
+        int meta_only = (argc > 3 && strcmp(argv[3], "--meta") == 0);
+        return dump_main(argv[2], meta_only);
+    }
     if (strcmp(argv[1], "trace") == 0)
         return trace_main(argc - 1, argv + 1);
     usage();
