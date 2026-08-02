@@ -109,3 +109,37 @@ PIE 的 symtab/DWARF 地址是镜像相对（0 基），恢复后实际基址随
   不能跨 VMA；glibc malloc 会 fallback mmap（分配仍可用）。
 - `heap_end`（desc.brk_base）定位取**第一个** `[heap]` 段：mmap 的大块
   匿名段也可能被内核标为 `[heap]`，真实 brk 指针是第一个。
+
+
+## 增量检查点 (diff 格式)
+
+- 检查点 0 完整 .elftrace；后续为差异文件（ELFTRACE_DIFF_MAGIC）：
+  `hdr | 状态区(regs/xstate/sigmask/fds表+路径) | unmap 段列表 | newseg 段(全量) | dirty 页(vaddr+4096)`
+- trace 在线只做轻量采集（fork 代理 + 状态副本），目标阶段结束后按检查点
+  顺序离线 dump（diff 需要顺序）：检查点 K 从代理读全量，与上一检查点
+  逐页 memcmp 生成差异。
+- build --checkpoints 检测 diff 格式：从 ckpt_000000 应用差异链合成完整
+  快照（collect_snapshot_load + apply_diff 维护 payload_offs）再走现有
+  组装；旧版完整格式目录自动退化。
+- 脏页覆盖语义：按 vaddr 找段、payload_offs 定位（段序在检查点间可变，
+  禁止顺序累积偏移）。
+- 效果：稳态程序每检查点 16-49KB vs 完整 7.5MB（-99.5%）。
+
+## trace bundle (归档)
+
+- 单文件格式：magic "ELFTBNDL" + 文件表 {name_len, size, name, data}，
+  无压缩无外部依赖；命令 `elftrace bundle <dir> -o out.bundle` /
+  `--unpack -o dir`；build --checkpoints 自动识别（magic 检测）。
+- trace 默认仍输出离散文件，bundle 仅用于存档/传输。
+
+## 延迟 dump 与代理生命周期
+
+- 在线检查点：INTERRUPT → 轻量状态采集 → COW 注入 fork 代理 → 目标恢复
+  （~100ns 停顿）→ tracer 只保存 {代理 pid + 状态副本}——目标采集期间
+  无重 CPU 负载。
+- 代理：写 flag 就绪后 pause 阻塞（不占 CPU）+ setpgid(0,0) 脱离目标
+  进程组（目标死后孤儿组 SIGHUP 会击杀代理，已修复）。
+- 离线 dump：目标阶段结束后按序从代理读内存（ckpt 0 完整 + 后续 diff），
+  dump 完回收代理；SIGTERM/SIGINT 触发优雅退出（先 dump 再退）。
+- 主循环退出检测：waitpid WNOHANG reap（ptrace 目标被 SIGKILL 后变
+  僵尸，kill(pid,0) 检测不到）。

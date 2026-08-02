@@ -25,8 +25,9 @@ make clean           # 全量重编（改 include/*.h 后若依赖不触发，�
 ## 测试
 
 ```bash
-tests/run_tests.sh   # 一键运行全部 13 项测试（basic/dbg/fd/ipc/cpp/fd_rw/
-                     # py/syscall/stack/bigmem/thread/append/bareheap）
+tests/run_tests.sh   # 一键运行全部 15 项测试（basic/dbg/fd/ipc/cpp/fd_rw/
+                     # py/syscall/stack/bigmem/thread/append/bareheap/
+                     # interval/bundle）
 ```
 
 测试脚本约定（新增测试必须遵守）：
@@ -46,7 +47,8 @@ tests/run_tests.sh   # 一键运行全部 13 项测试（basic/dbg/fd/ipc/cpp/fd
 | `src/freeze.c` | freeze CLI：seize+interrupt → 采集 → SIGSTOP+detach（保持冻结） |
 | `src/trace.c` | trace CLI：perf 指令计数 + 每 N 条注入 fork 采集检查点 + manifest |
 | `src/inject.c` | 两阶段注入（compel 式）：stage1 冷代码页 mmap 专用页，stage2 fork；子进程（镜像代理）自旋持 fork 时刻 COW 快照 |
-| `src/build.c` | 组装 ELF：gap 选址、desc 补丁、baremetal syscall→int3 替换、调试节重建 |
+| `src/build.c` | 组装 ELF：gap 选址、desc 补丁、baremetal syscall→int3 替换、调试节重建；--checkpoints 应用增量差异链合成 |
+| `src/bundle.c` | trace bundle 归档（目录↔单文件），build 自动识别 |
 | `src/stub_x86_64.S` | 恢复 stub（PIC 汇编）：内存/fd/RLIMIT/fs_base/信号帧/baremetal 模拟器 |
 | `src/dwarf.c` | DWARF v4/v5 地址偏置修补 |
 | `include/elftrace.h` | `.elftrace` v3 格式 |
@@ -75,6 +77,14 @@ tests/run_tests.sh   # 一键运行全部 13 项测试（basic/dbg/fd/ipc/cpp/fd
   SIGTERM/SIGINT 触发优雅退出（先离线 dump）。
 - **COW 注入轮询**：必须排除旧代理（上一轮检查点的代理 flag 早已置 1，
   误选会导致从旧代理读取缺新段 → EIO → 检查点段零填充 → 切片崩溃）。
+- **增量检查点**：检查点 0 完整 .elftrace，后续 elftrace_diff 文件
+  （状态区 regs/xstate/sigmask/fds + unmap 段 + newseg 段 + dirty 页）；
+  build 从 ckpt_000000 应用差异链合成（collect_snapshot_load + apply_diff
+  需同步维护 payload_offs）。diff 的脏页覆盖以 vaddr 找段、用 payload_offs
+  定位，禁止顺序累积偏移（段序会变）。
+- **meta 区**：v4 头含 meta_off/meta_size（采集环境信息 key=value）；
+  collect_write 只在 meta 非空时写 meta 区（含 NUL, size+1）——NULL 时
+  偏移规划不得 +1（曾导致 1 字节错位全线崩溃）。
 - **brk**：不恢复内核 brk（目标 glibc brk 缓存与切片内核 brk 差距可达
   数十 TB，overcommit 拒绝）；glibc malloc 会 fallback mmap。
 - **RLIMIT_STACK**：必须恢复（目标 setrlimit 的栈限制在切片进程是默认

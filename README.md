@@ -29,8 +29,13 @@ make                          # 需要 gcc/as/ld/objcopy
 ./sliced.elf                  # 恢复执行
 
 # 指令区间切片 (功能 7): 先采集检查点, 再从任意检查点恢复/退出
-./build/elftrace trace <pid> --every 200000000 --out ckpts/
+./build/elftrace trace <pid> --every 5000000 --out ckpts/       # 5m 条/检查点 (模拟器场景)
 ./build/elftrace build -o slice.elf --checkpoints ckpts/ --from 2 --to 5     [--mode real|baremetal]
+
+# trace bundle 归档: 检查点目录打包为单文件 (默认仍离散文件, 存档用)
+./build/elftrace bundle ckpts/ -o trace.bundle                  # 打包
+./build/elftrace bundle trace.bundle --unpack -o dir            # 解包
+./build/elftrace build -o slice.elf --checkpoints trace.bundle --from 2 --to 5   # 直接读单文件
 ```
 
 - `--mode baremetal`：生成裸机切片——目标代码中的 syscall 指令被替换为
@@ -44,6 +49,13 @@ make                          # 需要 gcc/as/ld/objcopy
 - `--checkpoints DIR --from K --to M`：从 trace 检查点 K 恢复、在检查点
   M 处退出（real 用 perf 计数，baremetal 用指令替换）；区间指令数 =
   (M-K)×检查点间隔。
+- **增量检查点**：trace 的检查点 0 为完整快照，后续检查点为差异文件
+  （相对上一检查点只记录修改的页 + 新段/删除段），体积减少 ~99.5%
+  （506 检查点 19MB vs 全量 3.8GB）；build 从 base 应用差异链自动合成。
+- **延迟 dump**：trace 在线只做轻量采集（fork 镜像代理 + 寄存器/段表状态），
+  内存 dump 在目标阶段结束后按检查点顺序离线进行（diff 需要顺序）——
+  目标采集期间无重 CPU 负载；代理 pause 阻塞（不占 CPU）并 setpgid
+  脱离目标进程组。SIGTERM/SIGINT 触发优雅退出（先完成离线 dump）。
 - `--breakpoint ADDR`：在构建期向内存映像注入 int3（gdb 无法在 stub 恢复
   内存前插入软件断点；此方法在恢复时自动生效，配合 gdb 调试切片）。
 
@@ -59,7 +71,8 @@ make                          # 需要 gcc/as/ld/objcopy
 | DWARF 修补 | `src/dwarf.c` | PIE 程序的调试节地址加加载偏置（DWARF v4/v5） |
 | 查看器 | `src/dump.c` | `.elftrace` 人读 |
 | 检查点采集 | `src/trace.c` | perf 指令计数，每 N 条指令冻结采集一个检查点 + manifest |
-| COW 注入器 | `src/inject.c` | 冻结目标时注入 fork（两阶段：mmap 专用页+自跳转），目标停顿 ~100ns，内存快照从自旋的镜像代理异步读取 |
+| COW 注入器 | `src/inject.c` | 冻结目标时注入 fork（两阶段：mmap 专用页+自跳转），目标停顿 ~100ns；镜像代理 pause 阻塞（不占 CPU）+ setpgid 脱离目标组 |
+| 归档工具 | `src/bundle.c` | 检查点目录打包为单文件（bundle 格式），build 可直接读取 |
 
 ### 恢复流程（x86_64 stub）
 
@@ -91,7 +104,7 @@ make                          # 需要 gcc/as/ld/objcopy
 ## 测试
 
 ```bash
-tests/run_tests.sh     # 一键运行全部 13 项测试
+tests/run_tests.sh     # 一键运行全部 15 项测试
 ```
 
 | 测试 | 覆盖 |
@@ -109,6 +122,8 @@ tests/run_tests.sh     # 一键运行全部 13 项测试
 | `test_thread.sh` | 多线程不崩溃（语义未定义） |
 | `test_append.sh` | O_APPEND fd 偏移语义 |
 | `test_bareheap.sh` | baremetal brk mock + real malloc fallback |
+| `test_interval.sh` | 区间切片指令数精度（内部/外部双验证，误差 <5%，10m/50m/100m） |
+| `test_bundle.sh` | trace bundle（打包/从 bundle 组装/解包一致性） |
 
 需要 `kernel.yama.ptrace_scope=0`（或目标进程允许被跟踪）。
 
@@ -125,8 +140,8 @@ tests/run_tests.sh     # 一键运行全部 13 项测试
 - real 模式下目标后续 sbrk/brk 增长受限：目标 glibc 的 brk 缓存（恢复
   的内存）与切片进程内核 brk 指针不一致，跨地址空间差距的 brk 扩展被
   overcommit 拒绝；glibc malloc 会 fallback 到 mmap，分配仍可用。
-- trace 被强杀（timeout/kill -9）时 COW 镜像代理不会回收（正常结束时
-  统一回收）；代理是目标的子进程并自旋，目标退出后成为孤儿。
+- trace 被强杀（SIGKILL）时 COW 镜像代理不会回收（正常结束/SIGTERM
+  时统一回收）；代理 pause 阻塞不占 CPU，目标退出后成为孤儿。
 - 指令流精确到单条（Intel PT/dynamorio 级）留作增强；当前检查点粒度 = N。
 - 冻结在系统调用中途时，该次 in-flight syscall 会丢失（检测到会告警）。
 - vdso/vvar/vsyscall 为内核管理区域，不采集不恢复；程序若在冻结后
