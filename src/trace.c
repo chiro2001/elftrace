@@ -282,9 +282,13 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
                  tc->ckpt_no);
         const char *base = strrchr(path, '/');
         base = base ? base + 1 : path;
-        fprintf(f, "%llu 0x%llx %s\n",
+        /* 第 4 字段: 该检查点时刻已捕获的 syscall 记录数 —
+           build --from/--to 据此裁剪回放表 (切片从检查点 K 恢复,
+           只消费 K 之后的 syscall 记录) */
+        fprintf(f, "%llu 0x%llx %s %zu\n",
                 (unsigned long long)tc->count,
-                (unsigned long long)sn.regs.rip, base);
+                (unsigned long long)sn.regs.rip, base,
+                tc->n_syscalls);
         fclose(f);
     }
     fprintf(stderr, "trace: ckpt %zu @ count %llu pc %#llx\n", tc->ckpt_no,

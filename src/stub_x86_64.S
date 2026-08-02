@@ -111,6 +111,9 @@ rst_desc:
     .quad 0                    /* stack_vaddr @0xA0 (builder 填) */
     .quad 0                    /* rlim_stack_cur @0xA8 (builder 填) */
     .quad 0                    /* rlim_stack_max @0xB0 (builder 填) */
+    .quad 0                    /* replay_off @0xB8 (builder 填, blob 相对) */
+    .quad 0                    /* replay_size @0xC0 (builder 填, 0=无回放表) */
+    .quad 0                    /* replay_cur @0xC8 (stub 运行时维护) */
     .space 0x100 - (.-rst_desc)  /* 补足 256B */
 
 /* ===================== FPU 状态 ===================== */
@@ -153,6 +156,9 @@ ipc_sigact:
 stub_stack:
     .space STUB_STACK_SIZE
 stub_stack_top:
+/* 裸金属处理器安全区 (bm_handler 迁移信号帧; 恢复完成目标运行后
+   stub_stack 闲置, 复用其空间; BM_SAFE_SIZE 需 <= STUB_STACK_SIZE) */
+bm_safe_area:
 
 /* ===================== 信号帧 ===================== */
 .org STUB_FRAME_OFF
@@ -716,13 +722,44 @@ ipc_restorer:
  * push x10 后 uc = rsp + 8 + 0x50 = rsp + 0x58,
  * sigcontext = uc + 0x28 = rsp + 0x80。
  */
-#define BMS_SC      0x80
+#define BMS_SC      0xB0
 #define BMS_RAX     (BMS_SC + SIGFRAME_SC_RAX)
 #define BMS_RDI     (BMS_SC + SIGFRAME_SC_RDI)
 #define BMS_RDX     (BMS_SC + SIGFRAME_SC_RDX)
 #define BMS_RIP     (BMS_SC + SIGFRAME_SC_RIP)
 
+/* 处理器安全区: 内核信号帧迁移至此 (dirty 回放覆盖目标栈页时,
+   帧/处理器栈不被破坏)。复用 stub 栈区 (恢复完成目标运行后闲置)。
+   BM_SAFE_SIZE 覆盖 帧+fpstate (~0x1000) + push 区 + 原帧地址槽 */
+#define BM_SAFE_SIZE 0x1100
+
 bm_handler:
+    /* 迁移内核信号帧 (含 push 区, 起点 frame-0x80) 到安全区:
+       dirty 回放覆盖目标栈页时帧不被破坏; SAFE+SIZE 存原 frame 地址
+       (fpstate 指针修正用); 迁移后 push 前 rsp = SAFE+0x80,
+       push 后 rsp = SAFE (对应原 frame-0x80 语义, BMS_* 偏移不变) */
+    movq %rsp, bm_safe_area+BM_SAFE_SIZE(%rip)
+    lea bm_safe_area(%rip), %rdi
+    lea -0x80(%rsp), %rsi
+    movq $BM_SAFE_SIZE, %rcx
+    rep movsb
+    lea bm_safe_area(%rip), %rsp
+    addq $0x80, %rsp               /* push 前 rsp = SAFE+0x80 */
+    movq 0xE8(%rsp), %rax          /* sc->fpstate (sc = rsp+0x30) */
+    testq %rax, %rax
+    jz 1f
+    subq bm_safe_area+BM_SAFE_SIZE(%rip), %rax   /* 帧内偏移 */
+    lea bm_safe_area(%rip), %rcx
+    addq %rcx, %rax
+    addq $0x80, %rax
+    movq %rax, 0xE8(%rsp)
+1:
+    /* 清 AC (对齐检查): 采集的 eflags 可能含 AC (ptrace 停止时内核
+       置 RF, 目标自身 AC 未知), 处理器内非对齐访问 (回放表/rep) 会
+       触发 #AC → SIGBUS */
+    pushfq
+    andq $-0x40001, (%rsp)         /* 清 AC + RF */
+    popfq
     pushq %rax
     pushq %rbx
     pushq %rcx
@@ -737,11 +774,190 @@ bm_handler:
     /* 触发地址 = sc->rip - 1; 与退出点比较 */
     movq BMS_RIP(%rsp), %rax
     decq %rax
+    movq %rax, %r12                    /* r12 = 触发地址 (后续 rax 被复用) */
     movq rst_desc+RST_DESC_EXIT_ADDR(%rip), %rbx
     cmpq %rbx, %rax
     je bm_goto_exit
 
-    /* 分派 syscall 号 */
+    /* exit_group/exit: 无条件真实退出 (回放表无记录 — trace 早于目标
+       退出, 且终止类 syscall 无需回放状态) */
+    movq BMS_RAX(%rsp), %rax
+    cmpq $231, %rax
+    je bm_real_exit
+    cmpq $60, %rax
+    je bm_real_exit
+
+    /* ===== syscall 回放表 (trace 生成的 syscalls/ 差异, 有记录时优先) =====
+       回放表布局 (blob 相对, build 填充):
+         +0   n_recs;  rec[i] @ 8+i*80:
+           +0 pc +8 sysno +16 rax +24 n_unmap +32 unmap_off
+           +40 n_newseg +48 newseg_off +56 n_dirty +64 dirty_off +72 pad
+         数据区 (偏移相对 replay 起点):
+           unmap {vaddr};  newseg {vaddr,filesz,memsz,flags}+data;
+           dirty {vaddr}+4096
+       游标顺序消费 (单线程执行顺序 == 记录顺序)。 */
+    movq rst_desc+RST_DESC_REPLAY_SIZE(%rip), %rbx
+    testq %rbx, %rbx
+    jz bm_mock_dispatch
+
+    call 1f
+1:  popq %r15
+    subq $(1b - bm_handler), %r15      /* r15 = bm_handler 绝对地址 */
+    subq $(bm_handler - _start), %r15  /* r15 = _start 绝对地址 */
+    subq $STUB_ENTRY_OFF, %r15         /* r15 = blob base */
+    movq %r15, %rbx
+
+    movq rst_desc+RST_DESC_REPLAY_OFF(%rip), %r15
+    addq %rbx, %r15                    /* r15 = replay 区起点 */
+    movq (%r15), %r13                  /* r13 = n_recs */
+    movq rst_desc+RST_DESC_REPLAY_CUR(%rip), %r14  /* 游标 */
+
+bm_replay_scan:
+    cmpq %r13, %r14
+    jae bm_replay_miss
+    movq %r14, %r11
+    imulq $80, %r11
+    cmpq 8(%r15,%r11), %r12            /* rec.pc vs 触发地址 */
+    je bm_replay_hit
+    incq %r14
+    jmp bm_replay_scan
+
+bm_replay_hit:
+    leaq 1(%r14), %r10
+    movq %r10, rst_desc+RST_DESC_REPLAY_CUR(%rip)
+    movq %r14, %r11
+    imulq $80, %r11
+    addq $8, %r11
+    addq %r15, %r11                    /* r11 = rec */
+    movq %r15, %rbp                    /* rbp = replay 起点 (数据区基址) */
+    movq %r11, %rbx                    /* rbx = rec (syscall 破坏 r11, rbx 安全) */
+
+    /* --- unmap: munmap(vaddr, 1) (unmap 任意重叠 VMA) --- */
+    movq 24(%rbx), %r12
+    movq 32(%rbx), %r13
+    addq %rbp, %r13
+bm_rp_unmap_loop:
+    testq %r12, %r12
+    jz bm_rp_newseg
+    movq (%r13), %rdi
+    addq $8, %r13
+    movq $1, %rsi
+    movq $11, %rax
+    syscall
+    decq %r12
+    jmp bm_rp_unmap_loop
+
+    /* --- newseg: mmap(vaddr,memsz,RW,FIXED|ANON) + 拷贝 + mprotect --- */
+bm_rp_newseg:
+    movq 40(%rbx), %r12
+    movq 48(%rbx), %r13
+    addq %rbp, %r13
+bm_rp_newseg_loop:
+    testq %r12, %r12
+    jz bm_rp_dirty
+    movq 0(%r13), %rdi                 /* vaddr */
+    movq 16(%r13), %rsi                /* memsz */
+    movq $6, %rdx                      /* PROT_READ|PROT_WRITE */
+    movq $0x32, %r10                   /* PRIVATE|ANON|FIXED */
+    movq $-1, %r8
+    xorq %r9, %r9
+    movq $9, %rax                      /* mmap */
+    syscall
+    /* 拷贝 filesz: src=r13+32, dst=vaddr(mmap 返回), len=filesz */
+    movq 8(%r13), %rcx
+    movq %rcx, %r14                    /* 保存 len (syscall 破坏 rcx) */
+    movq %rax, %rdi                    /* dst = vaddr */
+    leaq 32(%r13), %rsi                /* src */
+    rep movsb
+    /* mprotect(vaddr, memsz, flags) */
+    movq 0(%r13), %rdi
+    movq 16(%r13), %rsi
+    movq 24(%r13), %rdx
+    movq $10, %rax
+    syscall
+    movq 8(%r13), %rax
+    addq $32, %r13
+    addq %rax, %r13                    /* 下一条记录 */
+    decq %r12
+    jmp bm_rp_newseg_loop
+
+    /* --- dirty: 逐页按 vaddr 找段 (segs 表) 拷贝 --- */
+bm_rp_dirty:
+    movq 56(%rbx), %r12
+    movq 64(%rbx), %r13
+    addq %rbp, %r13
+bm_rp_dirty_loop:
+    testq %r12, %r12
+    jz bm_rp_done
+    movq (%r13), %r14                  /* dirty vaddr */
+    movq %rbp, %r15
+    movq rst_desc+RST_DESC_REPLAY_OFF(%rip), %r8
+    subq %r8, %r15                     /* r15 = blob base */
+    movq rst_desc+RST_DESC_SEGS_OFF(%rip), %r8
+    addq %r15, %r8                     /* r8 = segs 表 */
+    movq rst_desc+RST_DESC_N_SEGS(%rip), %r9
+    xorq %r10, %r10                    /* i */
+bm_rp_dirty_find:
+    cmpq %r9, %r10
+    jae bm_rp_dirty_next
+    movq %r10, %r15
+    imulq $48, %r15                    /* seg 偏移 */
+    movq (%r8,%r15), %rax              /* seg.vaddr */
+    cmpq %rax, %r14
+    jb bm_rp_dirty_find_next
+    movq 8(%r8,%r15), %rdx             /* seg.filesz */
+    addq %rax, %rdx
+    cmpq %rdx, %r14
+    jae bm_rp_dirty_find_next
+    /* src = blob base + seg.payload_off + (dirty - seg.vaddr) */
+    movq 32(%r8,%r15), %rdi
+    movq %rbp, %r11
+    movq rst_desc+RST_DESC_REPLAY_OFF(%rip), %rsi
+    subq %rsi, %r11                    /* r11 = blob base */
+    addq %r11, %rdi
+    movq %r14, %rsi
+    subq %rax, %rsi
+    addq %rsi, %rdi                    /* rdi = src */
+    /* len = min(4096, filesz - off) */
+    movq 8(%r8,%r15), %rcx
+    subq %rsi, %rcx
+    cmpq $4096, %rcx
+    jae 1f
+    jmp 2f
+1:  movq $4096, %rcx
+2:  movq %r14, %rsi                    /* dst = dirty vaddr */
+    xchgq %rdi, %rsi                   /* rsi=src rdi=dst */
+    rep movsb
+    jmp bm_rp_dirty_next
+bm_rp_dirty_find_next:
+    incq %r10
+    jmp bm_rp_dirty_find
+bm_rp_dirty_next:
+    addq $4104, %r13                   /* vaddr(8) + 4096 */
+    decq %r12
+    jmp bm_rp_dirty_loop
+
+bm_rp_done:
+    /* rax = B 的 syscall 返回值 */
+    movq 16(%rbx), %rax
+    movq %rax, BMS_RAX(%rsp)
+    jmp bm_done
+
+bm_replay_miss:
+    /* 无回放记录 (trace 窗口外的 syscall): 不兜底, 报错退出 */
+    jmp bm_unsupported
+
+bm_real_exit:
+    movq BMS_RDI(%rsp), %rdi            /* 退出码 */
+    movq $231, %rax                     /* exit_group */
+    syscall
+    /* 不返回; 兜底 exit */
+    movq $60, %rax
+    syscall
+    hlt
+
+bm_mock_dispatch:
+    /* 分派 syscall 号 (无回放表时的旧 mock 路径) */
     movq BMS_RAX(%rsp), %rax
     cmpq $231, %rax
     je bm_do_exit

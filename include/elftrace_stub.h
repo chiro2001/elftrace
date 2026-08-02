@@ -71,6 +71,9 @@
 #define RST_DESC_STACK_VADDR 0xA0  /* [stack] 段 vaddr (恢复时 MAP_GROWSDOWN) */
 #define RST_DESC_RLIM_STACK_CUR 0xA8  /* RLIMIT_STACK 当前值 */
 #define RST_DESC_RLIM_STACK_MAX 0xB0  /* RLIMIT_STACK 最大值 */
+#define RST_DESC_REPLAY_OFF  0xB8  /* baremetal syscall 回放表偏移 (blob 相对) */
+#define RST_DESC_REPLAY_SIZE 0xC0  /* 回放表大小 (0=无, 走旧 mock) */
+#define RST_DESC_REPLAY_CUR  0xC8  /* 回放表游标 (stub 运行时维护, 顺序消费) */
 
 #define RST_DESC_MAGIC_VAL  0x5253544452455354  /* "RESTDSTR" */
 
