@@ -23,7 +23,7 @@ __attribute__((noinline)) static unsigned long deep(unsigned long x, int depth)
     if (depth <= 0) {
         printf("TOP\n");
         fflush(stdout);
-        for (unsigned long i = 0; i < 1500000000UL; i++)
+        for (unsigned long i = 0; i < 500000000UL; i++)
             x += (i * 2654435761UL) & 0xff;
         return x;
     }
@@ -31,7 +31,7 @@ __attribute__((noinline)) static unsigned long deep(unsigned long x, int depth)
         printf("MID\n");
         fflush(stdout);
     }
-    for (unsigned long i = 0; i < 400000; i++)
+    for (unsigned long i = 0; i < 100000; i++)
         x += (i * 2654435761UL) & 0xff;
     memset(pad, depth & 0xff, sizeof(pad));
     sink += pad[0];

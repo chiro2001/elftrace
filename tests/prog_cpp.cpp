@@ -48,7 +48,7 @@ int main(int argc, char **argv)
 
     unsigned long x = 0x12345678UL;
     for (int c = 0; c < 8; c++) {
-        for (unsigned long j = 0; j < 150000000UL; j++) {
+        for (unsigned long j = 0; j < 75000000UL; j++) {
             x = hash_combine(x, data[j & 255]);
             x ^= labels.size() + payload.size();
         }

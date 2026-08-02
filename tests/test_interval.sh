@@ -24,7 +24,7 @@ g++ -O2 -o "$PROG" tests/prog_cpp.cpp || { echo "FAIL: compile"; exit 1; }
 rm -rf "$CKPTS"
 tf_run_bg "tr" "$PROG"
 sleep 0.3
-timeout 8 "$TF_ELFTRACE" trace "$TF_PID" --every "$N" --out "$CKPTS" \
+timeout 5 "$TF_ELFTRACE" trace "$TF_PID" --every "$N" --out "$CKPTS" \
     > /dev/null 2>&1
 tf_cleanup prog_interval
 

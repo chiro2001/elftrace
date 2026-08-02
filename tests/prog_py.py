@@ -17,7 +17,7 @@ def main():
     data = [i * 2654435761 % 2**64 for i in range(256)]
     x = 0x12345678
     for c in range(5):
-        for j in range(15000000):
+        for j in range(8000000):
             x = (x + data[j & 255]) * 31 & (2**64 - 1)
         print(f"CKPT {c} x={x}")
         sys.stdout.flush()

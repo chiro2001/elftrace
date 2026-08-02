@@ -44,7 +44,7 @@ int main(void)
     for (int c = 0; c < 8; c++) {
         printf("CKPT %d\n", c);
         fflush(stdout);
-        for (unsigned long j = 0; j < 64000000UL; j++) {
+        for (unsigned long j = 0; j < 32000000UL; j++) {
             rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
             x += mem[(rng >> 36) & MASK];
         }

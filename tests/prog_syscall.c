@@ -12,7 +12,7 @@ int main(void)
     for (int i = 0; i < 5; i++) {
         printf("SLEEP %d\n", i);
         fflush(stdout);
-        sleep(2);
+        sleep(1);
         printf("WAKE %d\n", i);
         fflush(stdout);
     }
