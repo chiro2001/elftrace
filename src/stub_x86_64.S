@@ -722,7 +722,7 @@ ipc_restorer:
  * push x10 后 uc = rsp + 8 + 0x50 = rsp + 0x58,
  * sigcontext = uc + 0x28 = rsp + 0x80。
  */
-#define BMS_SC      0xB0
+#define BMS_SC      0x80
 #define BMS_RAX     (BMS_SC + SIGFRAME_SC_RAX)
 #define BMS_RDI     (BMS_SC + SIGFRAME_SC_RDI)
 #define BMS_RDX     (BMS_SC + SIGFRAME_SC_RDX)
@@ -734,10 +734,14 @@ ipc_restorer:
 #define BM_SAFE_SIZE 0x1100
 
 bm_handler:
-    /* 迁移内核信号帧 (含 push 区, 起点 frame-0x80) 到安全区:
-       dirty 回放覆盖目标栈页时帧不被破坏; SAFE+SIZE 存原 frame 地址
+    /* 回放路径 (有回放表) 才迁移信号帧到安全区:
+       dirty 回放覆盖目标栈页时帧不被破坏; 旧 mock 路径 (无表) 原样
+       (其分派/帧布局经验证无迁移依赖)。SAFE+SIZE 存原 frame 地址
        (fpstate 指针修正用); 迁移后 push 前 rsp = SAFE+0x80,
        push 后 rsp = SAFE (对应原 frame-0x80 语义, BMS_* 偏移不变) */
+    movq rst_desc+RST_DESC_REPLAY_SIZE(%rip), %rbx
+    testq %rbx, %rbx
+    jz bm_mock_entry
     movq %rsp, bm_safe_area+BM_SAFE_SIZE(%rip)
     lea bm_safe_area(%rip), %rdi
     lea -0x80(%rsp), %rsi
@@ -745,14 +749,14 @@ bm_handler:
     rep movsb
     lea bm_safe_area(%rip), %rsp
     addq $0x80, %rsp               /* push 前 rsp = SAFE+0x80 */
-    movq 0xE8(%rsp), %rax          /* sc->fpstate (sc = rsp+0x30) */
+    movq 0xB8(%rsp), %rax          /* sc->fpstate (sc = rsp) */
     testq %rax, %rax
     jz 1f
     subq bm_safe_area+BM_SAFE_SIZE(%rip), %rax   /* 帧内偏移 */
     lea bm_safe_area(%rip), %rcx
     addq %rcx, %rax
     addq $0x80, %rax
-    movq %rax, 0xE8(%rsp)
+    movq %rax, 0xB8(%rsp)
 1:
     /* 清 AC (对齐检查): 采集的 eflags 可能含 AC (ptrace 停止时内核
        置 RF, 目标自身 AC 未知), 处理器内非对齐访问 (回放表/rep) 会
@@ -760,6 +764,11 @@ bm_handler:
     pushfq
     andq $-0x40001, (%rsp)         /* 清 AC + RF */
     popfq
+    jmp bm_common
+
+bm_mock_entry:
+    /* 旧 mock 路径: 无迁移, 直接压栈 (帧在目标栈, BMS_* 读 rsp0) */
+bm_common:
     pushq %rax
     pushq %rbx
     pushq %rcx

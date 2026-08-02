@@ -169,10 +169,30 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
     } else {
         if (!tc->have_pending) {
             /* INTERRUPT 打断进行中的 syscall: entry-stop 在捕获窗口前
-               (trace 开始前已在 syscall 中 / 被 INTERRUPT 打断),
-               该 syscall 的入口状态不可得, 跳过 (不中断采集) */
-            fprintf(stderr, "trace: syscall exit without entry @ %#llx "
-                    "(skipped)\n", (unsigned long long)rip);
+               (trace 开始前已在 syscall 中 / 被 INTERRUPT 打断)。
+               补记: A = 上检查点快照 (近似: 打断时刻状态不可得),
+               B = 当前 (syscall 已完成, buffer 被写/rax=返回值)。
+               切片从检查点恢复后重做该 syscall (int3) 时命中。 */
+            struct collect_snapshot b = {.pid = tc->pid};
+            collect_state_light(tc->pid, &b);
+            collect_memory(tc->pid, &b);
+            tc->syscalls = xrealloc(tc->syscalls,
+                                    (tc->n_syscalls + 1) *
+                                    sizeof(*tc->syscalls));
+            struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
+            r->pc = rip - 2;    /* syscall 指令 (x86_64 0f05 长 2) */
+            r->sysno = 0;       /* EXIT-stop 无 syscall 号 */
+            if (tc->have_last) {
+                collect_snapshot_copy_light(&r->light_a, &tc->last);
+                cbuf_append(&r->light_a.payload, tc->last.payload.data,
+                            tc->last.payload.size);
+            }
+            collect_snapshot_copy_light(&r->light_b, &b);
+            cbuf_append(&r->light_b.payload, b.payload.data, b.payload.size);
+            collect_free(&b);
+            fprintf(stderr, "trace: interrupted syscall @ %#llx "
+                    "(A=last ckpt, rec %zu)\n",
+                    (unsigned long long)r->pc, tc->n_syscalls - 1);
             ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);
             return;
         }
@@ -222,11 +242,41 @@ static int collect_interrupt_sc(struct trace_ctx *tc)
                 die("trace: PTRACE_GET_SYSCALL_INFO failed");
             fprintf(stderr, "dbg: interrupt-sc syscall op=%d\n",
                     (int)psi.op);
-            if (psi.op == PTRACE_SYSCALL_INFO_ENTRY)
+            if (psi.op == PTRACE_SYSCALL_INFO_ENTRY) {
                 handle_syscall_stop(tc, 1, psi.entry.nr,
                                     psi.instruction_pointer);
-            else
+            } else if (psi.op == PTRACE_SYSCALL_INFO_EXIT &&
+                       !tc->have_pending) {
+                /* INTERRUPT 打断进行中的 syscall: 恢复后先产生
+                   EXIT-stop (无对应 entry)。补记该记录 —
+                   A = 上检查点快照 (近似: 打断时刻状态不可得),
+                   B = 当前 (syscall 已完成, buffer 被写/rax=返回值)。
+                   切片从检查点恢复后重做该 syscall (int3) 时命中。 */
+                struct collect_snapshot b = {.pid = pid};
+                collect_state_light(pid, &b);
+                collect_memory(pid, &b);
+                tc->syscalls = xrealloc(tc->syscalls,
+                                        (tc->n_syscalls + 1) *
+                                        sizeof(*tc->syscalls));
+                struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
+                r->pc = psi.instruction_pointer - 2; /* syscall 指令 */
+                r->sysno = 0;   /* EXIT-stop 无 syscall 号 */
+                if (tc->have_last) {
+                    collect_snapshot_copy_light(&r->light_a, &tc->last);
+                    cbuf_append(&r->light_a.payload,
+                                tc->last.payload.data,
+                                tc->last.payload.size);
+                }
+                collect_snapshot_copy_light(&r->light_b, &b);
+                cbuf_append(&r->light_b.payload, b.payload.data,
+                            b.payload.size);
+                collect_free(&b);
+                fprintf(stderr, "trace: interrupted syscall @ %#llx "
+                        "(A=last ckpt)\n",
+                        (unsigned long long)r->pc);
+            } else {
                 handle_syscall_stop(tc, 0, 0, psi.instruction_pointer);
+            }
             continue;           /* 重新 INTERRUPT */
         }
         if (si == SIGTRAP)
