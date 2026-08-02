@@ -21,6 +21,7 @@
 #include "elftrace.h"
 #include "elftrace_stub.h"
 #include "collect.h"
+#include "bundle.h"
 #include "util.h"
 
 /* ---- 生成的 stub blob ---- */
@@ -321,6 +322,14 @@ int build_main(int argc, char **argv)
                 die("--mode must be real or baremetal");
         } else if (strcmp(argv[i], "--checkpoints") == 0 && i + 1 < argc) {
             ckpts = argv[++i];
+            /* bundle 单文件: 解包到临时目录 */
+            if (bundle_is_bundle(ckpts)) {
+                char tmpdir[] = "/tmp/elftrace_bundle_XXXXXX";
+                if (!mkdtemp(tmpdir))
+                    die("mkdtemp");
+                bundle_extract(ckpts, tmpdir);
+                ckpts = xstrdup(tmpdir);
+            }
         } else if (strcmp(argv[i], "--from") == 0 && i + 1 < argc) {
             from_ckpt = strtol(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--to") == 0 && i + 1 < argc) {
