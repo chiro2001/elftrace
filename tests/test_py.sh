@@ -20,8 +20,8 @@ python3 "$SCRIPT" > "$TMP/py_ref.out" 2>&1
 REF_RC=$?
 echo "ref rc=$REF_RC $(tail -1 "$TMP/py_ref.out")"
 
-run_case() {  # $1 = 名称, $2 = 冻结方式 (freeze|stub), $3 = 额外 build 参数
-    local name="$1" mode="$2" bm="$3"
+run_case() {  # $1 = 名称, $2 = 冻结方式 (freeze|stub), $3 = build 参数, $4 = 是否 baremetal
+    local name="$1" mode="$2" bm="$3" is_bm="$4"
     local extra=""
     [ "$mode" = "stub" ] && extra="--stub"
 
@@ -53,7 +53,7 @@ run_case() {  # $1 = 名称, $2 = 冻结方式 (freeze|stub), $3 = 额外 build 
     "$ELFTRACE" build "$SNAP" -o "$SLICED" $bm >/dev/null 2>&1 || { echo "FAIL[$name]: build"; return 1; }
 
     local S_RC
-    if [ -n "$bm" ]; then
+    if [ -n "$is_bm" ]; then
         timeout 60 strace -o "$TMP/py_${name}.strace" "$SLICED" > /dev/null 2>&1
         S_RC=$?
         # baremetal: 目标阶段 (rt_sigreturn 后) 无真实 syscall
@@ -80,9 +80,9 @@ run_case() {  # $1 = 名称, $2 = 冻结方式 (freeze|stub), $3 = 额外 build 
     return 0
 }
 
-run_case "ext" "freeze" "" || exit 1
-run_case "stub" "stub" "" || exit 1
-run_case "bm" "freeze" "--mode baremetal" || exit 1
+run_case "ext" "freeze" "--mode real" "" || exit 1
+run_case "stub" "stub" "--mode real" "" || exit 1
+run_case "bm" "freeze" "--mode baremetal" 1 || exit 1
 
 echo "PASS: python slice (external/stub/baremetal, rc=$REF_RC)"
 exit 0

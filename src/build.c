@@ -138,7 +138,7 @@ int build_main(int argc, char **argv)
     const char *out = "sliced.elf";
     uint64_t ipc_period = 0;
     uint64_t breakpoint = 0;    /* 注入 int3 的地址 (0 = 无) */
-    int mode_baremetal = 0;
+    int mode_baremetal = 1;   /* 默认 baremetal */
     const char *ckpts = NULL;   /* trace 检查点目录 */
     long from_ckpt = -1, to_ckpt = -1;
     struct snap s = {0};

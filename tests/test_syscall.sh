@@ -53,7 +53,7 @@ kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null
 echo "freeze warning OK: $(grep -o 'frozen inside syscall [0-9]*;.*' "$TMP/syscall_freeze.err")"
 
 # 4. 组装 + 运行切片 (重新执行被中断的 sleep, 总时长仍有限)
-"$ELFTRACE" build "$SNAP" -o "$SLICED" >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }
 timeout 30 "$SLICED" > /dev/null 2>&1
 S_RC=$?
 [ "$S_RC" = "$REF_RC" ] || { echo "FAIL: sliced rc=$S_RC != ref $REF_RC"; exit 1; }

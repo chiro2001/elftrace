@@ -30,7 +30,7 @@ BIAS=$("$ELFTRACE" dump "$SNAP" | awk '/exe_bias/{print $2}')
 ENTRY=$("$ELFTRACE" dump "$SNAP" | awk '/entry_pc/{print $2}')
 [ "$BIAS" != "0x0" ] || { echo "FAIL: PIE bias is zero"; exit 1; }
 
-"$ELFTRACE" build "$SNAP" -o "$SLICED" || exit 1
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real || exit 1
 
 # 1. 符号地址 = 文件地址 + bias
 MAIN_FILE=$(nm "$PROG" | awk '$3=="main"{print $1}')
@@ -46,7 +46,7 @@ echo "$L" | grep -q "$EXPECT" || { echo "FAIL: line info address mismatch: $L (e
 echo "line info: $L OK"
 
 # 3. 冻结点注入 int3, gdb 运行切片应命中并给出源码位置/栈
-"$ELFTRACE" build "$SNAP" -o "$SLICED" --breakpoint "$ENTRY" || exit 1
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real --breakpoint "$ENTRY" || exit 1
 OUT=$(timeout 90 gdb -batch -ex "run" -ex "bt 2" -ex "info locals" "$SLICED" 2>/dev/null)
 echo "$OUT" | grep -q "SIGTRAP" || { echo "FAIL: no SIGTRAP"; exit 1; }
 echo "$OUT" | grep -q "prog_simple.c:" || { echo "FAIL: no source line in backtrace"; echo "$OUT"; exit 1; }

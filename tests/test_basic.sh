@@ -36,7 +36,7 @@ grep -q "$CP" "$TMP/frozen.out" || { echo "FAIL: checkpoint not reached"; kill $
 "$ELFTRACE" freeze "$PID" -o "$SNAP" || { echo "FAIL: freeze"; exit 1; }
 
 # 3. 组装
-"$ELFTRACE" build "$SNAP" -o "$SLICED" || { echo "FAIL: build"; exit 1; }
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real || { echo "FAIL: build"; exit 1; }
 
 # 4. 运行切片
 timeout 60 "$SLICED" > "$TMP/sliced.out" 2>&1

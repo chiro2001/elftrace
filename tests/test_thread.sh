@@ -41,7 +41,7 @@ echo "threads at freeze: $NTHR"
 kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null
 
 # 3. 组装 + 运行切片 (主线程续跑; worker 线程不复存在)
-"$ELFTRACE" build "$SNAP" -o "$SLICED" >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }
 timeout 60 "$SLICED" > /dev/null 2>&1
 S_RC=$?
 

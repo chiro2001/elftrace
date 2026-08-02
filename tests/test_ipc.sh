@@ -28,7 +28,7 @@ sleep 0.3
 grep -q "$CP" "$TMP/ipc_frozen.out" || { echo "FAIL: checkpoint not reached"; kill $PID; exit 1; }
 "$ELFTRACE" freeze "$PID" -o "$SNAP" || exit 1
 
-"$ELFTRACE" build "$SNAP" -o "$SLICED" --ipc "$IPC_N" || exit 1
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real --ipc "$IPC_N" || exit 1
 
 # 运行切片 (同步, 限制时间)
 START=$(date +%s)

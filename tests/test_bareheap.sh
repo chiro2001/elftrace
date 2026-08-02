@@ -32,7 +32,7 @@ run_case() {  # $1 = 名称, $2 = prog 参数, $3 = build 参数, $4 = 期望 rc
     wait $PID 2>/dev/null
     local ORIG_RC=$?
 
-    "$ELFTRACE" build "$SNAP" -o "$SLICED" $bm >/dev/null 2>&1 || { echo "FAIL[$name]: build"; return 1; }
+    "$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real $bm >/dev/null 2>&1 || { echo "FAIL[$name]: build"; return 1; }
 
     local S_RC
     if [ -n "$bm" ]; then
@@ -67,7 +67,7 @@ run_case() {  # $1 = 名称, $2 = prog 参数, $3 = build 参数, $4 = 期望 rc
     || { echo "FAIL: ref --sbrk"; exit 1; }
 echo "ref: MALLOC OK / SBRK OK (both rc=0)"
 
-run_case "real" "" "" 0 "MALLOC OK" || exit 1
+run_case "real" "" "--mode real" 0 "MALLOC OK" || exit 1
 run_case "bm" "--sbrk" "--mode baremetal" 3 "" || exit 1
 
 echo "PASS: heap boundary (real malloc fallback + baremetal brk mock)"

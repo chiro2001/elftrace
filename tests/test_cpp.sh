@@ -40,7 +40,7 @@ run_frozen() {  # $1 = extra prog args
 # ============ 1. real 模式 ============
 run_frozen
 ORIG_RC=$?
-"$ELFTRACE" build "$SNAP" -o "$SLICED" >/dev/null 2>&1 || exit 1
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real >/dev/null 2>&1 || exit 1
 timeout 120 "$SLICED" > /dev/null 2>&1
 S_REAL_RC=$?
 [ "$S_REAL_RC" = "$ORIG_RC" ] || { echo "FAIL: real rc $S_REAL_RC != orig $ORIG_RC"; exit 1; }
@@ -85,7 +85,7 @@ NCK=$(wc -l < "$CKPTS/manifest.txt")
 echo "trace: $NCK checkpoints"
 
 # real 区间: 从检查点 1 到检查点 4
-"$ELFTRACE" build /dev/null -o "$SLICED" --checkpoints "$CKPTS" --from 1 --to 4 \
+"$ELFTRACE" build /dev/null -o "$SLICED" --mode real --checkpoints "$CKPTS" --from 1 --to 4 \
     > "$TMP/ckpts_build.log" 2>&1 || { echo "FAIL: build --from/--to"; cat "$TMP/ckpts_build.log"; exit 1; }
 timeout 60 "$SLICED" > /dev/null 2>&1
 R=$?

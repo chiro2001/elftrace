@@ -25,6 +25,7 @@ make                          # 需要 gcc/as/ld/objcopy
 ./build/elftrace freeze <pid> -o snap.elftrace   # 冻结并采集
 ./build/elftrace dump snap.elftrace              # 查看中间文件
 ./build/elftrace build snap.elftrace -o sliced.elf     [--mode real|baremetal] [--ipc N] [--breakpoint ADDR]
+# 注意: 默认 --mode baremetal (syscall 被 mock); real 模式需显式指定
 ./sliced.elf                  # 恢复执行
 
 # 指令区间切片 (功能 7): 先采集检查点, 再从任意检查点恢复/退出

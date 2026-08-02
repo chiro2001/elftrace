@@ -41,7 +41,7 @@ ORIG_RC=$?
 echo "orig-from-frozen rc=0 OK"
 
 # 3. 切片
-"$ELFTRACE" build "$SNAP" -o "$SLICED" >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }
 timeout 60 "$SLICED" > /dev/null 2>&1
 S_RC=$?
 [ "$S_RC" = "$ORIG_RC" ] || { echo "FAIL: sliced rc=$S_RC != $ORIG_RC"; exit 1; }

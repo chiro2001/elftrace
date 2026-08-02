@@ -46,7 +46,7 @@ echo "$FD_LINE" | grep -q "flags=0102001" \
     || { echo "FAIL: O_APPEND flag not captured: ${FD_LINE##*fd }"; exit 1; }
 
 # 4. 组装 + 运行切片
-"$ELFTRACE" build "$SNAP" -o "$SLICED" >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }
 timeout 60 "$SLICED" > /dev/null 2>&1
 S_RC=$?
 [ "$S_RC" = 0 ] || { echo "FAIL: sliced rc=$S_RC"; exit 1; }

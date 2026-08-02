@@ -37,7 +37,7 @@ grep -q "OPENED" "$TMP/fd_frozen.out" || { echo "FAIL: OPENED not seen"; kill $P
 "$ELFTRACE" freeze "$PID" -o "$SNAP" || { echo "FAIL: freeze"; exit 1; }
 
 # 3. 组装 (含 fd 恢复)
-"$ELFTRACE" build "$SNAP" -o "$SLICED" || { echo "FAIL: build"; exit 1; }
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real || { echo "FAIL: build"; exit 1; }
 
 # 4. 运行切片
 timeout 60 "$SLICED" > "$TMP/fd_sliced.out" 2>&1

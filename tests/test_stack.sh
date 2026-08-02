@@ -38,7 +38,7 @@ run_scenario_a() {
     PAYLOAD=$(grep -o "[0-9]* bytes payload" "$TMP/stack_a_freeze.out" | head -1)
     echo "[A] frozen at max depth ($PAYLOAD)"
 
-    "$ELFTRACE" build "$TMP/snap_stack_a.elftrace" -o "$TMP/sliced_stack_a.elf" >/dev/null 2>&1 \
+    "$ELFTRACE" build "$TMP/snap_stack_a.elftrace" -o "$TMP/sliced_stack_a.elf" --mode real >/dev/null 2>&1 \
         || { echo "FAIL[A]: build"; return 1; }
     timeout 90 "$TMP/sliced_stack_a.elf" > /dev/null 2>&1
     local RC=$?
@@ -66,7 +66,7 @@ run_scenario_b() {
     STACKSZ=$("$ELFTRACE" dump "$TMP/snap_stack_b.elftrace" | awk '/\[stack\]/{print $3}')
     echo "[B] frozen mid-descent ([stack]=$STACKSZ bytes, needs ~38MB growth)"
 
-    "$ELFTRACE" build "$TMP/snap_stack_b.elftrace" -o "$TMP/sliced_stack_b.elf" >/dev/null 2>&1 \
+    "$ELFTRACE" build "$TMP/snap_stack_b.elftrace" -o "$TMP/sliced_stack_b.elf" --mode real >/dev/null 2>&1 \
         || { echo "FAIL[B]: build"; return 1; }
     timeout 60 "$TMP/sliced_stack_b.elf" > /dev/null 2>&1
     local RC=$?

@@ -27,7 +27,7 @@ static void usage(void)
             "freeze 采集一个冻结进程的内存/寄存器/fd 快照到中间文件;\n"
             "build 将中间文件组装成可执行 ELF: 运行时恢复内存与寄存器,\n"
             "从冻结点继续执行。--ipc N 使切片在运行 N 条指令后自动退出;\n"
-            "--mode baremetal 生成裸机切片 (syscall 被 mock, 不依赖内核);\n"
+            "--mode real|baremetal (默认 baremetal: syscall 被 mock 不依赖内核);\n"
             "trace 每隔 N 条指令采集一个检查点 (供区间切片)。\n");
 }
 

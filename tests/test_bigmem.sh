@@ -40,7 +40,7 @@ PAYLOAD=$(grep -o "[0-9]* bytes payload" "$TMP/bigmem_freeze.out" | head -1)
 echo "freeze OK ($PAYLOAD)"
 
 # 3. 组装 + 运行切片
-"$ELFTRACE" build "$SNAP" -o "$SLICED" >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }
 timeout 90 "$SLICED" > /dev/null 2>&1
 S_RC=$?
 [ "$S_RC" = "$REF_RC" ] || { echo "FAIL: sliced rc=$S_RC != ref $REF_RC"; exit 1; }
