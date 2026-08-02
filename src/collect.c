@@ -171,9 +171,10 @@ void collect_segments(struct collect_snapshot *sn)
         if (n == 4 && name[0] == ' ')
             memmove(name, name + 1, strlen(name));  /* 去掉路径前导空格 */
 
-        /* 跳过内核管理区域 */
-        if (strstr(name, "[vdso]") || strstr(name, "[vvar") ||
-            strstr(name, "[vsyscall]") || strstr(name, "[sigpage]"))
+        /* 跳过内核管理区域 (vdso/vvar 需采集: libc 缓存其函数指针,
+           切片进程 vdso ASLR 位置不同, 不恢复则调用必崩;
+           vsyscall/sigpage 为固定内核页, 不采集) */
+        if (strstr(name, "[vsyscall]") || strstr(name, "[sigpage]"))
             continue;
         /* 跳过无权限区域 */
         if (perms[0] == '-' && perms[1] == '-' && perms[2] == '-')

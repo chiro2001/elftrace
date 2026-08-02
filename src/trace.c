@@ -147,8 +147,14 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
         return;
     }
     if (is_entry) {
-        if (tc->have_pending)
-            die("trace: syscall entry while pending (state corrupted)");
+        if (tc->have_pending) {
+            /* 捕获窗口竞态 (INTERRUPT 冻结在 syscall 中, 恢复后重复):
+               跳过, 不中断采集 */
+            fprintf(stderr, "trace: syscall entry while pending @ %#llx "
+                    "(skipped)\n", (unsigned long long)rip);
+            ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);
+            return;
+        }
         struct collect_snapshot sn = {.pid = tc->pid};
         collect_state_light(tc->pid, &sn);
         /* 入口基线: 目标在 syscall-stop (本来就停), 直接读内存 */
@@ -161,8 +167,15 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
         tc->have_pending = 1;
         collect_free(&sn);
     } else {
-        if (!tc->have_pending)
-            die("trace: syscall exit without entry (state corrupted)");
+        if (!tc->have_pending) {
+            /* INTERRUPT 打断进行中的 syscall: entry-stop 在捕获窗口前
+               (trace 开始前已在 syscall 中 / 被 INTERRUPT 打断),
+               该 syscall 的入口状态不可得, 跳过 (不中断采集) */
+            fprintf(stderr, "trace: syscall exit without entry @ %#llx "
+                    "(skipped)\n", (unsigned long long)rip);
+            ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);
+            return;
+        }
         struct collect_snapshot sn = {.pid = tc->pid};
         collect_state_light(tc->pid, &sn);
         /* 返回状态: 同样直接读目标内存 (无代理, 无 dumpable/注入交互) */
