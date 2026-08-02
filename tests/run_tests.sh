@@ -23,7 +23,7 @@ ROOT=$(pwd)
 LOG="$ROOT/tmp/test_run.log"
 mkdir -p "$ROOT/tmp"
 
-TESTS="basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap"
+TESTS="basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval"
 PASS=0
 FAIL=0
 
