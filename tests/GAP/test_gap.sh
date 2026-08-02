@@ -43,6 +43,8 @@ done
 [ "$LOADED" = 1 ] || { echo "FAIL: 图未加载完成 (RSS 探测)"; tf_cleanup bfs; exit 1; }
 sleep 0.3   # 进入 Trial 计算
 kill -0 $TF_PID 2>/dev/null || { echo "FAIL: 目标已退出"; tf_cleanup bfs; exit 1; }
+THR=$(awk '/^Threads/{print $2}' "/proc/$TF_PID/status" 2>/dev/null || echo 0)
+[ "$THR" = 1 ] || { echo "FAIL: 目标线程数 $THR != 1 (OMP_NUM_THREADS=1 未生效)"; tf_cleanup bfs; exit 1; }
 
 timeout 180 "$TF_ELFTRACE" freeze "$TF_PID" -o "$SNAP" >/dev/null 2>&1 \
     || { echo "FAIL: freeze (大镜像可能慢)"; tf_cleanup bfs; exit 1; }
