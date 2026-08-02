@@ -34,6 +34,9 @@
 int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child);
 
 #define TRACE_DEFAULT_EVERY 100000000ULL   /* 每 1e8 条指令一个检查点 */
+
+static volatile sig_atomic_t g_stop = 0;
+static void on_sig(int s) { (void)s; g_stop = 1; }
 #define RING_PAGES 5                        /* (1 + 2^k) 页 */
 
 struct trace_ctx {
@@ -51,6 +54,12 @@ struct trace_ctx {
     size_t n_cow_children;
     struct collect_snapshot last;   /* 上一检查点的段表+内容 (增量对比) */
     int have_last;
+    /* 延迟 dump: 在线只保存代理 pid + 轻量状态, 目标阶段结束后按序 dump */
+    struct ckpt_entry {
+        pid_t agent;
+        struct collect_snapshot light;
+    } *entries;
+    size_t n_entries;
 };
 
 static void perf_open(struct trace_ctx *tc)
@@ -129,37 +138,39 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
     /* COW 注入: 目标 fork 镜像代理后立即恢复运行 */
     if (inject_fork(tc->pid, &sn.regs, &child) == 0) {
         tc->cow_ok++;
-        /* 从代理 (fork 时刻快照, 稳定) 读内存, 目标不受影响。
-           注意: 子进程保持 spin (退出会破坏 perf 事件对目标的计数),
-           由 trace 结束时统一回收 */
-        collect_memory(child, &sn);
-        tc->cow_children = xrealloc(tc->cow_children,
-                                    (tc->n_cow_children + 1) *
-                                    sizeof(pid_t));
-        tc->cow_children[tc->n_cow_children++] = child;
+        /* 延迟 dump: 在线只保存代理 pid + 轻量状态 (目标零重负载);
+           代理 pause 阻塞保持快照, 目标阶段结束后统一按序 dump */
+        tc->entries = xrealloc(tc->entries,
+                               (tc->n_entries + 1) *
+                               sizeof(*tc->entries));
+        struct ckpt_entry *e = &tc->entries[tc->n_entries++];
+        e->agent = child;
+        collect_snapshot_copy_light(&e->light, &sn);
         child = -1;
     } else {
         tc->cow_fail++;
-        /* 回退: 冻结期间读全量内存 (tracee 已在 ptrace-stop) */
+        /* 回退: 冻结期间读全量内存并即时写检查点 (tracee 已在 ptrace-stop) */
         collect_memory(tc->pid, &sn);
         collect_resume(tc->pid);
-    }
-
-    snprintf(path, sizeof(path), "%s/ckpt_%06zu.elftrace", tc->out, tc->ckpt_no);
-    if (tc->ckpt_no == 0) {
-        collect_write(&sn, path);
-        collect_snapshot_copy_last(&tc->last, &sn);
-        tc->have_last = 1;
-    } else {
-        collect_write_diff(&tc->last, &sn, path);
-        collect_snapshot_free_last(&tc->last);
-        collect_snapshot_copy_last(&tc->last, &sn);
+        snprintf(path, sizeof(path), "%s/ckpt_%06zu.elftrace", tc->out,
+                 tc->ckpt_no);
+        if (tc->ckpt_no == 0) {
+            collect_write(&sn, path);
+            collect_snapshot_copy_last(&tc->last, &sn);
+            tc->have_last = 1;
+        } else {
+            collect_write_diff(&tc->last, &sn, path);
+            collect_snapshot_free_last(&tc->last);
+            collect_snapshot_copy_last(&tc->last, &sn);
+        }
     }
 
     snprintf(manifest, sizeof(manifest), "%s/manifest.txt", tc->out);
     f = fopen(manifest, "a");
     if (f) {
         /* 记录文件名 (相对目录), 供 build --checkpoints 拼接 */
+        snprintf(path, sizeof(path), "%s/ckpt_%06zu.elftrace", tc->out,
+                 tc->ckpt_no);
         const char *base = strrchr(path, '/');
         base = base ? base + 1 : path;
         fprintf(f, "%llu 0x%llx %s\n",
@@ -208,6 +219,10 @@ int trace_main(int argc, char **argv)
     if (ioctl(tc.perf_fd, PERF_EVENT_IOC_ENABLE, 0) < 0)
         die("perf enable");
 
+    /* SIGTERM/SIGINT: 优雅退出 (先离线 dump 再退出) */
+    signal(SIGTERM, on_sig);
+    signal(SIGINT, on_sig);
+
     /* 全程保持 SEIZE 关系; 每个检查点只 INTERRUPT */
     if (ptrace(PTRACE_SEIZE, pid, 0, 0) < 0)
         die("ptrace(SEIZE) on %d", pid);
@@ -240,20 +255,77 @@ int trace_main(int argc, char **argv)
                     (unsigned long long)cnt,
                     (unsigned long long)tc.meta->data_head);
         }
-        /* tracee 是否还活着 */
+        if (g_stop)
+            break;              /* SIGTERM: 优雅退出进入离线 dump */
+
+        /* tracee 是否还活着 (含僵尸: ptrace 目标被 SIGKILL 后变僵尸,
+           kill(pid,0) 不报 ESRCH, 需 waitpid WNOHANG reap 检测) */
+        {
+            int wst;
+            pid_t wr = waitpid(pid, &wst, WNOHANG);
+            if (wr == pid)
+                break;          /* 目标已退出 */
+        }
         if (kill(pid, 0) < 0 && errno == ESRCH)
             break;
     }
 
+    if (kill(pid, 0) == 0)
+        collect_detach_run(pid);   /* 目标已退出则无需 detach */
+    close(tc.perf_fd);
+
+    /* 离线 dump 阶段: 目标阶段已结束, 按检查点顺序从代理读内存,
+       先检查代理存活情况 */
+    {
+        int nalive = 0, nzombie = 0;
+        for (size_t k = 0; k < tc.n_entries; k++) {
+            pid_t a = tc.entries[k].agent;
+            char sp[64];
+            snprintf(sp, sizeof(sp), "/proc/%d/stat", a);
+            FILE *sf = fopen(sp, "r");
+            if (!sf) {
+                nzombie++;
+                fprintf(stderr, "dump: agent %d (ckpt %zu) gone\n", a, k);
+                continue;
+            }
+            char sb[256];
+            size_t sn2 = fread(sb, 1, sizeof(sb) - 1, sf);
+            sb[sn2] = 0;
+            fclose(sf);
+            char *p = strrchr(sb, ')');
+            if (p && p[1] == ' ' && p[2] == 'Z')
+                nzombie++;
+            else
+                nalive++;
+        }
+        fprintf(stderr, "dump: agents alive=%d zombie/gone=%d\n",
+                nalive, nzombie);
+    }
+
+    /* 检查点 0 写完整快照, 后续与上一检查点对比写 diff (需按序);
+       dump 完的代理立即回收 */
+    for (size_t k = 0; k < tc.n_entries; k++) {
+        struct ckpt_entry *e = &tc.entries[k];
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/ckpt_%06zu.elftrace", tc.out, k);
+        collect_memory(e->agent, &e->light);
+        if (k == 0) {
+            collect_write(&e->light, path);
+            collect_snapshot_copy_last(&tc.last, &e->light);
+            tc.have_last = 1;
+        } else {
+            collect_write_diff(&tc.last, &e->light, path);
+            collect_snapshot_free_last(&tc.last);
+            collect_snapshot_copy_last(&tc.last, &e->light);
+        }
+        kill(e->agent, SIGKILL);
+        e->agent = -1;
+        collect_snapshot_free_light(&e->light);
+    }
     if (tc.have_last)
         collect_snapshot_free_last(&tc.last);
-    collect_detach_run(pid);
-    close(tc.perf_fd);
-    /* 回收所有 COW 代理 (此时 perf 已无用) */
-    for (size_t i = 0; i < tc.n_cow_children; i++)
-        kill(tc.cow_children[i], SIGKILL);
     fprintf(stderr, "trace: done, %zu checkpoints (cow %zu/%zu, %zu agents) "
             "in %s\n", tc.ckpt_no, tc.cow_ok, tc.cow_ok + tc.cow_fail,
-            tc.n_cow_children, tc.out);
+            tc.n_entries, tc.out);
     return 0;
 }

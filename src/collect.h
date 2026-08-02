@@ -83,6 +83,9 @@ void collect_detach_run(pid_t pid);
 void collect_state(pid_t pid, struct collect_snapshot *sn);
 void collect_snapshot_copy_last(struct collect_snapshot *dst,
                                 const struct collect_snapshot *src);
+void collect_snapshot_copy_light(struct collect_snapshot *dst,
+                                 const struct collect_snapshot *src);
+void collect_snapshot_free_light(struct collect_snapshot *sn);
 void collect_snapshot_free_last(struct collect_snapshot *sn);
 void collect_snapshot_load(const char *path, struct collect_snapshot *sn);
 void collect_write_diff(const struct collect_snapshot *last,

@@ -67,8 +67,12 @@ tests/run_tests.sh   # 一键运行全部 13 项测试（basic/dbg/fd/ipc/cpp/fd
   - trace 全程保持 SEIZE，检查点之间只 INTERRUPT/CONT（不能重复 SEIZE）。
   - freeze 可采集已 SIGSTOP（T 状态）的进程。
 - **perf 与注入**：注入的 fork 子进程退出会破坏 perf 事件对目标的计数
-  （重新 enable/重开均无效）——所以镜像代理必须保持自旋，由 trace 结束
-  统一回收；这也导致 trace 被强杀时代理泄漏。
+  （重新 enable/重开均无效）——代理由 trace 结束统一回收；trace 被强杀
+  （SIGKILL）时代理泄漏。
+- **延迟 dump**：trace 在线只做轻量采集（fork 代理 + 状态），内存 dump
+  在目标阶段结束后按检查点顺序离线进行（diff 需要顺序）；代理 pause
+  阻塞 + setpgid 脱离目标组（避免孤儿组 SIGHUP 击杀），不占 CPU。
+  SIGTERM/SIGINT 触发优雅退出（先离线 dump）。
 - **COW 注入轮询**：必须排除旧代理（上一轮检查点的代理 flag 早已置 1，
   误选会导致从旧代理读取缺新段 → EIO → 检查点段零填充 → 切片崩溃）。
 - **brk**：不恢复内核 brk（目标 glibc brk 缓存与切片内核 brk 差距可达

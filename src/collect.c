@@ -207,8 +207,21 @@ static size_t read_mem_dbg(pid_t pid, uint64_t vaddr, uint64_t size,
 
     snprintf(path, sizeof(path), "/proc/%d/mem", pid);
     fd = open(path, O_RDONLY);
-    if (fd < 0)
+    if (fd < 0) {
+        char st[128];
+        snprintf(st, sizeof(st), "/proc/%d/stat", pid);
+        FILE *sf = fopen(st, "r");
+        if (sf) {
+            char sb[256];
+            size_t sn2 = fread(sb, 1, sizeof(sb) - 1, sf);
+            sb[sn2] = 0;
+            fprintf(stderr, "  agent %d state: %s\n", pid, sb);
+            fclose(sf);
+        } else {
+            fprintf(stderr, "  agent %d: /proc/%d/stat 不可读\n", pid, pid);
+        }
         die("cannot open %s", path);
+    }
 
     while (got < size) {
         ssize_t n = pread(fd, out + got, size - got, vaddr + got);
@@ -923,6 +936,62 @@ void collect_state_light(pid_t pid, struct collect_snapshot *sn)
     }
 }
 
+/* 深拷贝轻量状态 (regs/xstate/sigmask/fds/段表, 不含内存 payload)。
+   延迟 dump 模式: 在线检查点只保存此副本, 离线阶段补内存。 */
+void collect_snapshot_copy_light(struct collect_snapshot *dst,
+                                 const struct collect_snapshot *src)
+{
+    memset(dst, 0, sizeof(*dst));
+    dst->arch = src->arch;
+    dst->pid = src->pid;
+    dst->regs = src->regs;
+    if (src->xstate_size) {
+        dst->xstate = xmalloc(src->xstate_size);
+        memcpy(dst->xstate, src->xstate, src->xstate_size);
+        dst->xstate_size = src->xstate_size;
+    }
+    memcpy(dst->sigmask, src->sigmask, sizeof(dst->sigmask));
+    dst->nsegs = src->nsegs;
+    if (src->nsegs) {
+        dst->segs = xcalloc(src->nsegs, sizeof(struct cseg));
+        for (size_t i = 0; i < src->nsegs; i++) {
+            dst->segs[i] = src->segs[i];
+            if (src->segs[i].name)
+                dst->segs[i].name = xstrdup(src->segs[i].name);
+        }
+    }
+    dst->nfds = src->nfds;
+    if (src->nfds) {
+        dst->fds = xcalloc(src->nfds, sizeof(struct cfdinfo));
+        for (size_t i = 0; i < src->nfds; i++) {
+            dst->fds[i] = src->fds[i];
+            if (src->fds[i].path)
+                dst->fds[i].path = xstrdup(src->fds[i].path);
+        }
+    }
+    if (src->exe_path)
+        dst->exe_path = xstrdup(src->exe_path);
+    dst->exe_bias = src->exe_bias;
+    dst->rlim_stack_cur = src->rlim_stack_cur;
+    dst->rlim_stack_max = src->rlim_stack_max;
+    dst->meta = src->meta;          /* static, 不拷贝 */
+    dst->meta_size = src->meta_size;
+    if (src->naux) {
+        dst->aux = xcalloc(src->naux, sizeof(struct caux));
+        for (size_t i = 0; i < src->naux; i++) {
+            dst->aux[i] = src->aux[i];
+            if (src->aux[i].name)
+                dst->aux[i].name = xstrdup(src->aux[i].name);
+            if (src->aux[i].size) {
+                dst->aux[i].data = xmalloc(src->aux[i].size);
+                memcpy(dst->aux[i].data, src->aux[i].data,
+                       src->aux[i].size);
+            }
+        }
+        dst->naux = src->naux;
+    }
+}
+
 /* 深拷贝段表 + payload (增量检查点的 last 镜像用) */
 void collect_snapshot_copy_last(struct collect_snapshot *dst,
                                 const struct collect_snapshot *src)
@@ -941,6 +1010,25 @@ void collect_snapshot_copy_last(struct collect_snapshot *dst,
     }
     cbuf_init(&dst->payload);
     cbuf_append(&dst->payload, src->payload.data, src->payload.size);
+}
+
+/* 释放 collect_snapshot_copy_light 产生的副本 */
+void collect_snapshot_free_light(struct collect_snapshot *sn)
+{
+    for (size_t i = 0; i < sn->nsegs; i++)
+        free(sn->segs[i].name);
+    free(sn->segs);
+    for (size_t i = 0; i < sn->nfds; i++)
+        free(sn->fds[i].path);
+    free(sn->fds);
+    free(sn->exe_path);
+    for (size_t i = 0; i < sn->naux; i++) {
+        free(sn->aux[i].name);
+        free(sn->aux[i].data);
+    }
+    free(sn->aux);
+    free(sn->xstate);
+    memset(sn, 0, sizeof(*sn));
 }
 
 void collect_snapshot_free_last(struct collect_snapshot *sn)

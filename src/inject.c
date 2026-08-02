@@ -174,7 +174,7 @@ void build_stage2(unsigned char *buf, const struct user_regs_struct *r,
     *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;
     memcpy(p, &rip, 8); p += 8;
 
-    /* child: phase=0xAA -> flag=1 -> spin */
+    /* child: phase=0xAA -> flag=1 -> pause (阻塞不占 CPU, 保持快照) */
     {
         unsigned char *child = p;
         *p++ = 0x48; *p++ = 0xc7; *p++ = 0xc0;
@@ -185,7 +185,16 @@ void build_stage2(unsigned char *buf, const struct user_regs_struct *r,
         v = 1; memcpy(p, &v, 4); p += 4;
         emit_movabs(&p, 0x48, 0xbb, flag_addr);
         *p++ = 0x48; *p++ = 0x89; *p++ = 0x03;
-        *p++ = 0xeb; *p++ = 0xfe;
+        /* setpgid(0,0): 脱离目标进程组, 避免目标死后孤儿组 SIGHUP */
+        *p++ = 0x48; *p++ = 0xc7; *p++ = 0xc0;
+        v = 113; memcpy(p, &v, 4); p += 4;  /* setpgid */
+        *p++ = 0x48; *p++ = 0x31; *p++ = 0xff;  /* xor rdi,rdi */
+        *p++ = 0x48; *p++ = 0x31; *p++ = 0xf6;  /* xor rsi,rsi */
+        *p++ = 0x0f; *p++ = 0x05;
+        *p++ = 0x48; *p++ = 0xc7; *p++ = 0xc0;
+        v = 34; memcpy(p, &v, 4); p += 4;   /* pause */
+        *p++ = 0x0f; *p++ = 0x05;
+        *p++ = 0xeb; *p++ = 0xfe;           /* 兜底 spin (pause 失败) */
         int32_t disp = (int32_t)(child - (buf + 12 + 6));
         /* jz 指令在 buf[12..17], disp 在 buf[14..17] */
         memcpy(buf + 14, &disp, 4);
