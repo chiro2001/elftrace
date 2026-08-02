@@ -41,6 +41,12 @@ $(BUILD)/stub_blob_x86_64.o: $(BUILD)/stub_blob_x86_64.c
 $(BUILD)/%.o: $(SRC)/%.c $(wildcard $(INC)/*.h) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# inject.c 的注入代码是手写字节序列, gcc -O2 的 store 合并/重排会
+# 破坏 build_stage1/2 的生成顺序 (曾导致 fork 部分被覆盖、寄存器恢复
+# 缺失, 目标执行错误 stage2 崩溃); 必须 -O0 编译
+$(BUILD)/inject.o: $(SRC)/inject.c $(wildcard $(INC)/*.h) | $(BUILD)
+	$(CC) -O0 $(CFLAGS) -c $< -o $@
+
 $(TOOLS): $(OBJS)
 	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) -o $@
 

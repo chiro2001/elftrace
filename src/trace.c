@@ -19,6 +19,7 @@
 #include <poll.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <linux/ptrace.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <stddef.h>
@@ -31,7 +32,8 @@
 #include "collect.h"
 #include "util.h"
 
-int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child);
+int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child,
+                uint64_t *inj_page);
 
 #define TRACE_DEFAULT_EVERY 100000000ULL   /* 每 1e8 条指令一个检查点 */
 
@@ -60,6 +62,19 @@ struct trace_ctx {
         struct collect_snapshot light;
     } *entries;
     size_t n_entries;
+    /* syscall 前后检查点 (PTRACE_SYSCALL 捕获) */
+    uint64_t inj_page;              /* 注入专用页地址 (放行判断) */
+    struct syscall_rec {
+        uint64_t pc;                /* syscall 指令地址 */
+        uint64_t sysno;
+        struct collect_snapshot light_a;  /* 入口状态 + 内存基线 */
+        struct collect_snapshot light_b;  /* 返回状态 + 内存 */
+    } *syscalls;
+    size_t n_syscalls;
+    struct collect_snapshot pend_light;  /* 待定 syscall 入口状态 */
+    pid_t pend_agent;
+    uint64_t pend_pc, pend_sysno;
+    int have_pending;
 };
 
 static void perf_open(struct trace_ctx *tc)
@@ -120,6 +135,95 @@ static uint64_t perf_next_sample(struct trace_ctx *tc)
     return 0;
 }
 
+/* syscall 入口/返回停止处理 (PTRACE_SYSCALL 模式)
+ * entry: 记录待定 + 注入入口代理 A (临时 diff 基线)
+ * exit:  注入返回代理 B, 完成记录 {pc, A, B}
+ * 注入专用页内的 syscall (mmap/fork) 直接放行 */
+static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
+                                int sysno, uint64_t rip)
+{
+    if (tc->inj_page && rip >= tc->inj_page && rip < tc->inj_page + 4096) {
+        ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);   /* 注入代码的 syscall */
+        return;
+    }
+    if (is_entry) {
+        if (tc->have_pending)
+            die("trace: syscall entry while pending (state corrupted)");
+        struct collect_snapshot sn = {.pid = tc->pid};
+        collect_state_light(tc->pid, &sn);
+        /* 入口基线: 目标在 syscall-stop (本来就停), 直接读内存 */
+        collect_memory(tc->pid, &sn);
+        tc->pend_pc = rip;
+        tc->pend_sysno = sysno;
+        collect_snapshot_copy_light(&tc->pend_light, &sn);
+        cbuf_append(&tc->pend_light.payload, sn.payload.data,
+                    sn.payload.size);
+        tc->have_pending = 1;
+        collect_free(&sn);
+    } else {
+        if (!tc->have_pending)
+            die("trace: syscall exit without entry (state corrupted)");
+        struct collect_snapshot sn = {.pid = tc->pid};
+        collect_state_light(tc->pid, &sn);
+        /* 返回状态: 同样直接读目标内存 (无代理, 无 dumpable/注入交互) */
+        collect_memory(tc->pid, &sn);
+        tc->syscalls = xrealloc(tc->syscalls,
+                                (tc->n_syscalls + 1) *
+                                sizeof(*tc->syscalls));
+        struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
+        r->pc = tc->pend_pc;
+        r->sysno = tc->pend_sysno;
+        collect_snapshot_copy_light(&r->light_b, &sn);
+        cbuf_append(&r->light_b.payload, sn.payload.data, sn.payload.size);
+        /* A 基线 (入口状态+内存) 移入记录 */
+        r->light_a = tc->pend_light;
+        memset(&tc->pend_light, 0, sizeof(tc->pend_light));
+        tc->have_pending = 0;
+        collect_free(&sn);
+        fprintf(stderr, "trace: syscall %llu @ %#llx (rec %zu)\n",
+                (unsigned long long)r->sysno,
+                (unsigned long long)r->pc, tc->n_syscalls - 1);
+    }
+    ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);
+}
+
+/* 冻结目标: INTERRUPT 循环直到拿到 INTERRUPT-stop;
+ * 若目标在 syscall-stop (挂起未处理) 先按 syscall 逻辑处理再重新冻结 */
+static int collect_interrupt_sc(struct trace_ctx *tc)
+{
+    pid_t pid = tc->pid;
+    for (int i = 0; i < 16; i++) {
+        if (ptrace(PTRACE_INTERRUPT, pid, 0, 0) < 0)
+            return -1;
+        int st;
+        if (waitpid(pid, &st, 0) < 0)
+            return -1;
+        if (!WIFSTOPPED(st))
+            return -1;
+        int si = WSTOPSIG(st);
+        if (si == (SIGTRAP | 0x80)) {
+            struct ptrace_syscall_info psi;
+            memset(&psi, 0, sizeof(psi));
+            long n = ptrace(PTRACE_GET_SYSCALL_INFO, pid, sizeof(psi), &psi);
+            if (n <= 0)
+                die("trace: PTRACE_GET_SYSCALL_INFO failed");
+            fprintf(stderr, "dbg: interrupt-sc syscall op=%d\n",
+                    (int)psi.op);
+            if (psi.op == PTRACE_SYSCALL_INFO_ENTRY)
+                handle_syscall_stop(tc, 1, psi.entry.nr,
+                                    psi.instruction_pointer);
+            else
+                handle_syscall_stop(tc, 0, 0, psi.instruction_pointer);
+            continue;           /* 重新 INTERRUPT */
+        }
+        if (si == SIGTRAP)
+            return 0;           /* INTERRUPT-stop */
+        ptrace(PTRACE_SYSCALL, pid, 0, 0);   /* 其他信号: 放行再冻结 */
+        continue;
+    }
+    return -1;
+}
+
 /* already_stopped: tracee 已处于 ptrace-stop (初始停止或刚 INTERRUPT 完) */
 static void ckpt_take(struct trace_ctx *tc, int already_stopped)
 {
@@ -129,41 +233,33 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
     FILE *f;
     pid_t child = -1;
 
-    if (!already_stopped && collect_interrupt(tc->pid) < 0)
+    if (!already_stopped && collect_interrupt_sc(tc) < 0)
         return;                 /* tracee 已退出 */
 
     /* 轻量采集 (冻结 ~us): 寄存器/掩码/xstate/fds/段表 */
     collect_state_light(tc->pid, &sn);
-
-    /* COW 注入: 目标 fork 镜像代理后立即恢复运行 */
-    if (inject_fork(tc->pid, &sn.regs, &child) == 0) {
-        tc->cow_ok++;
-        /* 延迟 dump: 在线只保存代理 pid + 轻量状态 (目标零重负载);
-           代理 pause 阻塞保持快照, 目标阶段结束后统一按序 dump */
-        tc->entries = xrealloc(tc->entries,
-                               (tc->n_entries + 1) *
-                               sizeof(*tc->entries));
-        struct ckpt_entry *e = &tc->entries[tc->n_entries++];
-        e->agent = child;
-        collect_snapshot_copy_light(&e->light, &sn);
-        child = -1;
-    } else {
-        tc->cow_fail++;
-        /* 回退: 冻结期间读全量内存并即时写检查点 (tracee 已在 ptrace-stop) */
-        collect_memory(tc->pid, &sn);
-        collect_resume(tc->pid);
-        snprintf(path, sizeof(path), "%s/ckpt_%06zu.elftrace", tc->out,
-                 tc->ckpt_no);
-        if (tc->ckpt_no == 0) {
-            collect_write(&sn, path);
-            collect_snapshot_copy_last(&tc->last, &sn);
-            tc->have_last = 1;
-        } else {
-            collect_write_diff(&tc->last, &sn, path);
-            collect_snapshot_free_last(&tc->last);
-            collect_snapshot_copy_last(&tc->last, &sn);
-        }
+    if (tc->inj_page && sn.regs.rip >= tc->inj_page &&
+        sn.regs.rip < tc->inj_page + 4096) {
+        /* 冻结在注入代码中: 检查点无效, 放弃 (目标恢复运行) */
+        ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);
+        collect_free(&sn);
+        return;
     }
+
+    /* 冻结期间直接读全量内存并即时写检查点 (diff 链) */
+    collect_memory(tc->pid, &sn);
+    snprintf(path, sizeof(path), "%s/ckpt_%06zu.elftrace", tc->out,
+             tc->ckpt_no);
+    if (tc->ckpt_no == 0) {
+        collect_write(&sn, path);
+        collect_snapshot_copy_last(&tc->last, &sn);
+        tc->have_last = 1;
+    } else {
+        collect_write_diff(&tc->last, &sn, path);
+        collect_snapshot_free_last(&tc->last);
+        collect_snapshot_copy_last(&tc->last, &sn);
+    }
+    ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);   /* 保持 syscall 捕获模式 */
 
     snprintf(manifest, sizeof(manifest), "%s/manifest.txt", tc->out);
     f = fopen(manifest, "a");
@@ -224,7 +320,7 @@ int trace_main(int argc, char **argv)
     signal(SIGINT, on_sig);
 
     /* 全程保持 SEIZE 关系; 每个检查点只 INTERRUPT */
-    if (ptrace(PTRACE_SEIZE, pid, 0, 0) < 0)
+    if (ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_TRACESYSGOOD) < 0)
         die("ptrace(SEIZE) on %d", pid);
     if (ptrace(PTRACE_INTERRUPT, pid, 0, 0) < 0)
         die("ptrace(INTERRUPT) on %d", pid);
@@ -237,38 +333,69 @@ int trace_main(int argc, char **argv)
     /* 初始检查点 (count 0, 已处于初始停止) */
     ckpt_take(&tc, 1);
 
-    /* 主循环: 等待溢出 */
-    for (;;) {
-        struct pollfd pfd = {.fd = tc.perf_fd, .events = POLLIN};
-        int r = poll(&pfd, 1, 1000);
+    /* 目标恢复运行, 用 PTRACE_SYSCALL 模式 (每次 syscall 入口/返回停止) */
+    ptrace(PTRACE_SYSCALL, pid, 0, 0);
 
-        if (r > 0 && (pfd.revents & POLLIN)) {
-            uint64_t ip;
-            while ((ip = perf_next_sample(&tc)) != 0)
-                ckpt_take(&tc, 0);
-        } else if (r < 0 && errno != EINTR) {
-            die("poll");
-        } else if (r == 0) {
-            uint64_t cnt = 0;
-            read(tc.perf_fd, &cnt, 8);
-            fprintf(stderr, "dbg: timeout cnt=%llu head=%llu\n",
-                    (unsigned long long)cnt,
-                    (unsigned long long)tc.meta->data_head);
+    /* 主循环: 事件驱动 (syscall-stop 分派 + perf 溢出检查点) */
+    /* 主循环: WNOHANG 处理挂起 stop (syscall-stop) + poll 等 perf 溢出 */
+    for (;;) {
+        /* 1. 处理挂起的 ptrace-stop (syscall 入口/返回, 信号等) */
+        for (int ns = 0; ns < 256; ns++) {
+            if (g_stop)
+                break;
+            int wst;
+            pid_t wr = waitpid(pid, &wst, WNOHANG);
+            if (wr != pid)
+                break;
+            if (WIFEXITED(wst) || WIFSIGNALED(wst))
+                goto main_done;
+            if (!WIFSTOPPED(wst))
+                continue;
+            int si = WSTOPSIG(wst);
+            if (si == (SIGTRAP | 0x80)) {
+                struct ptrace_syscall_info psi;
+                memset(&psi, 0, sizeof(psi));
+                long n = ptrace(PTRACE_GET_SYSCALL_INFO, pid,
+                                sizeof(psi), &psi);
+                if (n <= 0)
+                    die("trace: PTRACE_GET_SYSCALL_INFO failed");
+                if (psi.op == PTRACE_SYSCALL_INFO_ENTRY)
+                    handle_syscall_stop(&tc, 1, psi.entry.nr,
+                                        psi.instruction_pointer);
+                else if (psi.op == PTRACE_SYSCALL_INFO_EXIT)
+                    handle_syscall_stop(&tc, 0, 0,
+                                        psi.instruction_pointer);
+                else
+                    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+            } else if (si == SIGTRAP) {
+                ptrace(PTRACE_SYSCALL, pid, 0, 0);
+            } else {
+                fprintf(stderr, "trace: target signal %d (delivered)\n",
+                        si);
+                ptrace(PTRACE_SYSCALL, pid, 0, si);
+            }
         }
+
+        /* 2. perf 溢出 → 常规检查点 */
+        {
+            struct pollfd pfd = {.fd = tc.perf_fd, .events = POLLIN};
+            int r = poll(&pfd, 1, 100);
+            if (r > 0 && (pfd.revents & POLLIN)) {
+                uint64_t ip;
+                while ((ip = perf_next_sample(&tc)) != 0)
+                    ckpt_take(&tc, 0);
+                if (kill(pid, 0) == 0)
+                    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+            }
+        }
+
         if (g_stop)
             break;              /* SIGTERM: 优雅退出进入离线 dump */
 
-        /* tracee 是否还活着 (含僵尸: ptrace 目标被 SIGKILL 后变僵尸,
-           kill(pid,0) 不报 ESRCH, 需 waitpid WNOHANG reap 检测) */
-        {
-            int wst;
-            pid_t wr = waitpid(pid, &wst, WNOHANG);
-            if (wr == pid)
-                break;          /* 目标已退出 */
-        }
         if (kill(pid, 0) < 0 && errno == ESRCH)
             break;
     }
+main_done:
 
     if (kill(pid, 0) == 0)
         collect_detach_run(pid);   /* 目标已退出则无需 detach */
@@ -324,8 +451,34 @@ int trace_main(int argc, char **argv)
     }
     if (tc.have_last)
         collect_snapshot_free_last(&tc.last);
-    fprintf(stderr, "trace: done, %zu checkpoints (cow %zu/%zu, %zu agents) "
-            "in %s\n", tc.ckpt_no, tc.cow_ok, tc.cow_ok + tc.cow_fail,
-            tc.n_entries, tc.out);
+
+    /* 离线 syscall 检查点: 对比入口/返回代理 → B-A diff
+       (syscalls/ 子目录, 仅记录差异, 不参与切片起点/终点选择) */
+    if (tc.n_syscalls) {
+        char sdir[PATH_MAX];
+        snprintf(sdir, sizeof(sdir), "%s/syscalls", tc.out);
+        mkdir(sdir, 0755);
+        char mp[PATH_MAX];
+        snprintf(mp, sizeof(mp), "%s/syscall.map", sdir);
+        FILE *mf = fopen(mp, "w");
+        if (!mf)
+            die("cannot create %s", mp);
+        for (size_t k = 0; k < tc.n_syscalls; k++) {
+            struct syscall_rec *r = &tc.syscalls[k];
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/sys_%06zu.elftrace", sdir, k);
+            collect_write_diff(&r->light_a, &r->light_b, path);
+            fprintf(mf, "%#llx %llu sys_%06zu.elftrace\n",
+                    (unsigned long long)r->pc,
+                    (unsigned long long)r->sysno, k);
+            collect_snapshot_free_light(&r->light_a);
+            collect_snapshot_free_light(&r->light_b);
+        }
+        fclose(mf);
+    }
+
+    fprintf(stderr, "trace: done, %zu checkpoints (cow %zu/%zu, %zu agents), "
+            "%zu syscalls in %s\n", tc.ckpt_no, tc.cow_ok,
+            tc.cow_ok + tc.cow_fail, tc.n_entries, tc.n_syscalls, tc.out);
     return 0;
 }

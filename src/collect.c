@@ -959,6 +959,11 @@ void collect_snapshot_copy_light(struct collect_snapshot *dst,
             if (src->segs[i].name)
                 dst->segs[i].name = xstrdup(src->segs[i].name);
         }
+        if (src->payload_offs) {
+            dst->payload_offs = xmalloc(src->nsegs * sizeof(uint64_t));
+            memcpy(dst->payload_offs, src->payload_offs,
+                   src->nsegs * sizeof(uint64_t));
+        }
     }
     dst->nfds = src->nfds;
     if (src->nfds) {

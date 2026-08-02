@@ -28,14 +28,15 @@
 
 #include "util.h"
 
-#define STAGE2_SIZE 512        /* stage2 代码 + 数据 */
+#define STAGE2_SIZE 1024       /* stage2 代码 + 数据 */
 #define STAGE1_SIZE 128
 
 /* stage2 数据区 (紧随代码) */
-#define D2_OFF    256
+#define D2_OFF    512   /* 数据区在代码之后 (代码 ~276B, 防 memset 覆盖) */
 #define D2_RIP    0
 #define D2_FLAG   8
 #define D2_PHASE  16
+#define D2_INJ_PAGE 24
 
 /* 找注入页: 某代码段的"冷"最后一页 (远离 rip 与执行流) */
 static unsigned long find_stage1_page(pid_t pid, unsigned long rip)
@@ -185,6 +186,15 @@ void build_stage2(unsigned char *buf, const struct user_regs_struct *r,
         v = 1; memcpy(p, &v, 4); p += 4;
         emit_movabs(&p, 0x48, 0xbb, flag_addr);
         *p++ = 0x48; *p++ = 0x89; *p++ = 0x03;
+        /* prctl(PR_SET_DUMPABLE=4, 1): ptrace 附着的父 fork 出的子继承
+           dumpable=0, tracer 读 /proc/<代理>/mem 会被拒 */
+        *p++ = 0x48; *p++ = 0xc7; *p++ = 0xc0;
+        v = 157; memcpy(p, &v, 4); p += 4;  /* prctl */
+        *p++ = 0x48; *p++ = 0xc7; *p++ = 0xc7;
+        v = 4; memcpy(p, &v, 4); p += 4;    /* PR_SET_DUMPABLE */
+        *p++ = 0x48; *p++ = 0xc7; *p++ = 0xc6;
+        v = 1; memcpy(p, &v, 4); p += 4;    /* 1 */
+        *p++ = 0x0f; *p++ = 0x05;
         /* setpgid(0,0): 脱离目标进程组, 避免目标死后孤儿组 SIGHUP */
         *p++ = 0x48; *p++ = 0xc7; *p++ = 0xc0;
         v = 113; memcpy(p, &v, 4); p += 4;  /* setpgid */
@@ -214,7 +224,7 @@ void build_stage2(unsigned char *buf, const struct user_regs_struct *r,
  *   jmp rax
  */
 void build_stage1(unsigned char *buf, const unsigned char *stage2,
-                         size_t stage2_len)
+                         size_t stage2_len, uint64_t flag_addr)
 {
     unsigned char *p = buf;
     uint64_t v;
@@ -233,6 +243,9 @@ void build_stage1(unsigned char *buf, const unsigned char *stage2,
     v = -1; memcpy(p, &v, 4); p += 4;
     *p++ = 0x4d; *p++ = 0x31; *p++ = 0xc9;   /* xor r9,r9 */
     *p++ = 0x0f; *p++ = 0x05;
+    /* mov [flag_page+D2_OFF+D2_INJ_PAGE], rax (48 A3 imm64) */
+    *p++ = 0x48; *p++ = 0xa3;
+    v = flag_addr + D2_INJ_PAGE - 8; memcpy(p, &v, 8); p += 8;
     /* mov rdi, rax */
     *p++ = 0x48; *p++ = 0x89; *p++ = 0xc7;
     /* lea rsi, [rip+disp] -> stage2 副本 (紧跟本代码) */
@@ -250,7 +263,8 @@ void build_stage1(unsigned char *buf, const unsigned char *stage2,
     memcpy(buf + STAGE1_SIZE, stage2, stage2_len);
 }
 
-int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child)
+int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child,
+                uint64_t *inj_page)
 {
     unsigned long page1 = find_stage1_page(pid, regs->rip);
     unsigned long flag_page = find_flag_page(pid);
@@ -266,7 +280,7 @@ int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child)
     flag_addr = flag_page + D2_OFF + D2_FLAG;
     memset(stage2, 0, sizeof(stage2));
     build_stage2(stage2, regs, regs->rip, flag_addr);
-    build_stage1(stage1, stage2, STAGE2_SIZE);
+    build_stage1(stage1, stage2, STAGE2_SIZE, flag_addr);
 
     for (int i = 0; i < STAGE1_SIZE; i++)
         backup[i] = ptrace(PTRACE_PEEKDATA, pid, page1 + i, 0) & 0xff;
@@ -341,6 +355,20 @@ int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child)
 
     if (!got)
         return -1;
+
+    /* 读取注入专用页地址 (stage1 的 movabs 写到 flag 页数据槽) */
+    if (inj_page) {
+        *inj_page = 0;
+        char mp[64];
+        snprintf(mp, sizeof(mp), "/proc/%d/mem", pid);
+        int mfd = open(mp, O_RDONLY);
+        if (mfd >= 0) {
+            uint64_t v = 0;
+            if (pread(mfd, &v, 8, flag_addr + D2_INJ_PAGE - 8) == 8)
+                *inj_page = v;
+            close(mfd);
+        }
+    }
 
     for (int i = 0; i < STAGE1_SIZE; i += 8) {
         unsigned long w = 0;
