@@ -10,7 +10,7 @@ CRIU 的做法是"重启"，elftrace 的做法是"切片"：不重建一个进�
 参考了 CRIU 的 compel/restorer 思路（stub 内 mmap+拷贝恢复内存、构建
 sigframe 让内核恢复寄存器），但代码从头编写。
 
-## .elftrace 格式 (v2)
+## .elftrace 格式 (v3)
 
 ```
 hdr | regs | fpu | sigmask | segs表 | fds表 | strings | aux表 | payload
@@ -18,16 +18,24 @@ hdr | regs | fpu | sigmask | segs表 | fds表 | strings | aux表 | payload
 
 - 全部小端字段化，`*_off` 为绝对文件偏移；payload 顺序拼接段内容。
 - aux 记录描述从原 exe 提取的调试节/分配节（含链接元数据），组装时重建节。
-- 头含 `exe_bias`：PIE 加载偏置，供调试节地址修正。
+- 头含 `exe_bias`（PIE 加载偏置）与 `rlim_stack_cur/max`（RLIMIT_STACK，
+  切片进程恢复栈增长限制用）。
+- 改动格式字段必须 `ELTRACE_VERSION +1`（collect 写、build/dump 读同步）。
 
 ## 恢复 stub blob 布局 (x86_64)
 
 ```
-[0x0000] desc(128B)  [0x0080] xstate(4KB)  [0x1080] sigmask(8B)
-[0x1088] sigacts(2.5KB)  [0x1A88] regs(216B)  [0x1B60] maps buf(4KB)
-[0x2B80] perf attr  [0x2C00] ipc sigact  [0x2C80] 栈(8KB)
-[0x4C80] rt_sigreturn 信号帧区  [0x6280] 代码  [0x8000] 追加区起点
+[0x0000] desc(256B)  [0x0100] xstate(4KB)  [0x1100] sigmask(8B)
+[0x1108] sigacts(2.5KB)  [0x1B08] regs(216B)  [0x1BE0] maps buf(4KB)
+[0x2BE0] perf attr  [0x2C60] ipc sigact  [0x2C80] 栈(8KB)
+[0x4CC0] rt_sigreturn 信号帧区  [0x62C0] 代码  [0x8000] 追加区起点
 ```
+
+desc 字段（0x100-0xB8 已用）：magic/version/flags/target_rip/n_segs/segs_off/
+n_fds/fds_off/fpu_off/fpu_size/sigmask_off/sigacts_off/regs_off/ipc_period/
+ipc_fd/ipc_buf_off/mode/exit_addr/brk_base/target_tid/stack_vaddr/
+rlim_stack_cur/rlim_stack_max。新增字段需同步三处（头文件宏、stub .quad、
+build blob_patch_u64）。
 
 追加区（builder 填充）：segs 表(48B/条)、fds 表(48B/条)、字符串、payload。
 所有固定偏移用 `label+const(%rip)` 寻址（PIC，objcopy 前经 ld 解析重定位）。
@@ -87,3 +95,17 @@ PIE 的 symtab/DWARF 地址是镜像相对（0 基），恢复后实际基址随
   x64_setup_rt_frame 返回值定位（-14）。
 - gdb 无法在 stub 恢复内存前插入软件断点 → 构建期 int3 注入
   （--breakpoint）。
+
+
+## 栈增长与堆边界 (v3 起)
+
+- `[stack]` 段恢复加 `MAP_GROWSDOWN`（desc.stack_vaddr 标记），允许目标
+  越过冻结时栈底继续向下增长（深递归程序）。
+- RLIMIT_STACK 恢复：freeze 读 `/proc/pid/limits` 存入头，stub 在段恢复
+  前 `setrlimit(RLIMIT_STACK)`（目标 setrlimit 的栈限制在切片进程是
+  默认 8MB，不恢复会 SIGSEGV）。
+- brk 不恢复：目标 glibc 的 brk 缓存（恢复的内存）与切片进程内核 brk
+  指针不一致，差距可达数十 TB，一次 brk 扩展被 overcommit 拒绝且 brk
+  不能跨 VMA；glibc malloc 会 fallback mmap（分配仍可用）。
+- `heap_end`（desc.brk_base）定位取**第一个** `[heap]` 段：mmap 的大块
+  匿名段也可能被内核标为 `[heap]`，真实 brk 指针是第一个。

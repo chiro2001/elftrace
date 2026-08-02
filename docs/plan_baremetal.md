@@ -1,4 +1,7 @@
-# 功能 6/7 设计：baremetal 模式与指令区间切片
+# 功能 6/7 设计：baremetal 模式与指令区间切片（历史规划，已实现）
+
+> 本文是功能开发前的设计规划，功能已全部实现。实际行为以 README.md 和
+> 代码为准；brk 恢复方案（stub 先 brk 到堆尾）已放弃（见下"实施修正"）。
 
 ## 总览
 
@@ -104,3 +107,18 @@ desc 扩至 256B（fpu 移至 0x100，后续区域顺移），新增：
   报错退出 0x5e
 - test_trace.sh：trace --every N 采集 → build --from K --to M 两种模式
   验证从检查点 K 恢复、M 处退出
+
+
+## 实施修正（与规划不同的点）
+
+1. **brk 恢复放弃**：规划中"stub 恢复 [heap] 前先 brk(冻结堆尾)"不可行——
+   切片进程（静态 ELF）内核 brk 起点低（~几百 MB），目标堆在随机高位，
+   一次 brk 扩展跨数十 TB，被内核 overcommit/跨 VMA 检查拒绝。实测
+   放弃；real 模式下目标 sbrk 会失败，但 glibc malloc fallback mmap。
+2. **RLIMIT_STACK 恢复**：深栈测试暴露目标 setrlimit 的栈限制未恢复
+   （切片进程默认 8MB），栈增长 SIGSEGV；v3 起 freeze 采集并恢复。
+3. **COW 注入轮询排除旧代理**：旧代理 flag 早已置 1，误选导致从旧代理
+   读取缺新段（EIO → 检查点段零填充 → 切片崩溃）。
+4. **代理 PDEATHSIG 方案不可行**：注入代码里 prctl(PR_SET_PDEATHSIG,
+   SIGKILL) 在 ptrace 场景下子进程立即死亡；代理保持自旋由 trace 结束
+   统一回收（被强杀时泄漏）。
