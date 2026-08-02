@@ -145,8 +145,11 @@ static void apply_diff(struct collect_snapshot *sn, const char *path)
     if (fstat(fd, &st) < 0)
         die("fstat %s", path);
     uint8_t *f = xmalloc(st.st_size);
-    if (read(fd, f, st.st_size) != (ssize_t)st.st_size)
-        die("short read %s", path);
+    { size_t roff = 0; while (roff < (size_t)st.st_size) {
+        ssize_t r = read(fd, (char *)f + roff, (size_t)st.st_size - roff);
+        if (r < 0) { close(fd); die("short read %s", path); }
+        roff += (size_t)r;
+    } }
     close(fd);
 
     elftrace_diff_hdr h;
@@ -490,8 +493,12 @@ int build_main(int argc, char **argv)
     s.file_size = lseek(fd, 0, SEEK_END);
     lseek(fd, 0, SEEK_SET);
     s.file = xmalloc(s.file_size);
-    if (read(fd, s.file, s.file_size) != (ssize_t)s.file_size)
-        die("short read on %s", in);
+    { size_t roff = 0; while (roff < s.file_size) {
+        ssize_t r = read(fd, (char *)s.file + roff, s.file_size - roff);
+        if (r < 0)
+            die("short read on %s", in);
+        roff += (size_t)r;
+    } }
     close(fd);
 
     memcpy(&s.h, s.file, sizeof(s.h));
@@ -803,8 +810,13 @@ int build_main(int argc, char **argv)
     fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     if (fd < 0)
         die("cannot create %s", out);
-    if (write(fd, file.data, file.size) != (ssize_t)file.size)
-        die("short write to %s", out);
+    size_t woff = 0;
+    while (woff < file.size) {
+        ssize_t n = write(fd, file.data + woff, file.size - woff);
+        if (n < 0)
+            die("write %s: %s", out, strerror(errno));
+        woff += (size_t)n;
+    }
     close(fd);
 
     fprintf(stderr, "build: %s written (entry %#llx, %zu sections)\n", out,

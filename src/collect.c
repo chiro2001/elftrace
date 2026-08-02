@@ -799,9 +799,15 @@ void collect_write(const struct collect_snapshot *sn, const char *out)
     int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0)
         die("cannot create %s", out);
-    size_t n = write(fd, file.data, file.size);
-    if (n != file.size)
-        die("short write to %s", out);
+    /* 单次 write() 有 MAX_RW_COUNT (2GB-4096) 上限, 大快照 (>2GB)
+       必须分块写, 否则截断 */
+    size_t woff = 0;
+    while (woff < file.size) {
+        ssize_t n = write(fd, file.data + woff, file.size - woff);
+        if (n < 0)
+            die("write %s: %s", out, strerror(errno));
+        woff += (size_t)n;
+    }
     close(fd);
 
     fprintf(stderr, "freeze: %zu segments, %zu fds, %zu aux sections, "
@@ -1061,8 +1067,11 @@ void collect_snapshot_load(const char *path, struct collect_snapshot *sn)
     if (fstat(fd, &st) < 0)
         die("fstat %s", path);
     uint8_t *f = xmalloc(st.st_size);
-    if (read(fd, f, st.st_size) != (ssize_t)st.st_size)
-        die("short read %s", path);
+    { size_t roff = 0; while (roff < (size_t)st.st_size) {
+        ssize_t r = read(fd, (char *)f + roff, (size_t)st.st_size - roff);
+        if (r < 0) { close(fd); die("short read %s", path); }
+        roff += (size_t)r;
+    } }
     close(fd);
 
     elftrace_hdr h;
@@ -1309,9 +1318,13 @@ void collect_write_diff(const struct collect_snapshot *last,
     int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0)
         die("cannot create %s", out);
-    size_t n = write(fd, file.data, file.size);
-    if (n != file.size)
-        die("short write to %s", out);
+    size_t woff = 0;
+    while (woff < file.size) {
+        ssize_t n = write(fd, file.data + woff, file.size - woff);
+        if (n < 0)
+            die("write %s: %s", out, strerror(errno));
+        woff += (size_t)n;
+    }
     close(fd);
 
     fprintf(stderr, "diff: %llu unmap, %llu newseg, %llu dirty pages -> %s "

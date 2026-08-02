@@ -110,8 +110,11 @@ int bundle_extract(const char *bundle, const char *dest_dir)
     struct stat st;
     fstat(fd, &st);
     uint8_t *f = xmalloc(st.st_size);
-    if (read(fd, f, st.st_size) != st.st_size)
-        die("bundle: short read");
+    { size_t roff = 0; while (roff < (size_t)st.st_size) {
+        ssize_t r = read(fd, (char *)f + roff, (size_t)st.st_size - roff);
+        if (r < 0) { close(fd); die("bundle: short read"); }
+        roff += (size_t)r;
+    } }
     close(fd);
 
     if (st.st_size < 16 || memcmp(f, BUNDLE_MAGIC, 8) != 0)

@@ -53,8 +53,11 @@ int dump_main(const char *path, int meta_only)
     if (fstat(fd, &st) < 0)
         die("fstat %s", path);
     f = xmalloc(st.st_size);
-    if (read(fd, f, st.st_size) != st.st_size)
-        die("short read %s", path);
+    { size_t roff = 0; while (roff < (size_t)st.st_size) {
+        ssize_t r = read(fd, (char *)f + roff, (size_t)st.st_size - roff);
+        if (r < 0) { close(fd); die("short read %s", path); }
+        roff += (size_t)r;
+    } }
     close(fd);
 
     memcpy(&h, f, sizeof(h));
