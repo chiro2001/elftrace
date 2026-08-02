@@ -16,9 +16,11 @@
 #include <unistd.h>
 #include <limits.h>
 #include <elf.h>
+#include <sys/stat.h>
 
 #include "elftrace.h"
 #include "elftrace_stub.h"
+#include "collect.h"
 #include "util.h"
 
 /* ---- 生成的 stub blob ---- */
@@ -132,6 +134,153 @@ static void blob_patch_u64(uint8_t *blob, uint64_t off, uint64_t val)
     memcpy(blob + off, &val, 8);
 }
 
+/* 应用差异文件到合成快照 (增量检查点重建) */
+static void apply_diff(struct collect_snapshot *sn, const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        die("cannot open diff %s", path);
+    struct stat st;
+    if (fstat(fd, &st) < 0)
+        die("fstat %s", path);
+    uint8_t *f = xmalloc(st.st_size);
+    if (read(fd, f, st.st_size) != (ssize_t)st.st_size)
+        die("short read %s", path);
+    close(fd);
+
+    elftrace_diff_hdr h;
+    memcpy(&h, f, sizeof(h));
+    if (h.magic != ELFTRACE_DIFF_MAGIC) {
+        free(f);
+        return;
+    }
+    size_t off = sizeof(h) + h.state_size;
+
+    /* 状态区: regs | xstate_size+xstate | sigmask | nfds+fds表+路径 */
+    if (h.state_size) {
+        size_t so = sizeof(h);
+        if (h.state_size >= sizeof(sn->regs))
+            memcpy(&sn->regs, f + so, sizeof(sn->regs));
+        so += sizeof(sn->regs);
+        if (so + 8 <= sizeof(h) + h.state_size) {
+            uint64_t xs;
+            memcpy(&xs, f + so, 8);
+            so += 8;
+            if (xs) {
+                free(sn->xstate);
+                sn->xstate = xmalloc(xs);
+                memcpy(sn->xstate, f + so, xs);
+                sn->xstate_size = xs;
+                so += xs;
+            }
+        }
+        if (so + 8 <= sizeof(h) + h.state_size) {
+            memcpy(sn->sigmask, f + so, sizeof(sn->sigmask));
+            so += sizeof(sn->sigmask);
+        }
+        if (so + 8 <= sizeof(h) + h.state_size) {
+            uint64_t nfds;
+            memcpy(&nfds, f + so, 8);
+            so += 8;
+            for (size_t i = 0; i < sn->nfds; i++)
+                free(sn->fds[i].path);
+            free(sn->fds);
+            sn->fds = NULL;
+            sn->nfds = 0;
+            if (nfds) {
+                sn->fds = xcalloc(nfds, sizeof(struct cfdinfo));
+                for (size_t i = 0; i < nfds; i++) {
+                    elftrace_fd e;
+                    memcpy(&e, f + so, sizeof(e));
+                    so += sizeof(e);
+                    sn->fds[i].fd = e.fd;
+                    sn->fds[i].flags = e.flags;
+                    sn->fds[i].mode = e.mode;
+                    sn->fds[i].pos = e.pos;
+                    if (e.path_len) {
+                        sn->fds[i].path = xstrdup((const char *)(f + so));
+                        so += e.path_len;
+                    }
+                }
+                sn->nfds = nfds;
+            }
+        }
+    }
+
+    /* 1. unmap: 删除段 (同步移除 payload 内容与 payload_offs) */
+    for (uint64_t k = 0; k < h.n_unmap; k++) {
+        uint64_t vaddr;
+        memcpy(&vaddr, f + off, 8);
+        off += 8;
+        for (size_t i = 0; i < sn->nsegs; i++) {
+            if (sn->segs[i].vaddr == vaddr) {
+                size_t boff = sn->payload_offs[i];
+                size_t blen = sn->segs[i].filesz;
+                memmove(sn->payload.data + boff,
+                        sn->payload.data + boff + blen,
+                        sn->payload.size - boff - blen);
+                sn->payload.size -= blen;
+                free(sn->segs[i].name);
+                memmove(&sn->segs[i], &sn->segs[i + 1],
+                        (sn->nsegs - i - 1) * sizeof(struct cseg));
+                memmove(&sn->payload_offs[i], &sn->payload_offs[i + 1],
+                        (sn->nsegs - i - 1) * sizeof(uint64_t));
+                sn->nsegs--;
+                for (size_t j = i; j < sn->nsegs; j++)
+                    sn->payload_offs[j] -= blen;
+                break;
+            }
+        }
+    }
+
+    /* 2. newseg: 追加段 (内容进 payload) */
+    for (uint64_t k = 0; k < h.n_newseg; k++) {
+        elftrace_diff_seg e;
+        memcpy(&e, f + off, sizeof(e));
+        off += sizeof(e);
+        sn->segs = xrealloc(sn->segs, (sn->nsegs + 1) * sizeof(struct cseg));
+        sn->payload_offs = xrealloc(sn->payload_offs,
+                                    (sn->nsegs + 1) * sizeof(uint64_t));
+        struct cseg *c = &sn->segs[sn->nsegs];
+        memset(c, 0, sizeof(*c));
+        c->vaddr = e.vaddr;
+        c->filesz = e.filesz;
+        c->memsz = e.memsz;
+        c->flags = e.flags;
+        c->name = NULL;
+        sn->payload_offs[sn->nsegs] = sn->payload.size;
+        sn->nsegs++;
+        cbuf_append(&sn->payload, f + off, e.filesz);
+        off += e.filesz;
+    }
+
+    /* 3. dirty: 覆盖页内容 (用 payload_offs 定位) */
+    for (uint64_t k = 0; k < h.n_dirty; k++) {
+        uint64_t vaddr;
+        memcpy(&vaddr, f + off, 8);
+        off += 8;
+        const uint8_t *data = f + off;
+        off += 4096;
+        size_t si = (size_t)-1;
+        for (size_t i = 0; i < sn->nsegs; i++) {
+            if (vaddr >= sn->segs[i].vaddr &&
+                vaddr < sn->segs[i].vaddr + sn->segs[i].memsz) {
+                si = i;
+                break;
+            }
+        }
+        if (si == (size_t)-1)
+            continue;
+        uint64_t rel = vaddr - sn->segs[si].vaddr;
+        size_t avail = sn->segs[si].filesz > rel
+                           ? sn->segs[si].filesz - rel : 0;
+        size_t n = avail < 4096 ? avail : 4096;
+        if (n)
+            memcpy(sn->payload.data + sn->payload_offs[si] + rel, data, n);
+    }
+    free(f);
+}
+
 int build_main(int argc, char **argv)
 {
     const char *in = NULL;
@@ -230,6 +379,71 @@ int build_main(int argc, char **argv)
         fprintf(stderr, "build: base = checkpoint %ld (count %llu, pc %#llx)\n",
                 found_from, (unsigned long long)count0,
                 (unsigned long long)ip0);
+
+        /* 增量检查点: 从 base (ckpt_000000 完整) 应用 1..from_ckpt 差异链,
+           合成完整快照到临时文件。仅当检查点 1 是 diff 格式时启用;
+           旧版完整格式目录直接以 from 检查点文件为 in。 */
+        int use_diff = 0;
+        if (found_from > 0) {
+            char c1[PATH_MAX];
+            snprintf(c1, sizeof(c1), "%s/ckpt_000001.elftrace", ckpts);
+            int fd1 = open(c1, O_RDONLY);
+            if (fd1 >= 0) {
+                uint32_t mg;
+                if (read(fd1, &mg, 4) == 4)
+                    use_diff = (mg == ELFTRACE_DIFF_MAGIC);
+                close(fd1);
+            }
+        }
+        if (use_diff) {
+            struct collect_snapshot syn = {0};
+            {
+                char bp[PATH_MAX];
+                snprintf(bp, sizeof(bp), "%s/ckpt_000000.elftrace", ckpts);
+                if (access(bp, R_OK) != 0)
+                    die("incremental checkpoints need %s (full base)", bp);
+                collect_snapshot_load(bp, &syn);
+            }
+            {
+                char mp[PATH_MAX];
+                snprintf(mp, sizeof(mp), "%s/manifest.txt", ckpts);
+                FILE *df = fopen(mp, "r");
+                if (!df)
+                    die("cannot open %s", mp);
+                long idx2 = 0;
+                while (fgets(line, sizeof(line), df)) {
+                    uint64_t cnt, ip;
+                    char file[PATH_MAX];
+                    if (sscanf(line, "%llu 0x%llx %511s", &cnt, &ip, file)
+                        != 3)
+                        continue;
+                    if (idx2 >= 1 && idx2 <= found_from) {
+                        char dp[PATH_MAX];
+                        snprintf(dp, sizeof(dp), "%s/%s", ckpts, file);
+                        apply_diff(&syn, dp);
+                    }
+                    if (idx2 >= found_from)
+                        break;
+                    idx2++;
+                }
+                fclose(df);
+            }
+            char tmp[PATH_MAX];
+            snprintf(tmp, sizeof(tmp), "%s/.synth_%ld.elftrace", ckpts,
+                     found_from);
+            collect_write(&syn, tmp);
+            free(in);
+            in = xstrdup(tmp);
+            for (size_t k = 0; k < syn.nsegs; k++)
+                free(syn.segs[k].name);
+            free(syn.segs);
+            free(syn.payload_offs);
+            free(syn.payload.data);
+            for (size_t k = 0; k < syn.nfds; k++)
+                free(syn.fds[k].path);
+            free(syn.fds);
+            free(syn.xstate);
+        }
 
         if (to_ckpt >= 0) {
             if (mode_baremetal) {

@@ -81,6 +81,12 @@ int collect_interrupt(pid_t pid);
 void collect_detach_run(pid_t pid);
 /* 采集全部状态 (要求 tracee 已冻结) */
 void collect_state(pid_t pid, struct collect_snapshot *sn);
+void collect_snapshot_copy_last(struct collect_snapshot *dst,
+                                const struct collect_snapshot *src);
+void collect_snapshot_free_last(struct collect_snapshot *sn);
+void collect_snapshot_load(const char *path, struct collect_snapshot *sn);
+void collect_write_diff(const struct collect_snapshot *last,
+                        const struct collect_snapshot *sn, const char *out);
 /* 采集轻量状态 (寄存器/掩码/xstate/fds/段表, 不含内存) */
 void collect_state_light(pid_t pid, struct collect_snapshot *sn);
 void collect_segments(struct collect_snapshot *sn);

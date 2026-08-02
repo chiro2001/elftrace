@@ -694,9 +694,14 @@ void collect_write(const struct collect_snapshot *sn, const char *out)
     h.rlim_stack_max = sn->rlim_stack_max;
 
     off = sizeof(elftrace_hdr);
-    h.meta_off = off;
-    h.meta_size = sn->meta_size + 1;   /* 含结尾 NUL, 与写入一致 */
-    off += sn->meta_size + 1;
+    if (sn->meta && sn->meta_size) {
+        h.meta_off = off;
+        h.meta_size = sn->meta_size + 1;   /* 含结尾 NUL, 与写入一致 */
+        off += sn->meta_size + 1;
+    } else {
+        h.meta_off = 0;
+        h.meta_size = 0;
+    }
 
     h.regs_off = off;
     h.regs_size = sizeof(struct user_regs_struct);
@@ -916,6 +921,318 @@ void collect_state_light(pid_t pid, struct collect_snapshot *sn)
         }
         fclose(lf);
     }
+}
+
+/* 深拷贝段表 + payload (增量检查点的 last 镜像用) */
+void collect_snapshot_copy_last(struct collect_snapshot *dst,
+                                const struct collect_snapshot *src)
+{
+    dst->nsegs = src->nsegs;
+    dst->segs = xcalloc(src->nsegs ? src->nsegs : 1, sizeof(struct cseg));
+    for (size_t i = 0; i < src->nsegs; i++) {
+        dst->segs[i] = src->segs[i];
+        if (src->segs[i].name)
+            dst->segs[i].name = xstrdup(src->segs[i].name);
+    }
+    if (src->nsegs) {
+        dst->payload_offs = xmalloc(src->nsegs * sizeof(uint64_t));
+        memcpy(dst->payload_offs, src->payload_offs,
+               src->nsegs * sizeof(uint64_t));
+    }
+    cbuf_init(&dst->payload);
+    cbuf_append(&dst->payload, src->payload.data, src->payload.size);
+}
+
+void collect_snapshot_free_last(struct collect_snapshot *sn)
+{
+    for (size_t i = 0; i < sn->nsegs; i++)
+        free(sn->segs[i].name);
+    free(sn->segs);
+    free(sn->payload_offs);
+    free(sn->payload.data);
+    sn->segs = NULL;
+    sn->nsegs = 0;
+    sn->payload_offs = NULL;
+    sn->payload.data = NULL;
+    sn->payload.size = sn->payload.cap = 0;
+}
+
+/* 从 .elftrace 文件构造 collect_snapshot (段表 + payload, build 合成用) */
+void collect_snapshot_load(const char *path, struct collect_snapshot *sn)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        die("cannot open %s", path);
+    struct stat st;
+    if (fstat(fd, &st) < 0)
+        die("fstat %s", path);
+    uint8_t *f = xmalloc(st.st_size);
+    if (read(fd, f, st.st_size) != (ssize_t)st.st_size)
+        die("short read %s", path);
+    close(fd);
+
+    elftrace_hdr h;
+    memcpy(&h, f, sizeof(h));
+    if (h.magic != ELFTRACE_MAGIC || h.version != ELFTRACE_VERSION)
+        die("%s: not a v%d elftrace file", path, ELFTRACE_VERSION);
+
+    sn->arch = h.arch;
+    sn->pid = h.task_tid;
+    sn->nsegs = h.nsegs;
+    sn->segs = xcalloc(h.nsegs ? h.nsegs : 1, sizeof(struct cseg));
+    if (h.nsegs)
+        sn->payload_offs = xmalloc(h.nsegs * sizeof(uint64_t));
+    for (size_t i = 0; i < h.nsegs; i++) {
+        elftrace_seg e;
+        memcpy(&e, f + h.segs_off + i * sizeof(e), sizeof(e));
+        struct cseg *c = &sn->segs[i];
+        c->vaddr = e.vaddr;
+        c->filesz = e.filesz;
+        c->memsz = e.memsz;
+        c->flags = e.flags;
+        c->name = NULL;
+        if (e.name_off) {
+            const char *nm = (const char *)(f + h.strings_off + e.name_off);
+            c->name = xstrdup(nm);
+        }
+        sn->payload_offs[i] = sn->payload.size;
+        uint8_t *tmp = xmalloc(e.filesz ? e.filesz : 1);
+        memcpy(tmp, f + h.payload_off + e.payload_off, e.filesz);
+        cbuf_append(&sn->payload, tmp, e.filesz);
+        free(tmp);
+    }
+    /* 状态: regs/xstate/sigmask/fds (aux 用 base 的调试节, 不常变) */
+    if (h.regs_off && h.regs_size <= sizeof(sn->regs))
+        memcpy(&sn->regs, f + h.regs_off, h.regs_size);
+    if (h.fpu_off && h.fpu_size) {
+        sn->xstate = xmalloc(h.fpu_size);
+        memcpy(sn->xstate, f + h.fpu_off, h.fpu_size);
+        sn->xstate_size = h.fpu_size;
+    }
+    memcpy(sn->sigmask, f + h.sigmask_off, sizeof(sn->sigmask));
+    if (h.aux_n) {
+        sn->aux = xcalloc(h.aux_n, sizeof(struct caux));
+        for (size_t i = 0; i < h.aux_n; i++) {
+            elftrace_aux e;
+            memcpy(&e, f + h.aux_off + i * sizeof(e), sizeof(e));
+            sn->aux[i].addr = e.addr;
+            sn->aux[i].size = e.size;
+            sn->aux[i].type = e.type;
+            sn->aux[i].flags = e.flags;
+            sn->aux[i].align = e.align;
+            sn->aux[i].entsize = e.entsize;
+            sn->aux[i].link = e.link;
+            sn->aux[i].info = e.info;
+            if (e.name_off)
+                sn->aux[i].name = xstrdup((const char *)
+                                          (f + h.strings_off + e.name_off));
+            sn->aux[i].data = xmalloc(e.size ? e.size : 1);
+            memcpy(sn->aux[i].data, f + h.payload_off + e.payload_off,
+                   e.size);
+        }
+        sn->naux = h.aux_n;
+    }
+    if (h.nfds) {
+        sn->fds = xcalloc(h.nfds, sizeof(struct cfdinfo));
+        for (size_t i = 0; i < h.nfds; i++) {
+            elftrace_fd e;
+            memcpy(&e, f + h.fds_off + i * sizeof(e), sizeof(e));
+            sn->fds[i].fd = e.fd;
+            sn->fds[i].flags = e.flags;
+            sn->fds[i].mode = e.mode;
+            sn->fds[i].pos = e.pos;
+            if (e.path_len) {
+                sn->fds[i].path =
+                    xstrdup((const char *)(f + h.strings_off + e.path_off));
+            }
+        }
+        sn->nfds = h.nfds;
+    }
+    free(f);
+}
+
+/* 对比 last 与 sn, 写差异文件 (增量检查点) */
+void collect_write_diff(const struct collect_snapshot *last,
+                        const struct collect_snapshot *sn, const char *out)
+{
+    struct cbuf file = {0};
+    struct cbuf state = {0};
+    struct cbuf tmpbuf = {0};
+    elftrace_diff_hdr h = {0};
+    uint64_t n_unmap = 0, n_newseg = 0, n_dirty = 0;
+    uint64_t *unmaps = NULL;
+    uint64_t *dirty_addrs = NULL;
+    struct cbuf dirty_data = {0};
+    struct cbuf newseg_data = {0};
+
+    /* 第一次扫描: unmap (last 有, sn 无) + newseg (sn 有, last 无) */
+    for (size_t i = 0; i < last->nsegs; i++) {
+        int found = 0;
+        for (size_t j = 0; j < sn->nsegs; j++) {
+            if (sn->segs[j].vaddr == last->segs[i].vaddr) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            n_unmap++;
+    }
+    if (n_unmap)
+        unmaps = xcalloc(n_unmap, sizeof(uint64_t));
+    n_unmap = 0;
+    for (size_t i = 0; i < last->nsegs; i++) {
+        int found = 0;
+        for (size_t j = 0; j < sn->nsegs; j++) {
+            if (sn->segs[j].vaddr == last->segs[i].vaddr) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            unmaps[n_unmap++] = last->segs[i].vaddr;
+    }
+
+    /* 第二遍: newseg + dirty (用 payload_offs 精确定位) */
+    for (size_t i = 0; i < last->nsegs; i++) {
+        /* 找 sn 中同 vaddr 段 */
+        const struct cseg *m = NULL;
+        size_t m_idx = 0;
+        for (size_t j = 0; j < sn->nsegs; j++) {
+            if (sn->segs[j].vaddr == last->segs[i].vaddr) {
+                m = &sn->segs[j];
+                m_idx = j;
+                break;
+            }
+        }
+        if (!m)
+            continue;           /* unmap 段 */
+        const uint8_t *lp = last->payload.data + last->payload_offs[i];
+        const uint8_t *sp = sn->payload.data + sn->payload_offs[m_idx];
+        size_t llen = last->segs[i].filesz;
+        size_t slen = m->filesz;
+        size_t common = llen < slen ? llen : slen;
+        uint64_t pg = 0;
+        while (pg + 4096 <= common) {
+            if (memcmp(lp + pg, sp + pg, 4096) != 0) {
+                dirty_addrs = xrealloc(dirty_addrs,
+                                       (n_dirty + 1) * sizeof(uint64_t));
+                dirty_addrs[n_dirty++] = last->segs[i].vaddr + pg;
+                cbuf_append(&dirty_data, sp + pg, 4096);
+            }
+            pg += 4096;
+        }
+        /* 尾部残页 (不足 4096) 或内容变化 */
+        if (common > pg) {
+            size_t tail = common - pg;
+            if (tail < 4096)
+                tail = 4096;
+            if (slen > llen ||
+                memcmp(lp + pg, sp + pg, common - pg) != 0) {
+                dirty_addrs = xrealloc(dirty_addrs,
+                                       (n_dirty + 1) * sizeof(uint64_t));
+                dirty_addrs[n_dirty++] = last->segs[i].vaddr + pg;
+                cbuf_append(&dirty_data, sp + pg, tail);
+            }
+        }
+        /* sn 比 last 长的部分: 全部 dirty */
+        for (uint64_t extra = common; extra + 4096 <= slen; extra += 4096) {
+            dirty_addrs = xrealloc(dirty_addrs,
+                                   (n_dirty + 1) * sizeof(uint64_t));
+            dirty_addrs[n_dirty++] = m->vaddr + extra;
+            cbuf_append(&dirty_data, sp + extra, 4096);
+        }
+        if (slen > common && (slen - common) < 4096) {
+            size_t tail = slen - common;
+            if (tail < 4096)
+                tail = 4096;
+            dirty_addrs = xrealloc(dirty_addrs,
+                                   (n_dirty + 1) * sizeof(uint64_t));
+            dirty_addrs[n_dirty++] = m->vaddr + common;
+            cbuf_append(&dirty_data, sp + common, tail);
+        }
+    }
+
+    /* newseg: sn 中 last 没有的段 (内容全量) */
+    for (size_t j = 0; j < sn->nsegs; j++) {
+        int found = 0;
+        for (size_t i = 0; i < last->nsegs; i++) {
+            if (sn->segs[j].vaddr == last->segs[i].vaddr) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            n_newseg++;
+            elftrace_diff_seg e = {0};
+            e.vaddr = sn->segs[j].vaddr;
+            e.filesz = sn->segs[j].filesz;
+            e.memsz = sn->segs[j].memsz;
+            e.flags = sn->segs[j].flags;
+            cbuf_append(&newseg_data, &e, sizeof(e));
+            cbuf_append(&newseg_data,
+                        sn->payload.data + sn->payload_offs[j], e.filesz);
+        }
+    }
+
+    /* 状态区: regs | xstate_size+xstate | sigmask | nfds + fds表 + 路径 */
+    cbuf_append(&state, &sn->regs, sizeof(sn->regs));
+    cbuf_append(&state, &sn->xstate_size, sizeof(sn->xstate_size));
+    if (sn->xstate_size)
+        cbuf_append(&state, sn->xstate, sn->xstate_size);
+    cbuf_append(&state, sn->sigmask, sizeof(sn->sigmask));
+    cbuf_append(&state, &sn->nfds, sizeof(sn->nfds));
+    for (size_t i = 0; i < sn->nfds; i++) {
+        elftrace_fd e = {0};
+        e.fd = sn->fds[i].fd;
+        e.flags = sn->fds[i].flags;
+        e.mode = sn->fds[i].mode;
+        e.pos = sn->fds[i].pos;
+        e.path_len = sn->fds[i].path ? strlen(sn->fds[i].path) + 1 : 0;
+        e.path_off = state.size;   /* 路径紧跟 fd 表后 */
+        cbuf_append(&state, &e, sizeof(e));
+        if (sn->fds[i].path)
+            cbuf_append(&state, sn->fds[i].path, e.path_len);
+    }
+
+    /* 写文件: hdr | 状态区 | unmaps | newseg 区 | dirty 页区 */
+    h.magic = ELFTRACE_DIFF_MAGIC;
+    h.version = ELFTRACE_DIFF_VERSION;
+    h.state_size = state.size;
+    h.n_unmap = n_unmap;
+    h.n_newseg = n_newseg;
+    h.n_dirty = n_dirty;
+    cbuf_init(&file);
+    cbuf_append(&file, &h, sizeof(h));
+    cbuf_append(&file, state.data, state.size);
+    if (n_unmap)
+        cbuf_append(&file, unmaps, n_unmap * sizeof(uint64_t));
+    cbuf_append(&file, newseg_data.data, newseg_data.size);
+    for (uint64_t k = 0; k < n_dirty; k++) {
+        cbuf_append(&file, &dirty_addrs[k], sizeof(uint64_t));
+        cbuf_append(&file, dirty_data.data + k * 4096, 4096);
+    }
+
+    int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        die("cannot create %s", out);
+    size_t n = write(fd, file.data, file.size);
+    if (n != file.size)
+        die("short write to %s", out);
+    close(fd);
+
+    fprintf(stderr, "diff: %llu unmap, %llu newseg, %llu dirty pages -> %s "
+            "(%llu bytes)\n",
+            (unsigned long long)n_unmap, (unsigned long long)n_newseg,
+            (unsigned long long)n_dirty, out,
+            (unsigned long long)file.size);
+
+    free(unmaps);
+    free(dirty_addrs);
+    free(file.data);
+    free(state.data);
+    free(tmpbuf.data);
+    free(newseg_data.data);
+    free(dirty_data.data);
 }
 
 void collect_memory(pid_t pid, struct collect_snapshot *sn)

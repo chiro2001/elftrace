@@ -33,6 +33,15 @@ NCKPT=$(wc -l < "$CKPTS/manifest.txt")
 [ "$NCKPT" -ge 8 ] || { echo "FAIL: only $NCKPT checkpoints"; exit 1; }
 echo "trace: $NCKPT checkpoints (every $N)"
 
+# 1.5 增量检查点: 检查点 0 完整, 后续为差异文件 (体积 << 完整)
+BASE_SIZE=$(stat -c %s "$CKPTS/ckpt_000000.elftrace")
+DIFF_SIZE=$(stat -c %s "$CKPTS/ckpt_000001.elftrace")
+if [ "$DIFF_SIZE" -gt $((BASE_SIZE / 4)) ]; then
+    echo "FAIL: diff ckpt too big ($DIFF_SIZE vs base $BASE_SIZE)";
+    exit 1
+fi
+echo "incremental: base=$BASE_SIZE diff=$DIFF_SIZE ($((DIFF_SIZE * 100 / BASE_SIZE))%)"
+
 # 2. manifest 采样点精度: 相邻 count 差必须 == N
 awk '{print $1}' "$CKPTS/manifest.txt" | python3 -c "
 import sys

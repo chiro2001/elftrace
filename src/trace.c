@@ -49,6 +49,8 @@ struct trace_ctx {
     size_t cow_ok, cow_fail;
     pid_t *cow_children;
     size_t n_cow_children;
+    struct collect_snapshot last;   /* 上一检查点的段表+内容 (增量对比) */
+    int have_last;
 };
 
 static void perf_open(struct trace_ctx *tc)
@@ -144,7 +146,15 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
     }
 
     snprintf(path, sizeof(path), "%s/ckpt_%06zu.elftrace", tc->out, tc->ckpt_no);
-    collect_write(&sn, path);
+    if (tc->ckpt_no == 0) {
+        collect_write(&sn, path);
+        collect_snapshot_copy_last(&tc->last, &sn);
+        tc->have_last = 1;
+    } else {
+        collect_write_diff(&tc->last, &sn, path);
+        collect_snapshot_free_last(&tc->last);
+        collect_snapshot_copy_last(&tc->last, &sn);
+    }
 
     snprintf(manifest, sizeof(manifest), "%s/manifest.txt", tc->out);
     f = fopen(manifest, "a");
@@ -235,6 +245,8 @@ int trace_main(int argc, char **argv)
             break;
     }
 
+    if (tc.have_last)
+        collect_snapshot_free_last(&tc.last);
     collect_detach_run(pid);
     close(tc.perf_fd);
     /* 回收所有 COW 代理 (此时 perf 已无用) */

@@ -123,4 +123,33 @@ typedef struct {
     uint64_t info;              /* sh_info */
 } elftrace_aux;
 
+/* ============ 增量检查点 (diff) 格式 ============
+ * 检查点 0 为完整 .elftrace; 后续检查点为差异文件:
+ *   只记录相对上一检查点修改的页 (新段全量, 删除段列表, 脏页内容)。
+ * 布局: hdr | unmap 表 | newseg 记录区 | dirty 页区
+ *   unmap:  {vaddr} x n_unmap            (段被 unmap, 按 vaddr 匹配)
+ *   newseg: {vaddr,filesz,memsz,flags,pad} + data(filesz)  x n_newseg
+ *   dirty:  {vaddr} + data(4096)         x n_dirty
+ */
+#define ELFTRACE_DIFF_MAGIC 0x46464944   /* "DIFF" */
+#define ELFTRACE_DIFF_VERSION 1
+
+typedef struct {
+    uint32_t magic;             /* ELFTRACE_DIFF_MAGIC */
+    uint32_t version;           /* ELFTRACE_DIFF_VERSION */
+    uint64_t state_size;        /* 状态区大小 (regs/xstate/sigmask/fds) */
+    uint64_t n_unmap;           /* 删除的段数 */
+    uint64_t n_newseg;          /* 新段数 (完整内容) */
+    uint64_t n_dirty;           /* 脏页数 (4096 字节/页) */
+} elftrace_diff_hdr;
+
+/* newseg 记录 (40 字节) */
+typedef struct {
+    uint64_t vaddr;
+    uint64_t filesz;
+    uint64_t memsz;
+    uint64_t flags;
+    uint64_t pad;
+} elftrace_diff_seg;
+
 #endif /* ELFTRACE_H */
