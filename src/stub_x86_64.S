@@ -727,6 +727,7 @@ ipc_restorer:
 #define BMS_RDI     (BMS_SC + SIGFRAME_SC_RDI)
 #define BMS_RDX     (BMS_SC + SIGFRAME_SC_RDX)
 #define BMS_RIP     (BMS_SC + SIGFRAME_SC_RIP)
+#define BMS_EFLAGS  (BMS_SC + SIGFRAME_SC_EFLAGS)
 
 /* 处理器安全区: 内核信号帧迁移至此 (dirty 回放覆盖目标栈页时,
    帧/处理器栈不被破坏)。复用 stub 栈区 (恢复完成目标运行后闲置)。
@@ -890,7 +891,7 @@ bm_rp_newseg_loop:
     decq %r12
     jmp bm_rp_newseg_loop
 
-    /* --- dirty: 逐页按 vaddr 找段 (segs 表) 拷贝 --- */
+    /* --- dirty: 数据内嵌 replay 区 {vaddr}+4096, 直接拷贝 --- */
 bm_rp_dirty:
     movq 56(%rbx), %r12
     movq 64(%rbx), %r13
@@ -898,51 +899,11 @@ bm_rp_dirty:
 bm_rp_dirty_loop:
     testq %r12, %r12
     jz bm_rp_done
-    movq (%r13), %r14                  /* dirty vaddr */
-    movq %rbp, %r15
-    movq rst_desc+RST_DESC_REPLAY_OFF(%rip), %r8
-    subq %r8, %r15                     /* r15 = blob base */
-    movq rst_desc+RST_DESC_SEGS_OFF(%rip), %r8
-    addq %r15, %r8                     /* r8 = segs 表 */
-    movq rst_desc+RST_DESC_N_SEGS(%rip), %r9
-    xorq %r10, %r10                    /* i */
-bm_rp_dirty_find:
-    cmpq %r9, %r10
-    jae bm_rp_dirty_next
-    movq %r10, %r15
-    imulq $48, %r15                    /* seg 偏移 */
-    movq (%r8,%r15), %rax              /* seg.vaddr */
-    cmpq %rax, %r14
-    jb bm_rp_dirty_find_next
-    movq 8(%r8,%r15), %rdx             /* seg.filesz */
-    addq %rax, %rdx
-    cmpq %rdx, %r14
-    jae bm_rp_dirty_find_next
-    /* src = blob base + seg.payload_off + (dirty - seg.vaddr) */
-    movq 32(%r8,%r15), %rdi
-    movq %rbp, %r11
-    movq rst_desc+RST_DESC_REPLAY_OFF(%rip), %rsi
-    subq %rsi, %r11                    /* r11 = blob base */
-    addq %r11, %rdi
-    movq %r14, %rsi
-    subq %rax, %rsi
-    addq %rsi, %rdi                    /* rdi = src */
-    /* len = min(4096, filesz - off) */
-    movq 8(%r8,%r15), %rcx
-    subq %rsi, %rcx
-    cmpq $4096, %rcx
-    jae 1f
-    jmp 2f
-1:  movq $4096, %rcx
-2:  movq %r14, %rsi                    /* dst = dirty vaddr */
-    xchgq %rdi, %rsi                   /* rsi=src rdi=dst */
+    movq (%r13), %rdi                    /* dst = dirty vaddr */
+    leaq 8(%r13), %rsi                   /* src = dirty 数据 */
+    movq $4096, %rcx
     rep movsb
-    jmp bm_rp_dirty_next
-bm_rp_dirty_find_next:
-    incq %r10
-    jmp bm_rp_dirty_find
-bm_rp_dirty_next:
-    addq $4104, %r13                   /* vaddr(8) + 4096 */
+    addq $4104, %r13                     /* vaddr(8) + 4096 */
     decq %r12
     jmp bm_rp_dirty_loop
 
@@ -950,6 +911,19 @@ bm_rp_done:
     /* rax = B 的 syscall 返回值 */
     movq 16(%rbx), %rax
     movq %rax, BMS_RAX(%rsp)
+    /* 显式设置恢复现场 (不依赖 sigframe 原值):
+       rip = rec.pc + 2 (跳过 int3+nop, syscall 已完成, 从原 syscall
+       下一条继续; sigframe rip 的 int3+1/int3+2 不确定性被消除) */
+    movq (%rbx), %rax          /* rec.pc (int3 地址) */
+    addq $2, %rax
+    movq %rax, BMS_RIP(%rsp)
+    /* eflags: 清 TF(bit8)/RF(bit16)/AC(bit18) — 防恢复后单步风暴
+       (TF 残留 → 每条指令单步 SIGTRAP → 误判为 syscall 触发)。
+       掩码 = ~(0x100|0x10000|0x40000) = 0xfffafeff = -0x50101
+       (注意: -0x50100 = 0xfffaff00, TF bit8=1 未清) */
+    movq BMS_EFLAGS(%rsp), %rax
+    andq $-0x50101, %rax
+    movq %rax, BMS_EFLAGS(%rsp)
     jmp bm_done
 
 bm_replay_miss:

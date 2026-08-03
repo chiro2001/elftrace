@@ -875,6 +875,14 @@ void collect_state_light(pid_t pid, struct collect_snapshot *sn)
                 die("ptrace(GETREGS) on %d", pid);
         }
     }
+#if defined(__x86_64__)
+    /* ptrace 停止机制 (尤其 PTRACE_SYSCALL) 可能在 eflags 残留 TF
+       (bit 8): 内核用单步在 syscall 边界停止, INTERRUPT-stop 时 TF
+       仍置位。切片恢复后目标每条指令触发单步 SIGTRAP (风暴),
+       baremetal 处理器误判为 syscall 触发。目标正常运行时的 eflags
+       不含 TF, 清除是正确语义。 */
+    sn->regs.eflags &= ~0x100UL;
+#endif
 
     /* FPU: 按架构选择 regset */
     sn->xstate = xcalloc(1, 8192);
