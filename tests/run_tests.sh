@@ -23,7 +23,7 @@ ROOT=$(pwd)
 LOG="$ROOT/tmp/test_run.log"
 mkdir -p "$ROOT/tmp"
 
-TESTS="basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle"
+TESTS="basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle baremetal imix"
 PASS=0
 FAIL=0
 
@@ -37,7 +37,9 @@ echo "elftrace test suite ($(date '+%F %T'))"
 echo "=========================================="
 for t in $TESTS; do
     printf "%-8s " "[$t]"
-    if timeout 600 "tests/test_$t.sh" > "$LOG" 2>&1; then
+    TS="tests/test_$t.sh"
+    [ "$t" = imix ] && TS="tests/IMIX/test_imix.sh"
+    if timeout 600 "$TS" > "$LOG" 2>&1; then
         LAST=$(grep -E "^PASS" "$LOG" | tail -1)
         echo "PASS  (${LAST#PASS: })"
         PASS=$((PASS + 1))

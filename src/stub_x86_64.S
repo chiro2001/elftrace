@@ -719,20 +719,29 @@ ipc_restorer:
  * desc.exit_addr 时跳转退出代码。不支持的 syscall 打印后退出 0x5e。
  *
  * 入口 rsp = 信号帧 frame 地址 (pretcode 槽, 即 uc-8);
- * push x10 后 uc = rsp + 8 + 0x50 = rsp + 0x58,
- * sigcontext = uc + 0x28 = rsp + 0x80。
+ * push x15 (rbp,r12-r15 + x10) 后 uc = rsp + 8 + 0x78 = rsp + 0x80,
+ * sigcontext = uc + 0x28 = rsp + 0xA8。
+ * (处理器内部使用 rbp/r12-r15, 必须保存恢复, 否则目标现场被破坏 —
+ *   C++ 程序 r12-r15 存全局指针, 曾致恢复后 SIGSEGV)
  */
-#define BMS_SC      0x80
+#define BMS_SC      0xA8
 #define BMS_RAX     (BMS_SC + SIGFRAME_SC_RAX)
 #define BMS_RDI     (BMS_SC + SIGFRAME_SC_RDI)
 #define BMS_RDX     (BMS_SC + SIGFRAME_SC_RDX)
 #define BMS_RIP     (BMS_SC + SIGFRAME_SC_RIP)
 #define BMS_EFLAGS  (BMS_SC + SIGFRAME_SC_EFLAGS)
+#define BMS_RSP     (BMS_SC + SIGFRAME_SC_RSP)
+#define BMS_RBP     (BMS_SC + SIGFRAME_SC_RBP)
 
 /* 处理器安全区: 内核信号帧迁移至此 (dirty 回放覆盖目标栈页时,
    帧/处理器栈不被破坏)。复用 stub 栈区 (恢复完成目标运行后闲置)。
-   BM_SAFE_SIZE 覆盖 帧+fpstate (~0x1000) + push 区 + 原帧地址槽 */
-#define BM_SAFE_SIZE 0x1100
+   BM_SAFE_SIZE 覆盖 帧+fpstate (~0x1000) + push 区 + 原帧地址槽。
+   容量上限 = 0x62C0(代码起点) - 0x4CA0(bm_safe_area) = 0x1620;
+   独立 fpstate 缓冲 (大 xstate 时在 frame+0x2000 附近) 装不下,
+   由 bm_handler 把 fpstate 数据拷贝到 SAFE+0xB50 并重指 */
+#define BM_SAFE_SIZE 0x1620
+/* fpstate 数据拷贝位置 (SAFE 内空闲区, frame 数据实际用到 0xAC8) */
+#define BM_FPSTATE_COPY (0xB50)
 
 bm_handler:
     /* 回放路径 (有回放表) 才迁移信号帧到安全区:
@@ -749,16 +758,27 @@ bm_handler:
     movq $BM_SAFE_SIZE, %rcx
     rep movsb
     lea bm_safe_area(%rip), %rsp
-    addq $0x80, %rsp               /* push 前 rsp = SAFE+0x80 */
-    movq 0xB8(%rsp), %rax          /* sc->fpstate (sc = rsp) */
-    testq %rax, %rax
-    jz 1f
-    subq bm_safe_area+BM_SAFE_SIZE(%rip), %rax   /* 帧内偏移 */
-    lea bm_safe_area(%rip), %rcx
-    addq %rcx, %rax
-    addq $0x80, %rax
-    movq %rax, 0xB8(%rsp)
-1:
+    addq $0x80, %rsp               /* push 前 rsp = SAFE+0x80 = 新 frame */
+    /* fpstate 处理: 原指针可能指向独立缓冲 (大 xstate 时内核在
+       frame 外分配, 目标栈上; dirty 回放会覆盖) 或在 sigframe 内嵌。
+       统一: 把 fpstate 数据拷贝到 SAFE+BM_FPSTATE_COPY 并重指,
+       大小 = RST_DESC_FPU_SIZE (采集的 xstate 大小) */
+    call 1f
+1:  popq %rax
+    subq $(1b - bm_handler), %rax      /* rax = bm_handler 绝对地址 */
+    subq $(bm_handler - _start), %rax  /* rax = _start 绝对地址 */
+    subq $STUB_ENTRY_OFF, %rax         /* rax = blob base */
+    movq 0xE8(%rsp), %rdi              /* sc->fpstate (push 前 rsp=SAFE+0x80, fpstate 字段在 SAFE+0x168) */
+    testq %rdi, %rdi
+    jz 2f
+    movq rst_desc+RST_DESC_FPU_SIZE(%rip), %rcx
+    testq %rcx, %rcx
+    jz 2f
+    lea 0xAD0(%rsp), %rsi              /* dst = SAFE+0xB50 (rsp=SAFE+0x80) */
+    movq %rsi, %r12                    /* 保存 dst (rep 后 rsi/rdi 都 +len) */
+    rep movsb
+    movq %r12, 0xE8(%rsp)              /* sc->fpstate = 拷贝位置 (绝对地址) */
+2:
     /* 清 AC (对齐检查): 采集的 eflags 可能含 AC (ptrace 停止时内核
        置 RF, 目标自身 AC 未知), 处理器内非对齐访问 (回放表/rep) 会
        触发 #AC → SIGBUS */
@@ -770,6 +790,11 @@ bm_handler:
 bm_mock_entry:
     /* 旧 mock 路径: 无迁移, 直接压栈 (帧在目标栈, BMS_* 读 rsp0) */
 bm_common:
+    pushq %rbp
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
     pushq %rax
     pushq %rbx
     pushq %rcx
@@ -867,7 +892,7 @@ bm_rp_newseg_loop:
     jz bm_rp_dirty
     movq 0(%r13), %rdi                 /* vaddr */
     movq 16(%r13), %rsi                /* memsz */
-    movq $6, %rdx                      /* PROT_READ|PROT_WRITE */
+    movq $3, %rdx                      /* PROT_READ|PROT_WRITE */
     movq $0x32, %r10                   /* PRIVATE|ANON|FIXED */
     movq $-1, %r8
     xorq %r9, %r9
@@ -879,10 +904,23 @@ bm_rp_newseg_loop:
     movq %rax, %rdi                    /* dst = vaddr */
     leaq 32(%r13), %rsi                /* src */
     rep movsb
-    /* mprotect(vaddr, memsz, flags) */
+    /* mprotect(vaddr, memsz, ET_SEG_* -> PROT_* 转换)
+       ET: X=1 W=2 R=4;  PROT: R=1 W=2 X=4 (直接传 ET 值会得
+       W|X 无读 → 目标读段 SIGSEGV, 曾致 deep-stack 崩溃) */
     movq 0(%r13), %rdi
     movq 16(%r13), %rsi
     movq 24(%r13), %rdx
+    xorq %rcx, %rcx
+    testq $1, %rdx                     /* ET_SEG_X -> PROT_EXEC */
+    jz 1f
+    orq $4, %rcx
+1:  testq $2, %rdx                     /* ET_SEG_W -> PROT_WRITE */
+    jz 2f
+    orq $2, %rcx
+2:  testq $4, %rdx                     /* ET_SEG_R -> PROT_READ */
+    jz 3f
+    orq $1, %rcx
+3:  movq %rcx, %rdx
     movq $10, %rax
     syscall
     movq 8(%r13), %rax
@@ -1049,6 +1087,11 @@ bm_done:
     popq %rcx
     popq %rbx
     popq %rax
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbp
     ret                             /* -> restorer -> rt_sigreturn */
 
 bm_do_exit:
