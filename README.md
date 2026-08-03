@@ -32,6 +32,10 @@ make                          # 需要 gcc/as/ld/objcopy
 ./build/elftrace trace <pid> --every 5000000 --out ckpts/       # 5m 条/检查点 (模拟器场景)
 ./build/elftrace build -o slice.elf --checkpoints ckpts/ --from 2 --to 5     [--mode real|baremetal]
 
+# trace 期间还会采集每个 syscall 的入口/返回状态差异 (PTRACE_SYSCALL):
+#   ckpts/syscalls/syscall.map + sys_%06zu.elftrace
+# baremetal build 时嵌入为回放表 (切片区间 [from, to) 内的记录)
+
 # trace bundle 归档: 检查点目录打包为单文件 (默认仍离散文件, 存档用)
 ./build/elftrace bundle ckpts/ -o trace.bundle                  # 打包
 ./build/elftrace bundle trace.bundle --unpack -o dir            # 解包
@@ -39,10 +43,18 @@ make                          # 需要 gcc/as/ld/objcopy
 ```
 
 - `--mode baremetal`：生成裸机切片——目标代码中的 syscall 指令被替换为
-  int3，运行时由 stub 的 SIGTRAP 模拟器 mock（read/write/writev/open/
-  close/mmap/mprotect/munmap/brk/getpid/kill/arch_prctl/rt_sigaction/
-  rt_sigprocmask/exit_group/exit 等），不支持的 syscall 打印后以退出码
-  0x5e 退出；退出不用 perf，而是把退出点指令替换为 int3。默认 real 模式。
+  int3，运行时由 stub 的 SIGTRAP 处理器接管：
+  - **syscall 回放表（trace 场景，优先）**：`trace` 用 PTRACE_SYSCALL 采集
+    每个 syscall 入口/返回状态差异（`ckpts/syscalls/` 子目录），build 嵌入
+    回放表（pc/syscall 号/返回值/unmap 段/newseg 段/dirty 页数据）；处理器
+    命中后重放内存差异、伪造返回值与 rip，目标全程不执行真实 syscall
+    （处理器内部用于重放内存的 mmap/mprotect/munmap 与最终 exit_group 除外）。
+  - **旧 mock 路径（freeze 场景，无回放表时兜底）**：按 syscall 号分派模拟
+    （read/write/writev/open/close/mmap/mprotect/munmap/brk/getpid/kill/
+    arch_prctl/rt_sigaction/rt_sigprocmask/exit_group/exit 等）。
+  - 不支持的 syscall 打印后以退出码 0x5e 退出；退出点由 `--checkpoints
+    --to M`（检查点 M 的指令地址）或 `--breakpoint ADDR` 处的指令替换为
+    int3 实现。**默认 baremetal 模式**（`--mode real` 显式切回）。
 - `--ipc N`：real 模式为 perf_event_open 指令计数退出（溢出触发 SIGIO，
   打印 `IPC: <count> instructions` 后退出，返回 0）；baremetal 模式需
   配合 `--checkpoints` 确定第 N 条指令的地址。
@@ -70,9 +82,9 @@ make                          # 需要 gcc/as/ld/objcopy
 | 组装器 | `src/build.c` | 解析 `.elftrace`，把 stub blob 放入目标地址空间空闲 gap，组装 ET_EXEC |
 | DWARF 修补 | `src/dwarf.c` | PIE 程序的调试节地址加加载偏置（DWARF v4/v5） |
 | 查看器 | `src/dump.c` | `.elftrace` 人读 |
-| 检查点采集 | `src/trace.c` | perf 指令计数，每 N 条指令冻结采集一个检查点 + manifest |
+| 检查点采集 | `src/trace.c` | perf 指令计数，每 N 条指令冻结采集一个检查点 + manifest；PTRACE_SYSCALL 采集每个 syscall 的入口/返回差异（`syscalls/` 子目录，供 baremetal 回放表） |
 | COW 注入器 | `src/inject.c` | 冻结目标时注入 fork（两阶段：mmap 专用页+自跳转），目标停顿 ~100ns；镜像代理 pause 阻塞（不占 CPU）+ setpgid 脱离目标组 |
-| 归档工具 | `src/bundle.c` | 检查点目录打包为单文件（bundle 格式），build 可直接读取 |
+| 归档工具 | `src/bundle.c` | 检查点目录打包为单文件（bundle 格式，含 manifest；不含 `syscalls/` 差异），build 可直接读取 |
 
 ### 恢复流程（x86_64 stub）
 
@@ -90,6 +102,26 @@ make                          # 需要 gcc/as/ld/objcopy
 10. `rt_sigreturn`：内核一次性恢复全部寄存器、信号掩码与 FPU/AVX 状态，
     跳转到冻结 PC。
 
+### baremetal 回放机制（x86_64 stub）
+
+- **构建期**：所有 PF_X 段内 `0f 05`（syscall）→ `cc 90`（int3+nop）；
+  退出点地址处写 int3；`--checkpoints` 时把 `syscalls/` 差异嵌入回放表
+  （`n_recs + rec×80B{pc,sysno,rax,n_unmap,unmap_off,n_newseg,newseg_off,
+  n_dirty,dirty_off} + 数据区{unmap vaddr表 / newseg{vaddr,filesz,memsz,
+  flags}+数据 / dirty{vaddr}+4096}`），只保留切片区间 `[from,to)` 内的记录；
+  pc 统一修正为 int3 地址（entry-stop 的 ip 是 syscall 下一条）。
+- **运行时**：目标命中 int3 → SIGTRAP → 处理器：
+  1. 内核信号帧迁移到 blob 安全区（dirty 回放覆盖目标栈页时不破坏帧）；
+     fpstate 数据（可能在内核独立分配的缓冲，dirty 会覆盖）拷贝到安全区
+     并重指 `sc->fpstate`（大小取采集的 xstate 大小）；
+  2. 触发地址 = `sc->rip - 1`：等于退出点 → 跳退出代码；`exit_group/exit`
+     → 真实退出；
+  3. 游标顺序扫描回放表匹配 pc：应用 unmap（munmap）/ newseg（mmap+
+     拷贝+mprotect，ET→PROT 权限转换）/ dirty（rep movsb 整页覆盖）；
+  4. 恢复现场：rax = 记录的返回值，rip = pc+2（跳过 int3+nop），
+     eflags 清 TF/RF/AC（残留 TF 会单步风暴），rt_sigreturn 返回目标。
+- **无回放表**（freeze 场景）：按 syscall 号走旧 mock 分派。
+
 ### 关键设计点
 
 - **恢复位置**：stub blob（含全部 payload）放在目标地址空间的一个空闲
@@ -104,7 +136,7 @@ make                          # 需要 gcc/as/ld/objcopy
 ## 测试
 
 ```bash
-tests/run_tests.sh     # 一键运行全部 15 项测试
+tests/run_tests.sh     # 一键运行全部 17 项测试
 ```
 
 | 测试 | 覆盖 |
@@ -124,6 +156,8 @@ tests/run_tests.sh     # 一键运行全部 15 项测试
 | `test_bareheap.sh` | baremetal brk mock + real malloc fallback |
 | `test_interval.sh` | 区间切片指令数精度（内部/外部双验证，误差 <5%，10m/50m/100m） |
 | `test_bundle.sh` | trace bundle（打包/从 bundle 组装/解包一致性） |
+| `test_baremetal.sh` | baremetal 回放统一测试：9 负载（simple/fd/fd_rw/stack/bigmem/thread/append/cpp/syscall）trace+回放表路径，断言 rc 一致、目标阶段无真实 syscall、perf 指令数 real vs bm 差 <1%、topdown 趋势一致 |
+| `tests/IMIX/test_imix.sh` | 指令流验证：DynamoRIO+instrace 采集 real 切片 imix 分布（prog_imix 3500 万指令），perf/dynamorio 指令数交叉验证 <1%，topdown real/bm 对比；mov 占比合理性 |
 
 需要 `kernel.yama.ptrace_scope=0`（或目标进程允许被跟踪）。
 
@@ -133,6 +167,8 @@ tests/run_tests.sh     # 一键运行全部 15 项测试
 - trace 的 COW 检查点：注入 fork 创建的镜像代理保持自旋（退出会破坏
   perf 事件对目标的计数），由 trace 结束时统一回收；每检查点目标地址
   空间增加一个 ~4KB 专用页。
+- baremetal 回放表只来自 `--checkpoints` 的 `syscalls/` 差异目录；
+  bundle 归档不含 `syscalls/`（从 bundle 组装时回放表为空，回退旧 mock 路径）。
 - baremetal 退出点为检查点粒度（trace 间隔），"第 N 条指令"取最近检查点
   PC，误差 < 间隔；若退出点恰在循环内，进程在首次执行到该指令时退出。
 - baremetal 的 brk 模拟只允许在冻结时堆边界内移动；mmap 返回 -ENOMEM，

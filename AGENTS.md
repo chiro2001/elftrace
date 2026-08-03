@@ -25,9 +25,10 @@ make clean           # 全量重编（改 include/*.h 后若依赖不触发，�
 ## 测试
 
 ```bash
-tests/run_tests.sh   # 一键运行全部 15 项测试（basic/dbg/fd/ipc/cpp/fd_rw/
+tests/run_tests.sh   # 一键运行全部 17 项测试（basic/dbg/fd/ipc/cpp/fd_rw/
                      # py/syscall/stack/bigmem/thread/append/bareheap/
-                     # interval/bundle）
+                     # interval/bundle/baremetal/imix；imix 在
+                     # tests/IMIX/test_imix.sh，run_tests 特判路径）
 ```
 
 测试脚本约定（新增测试必须遵守）：
@@ -38,6 +39,29 @@ tests/run_tests.sh   # 一键运行全部 15 项测试（basic/dbg/fd/ipc/cpp/fd
 - **strace 必须直接跟踪目标**：`timeout 60 strace -o f ./target`，
   不能 `strace -o f timeout 60 ./target`（后者跟踪的是 timeout）
 - baremetal 测试断言只查退出码（write 被 mock 丢弃，输出不可见）
+
+## baremetal 回放（新机制，改代码前必读）
+
+- **采集**（trace.c）：PTRACE_SYSCALL 捕获每个 syscall 的 ENTRY（A）/EXIT
+  （B）状态 → 离线 `collect_write_diff(A,B)` 写 `syscalls/sys_%06zu.elftrace`
+  + `syscall.map`（行号=索引）；被打断的 syscall 补记 A=上一检查点。
+- **构建**（build.c 3.6）：解析 map，只保留切片区间 `[syscall_start,
+  syscall_end)` 记录；pc 修正：entry-stop ip 是 syscall 下一条，blob 中
+  pc-2 处是 0xcc 则取 pc-2。布局 `n_recs + rec×80B + 数据区`。
+- **stub 处理器**（stub_x86_64.S bm_handler~bm_done）：
+  - 有回放表时把内核 sigframe 迁移到 `bm_safe_area`（blob+0x4CA0，
+    容量上限 0x62C0-0x4CA0=0x1620）；**fpstate 统一拷贝到 SAFE+0xB50 并
+    重指 sc->fpstate**（大 xstate 时内核在 frame 外分配独立缓冲，dirty
+    回放会覆盖它；迁移区装不下，不能靠扩迁移区——曾因扩到 0x2300 覆盖
+    代码区自我崩溃）。
+  - 回放命中：unmap=munmap；newseg=mmap(RW,FIXED)+拷贝+mprotect
+    （**ET_SEG flags(X=1,W=2,R=4)≠PROT(R=1,W=2,X=4)，必须转换**）；
+    dirty=rep movsb 整页覆盖（数据内嵌回放区）。
+  - 恢复现场：rax=rec.rax、rip=rec.pc+2、eflags 清 TF/RF/AC
+    （掩码 -0x50101，注意 -0x50100 的 TF 位未清）。
+- **调试教训**：禁止在处理器内用 write 打印调试（fd 已被 stub 恢复成目标
+  输出文件，污染输出与指令数；BMS_RSP/BMS_RBP 等宏定义在处理器区头部，
+  改代码前确认存在）。
 
 ## 代码结构
 
