@@ -23,6 +23,7 @@
 #include "collect.h"
 #include "bundle.h"
 #include "util.h"
+#include "disasm.h"
 
 /* ---- 生成的 stub blob ---- */
 extern const unsigned char stub_blob_x86_64[];
@@ -354,6 +355,7 @@ int build_main(int argc, char **argv)
 
     /* --from/--to: 用 trace 检查点替代基础镜像并确定退出点 */
     uint64_t syscall_start = 0, syscall_end = UINT64_MAX;
+    uint64_t resume_pc = 0;   /* 切片恢复点 pc (丢弃悬空记录用) */
     if (ckpts) {
         char path[PATH_MAX];
         FILE *f;
@@ -381,6 +383,7 @@ int build_main(int argc, char **argv)
                 found_from = idx;
                 count0 = cnt;
                 ip0 = ip;
+                resume_pc = ip;
                 if (nf >= 4)
                     syscall_start = nsys; /* 回放表起始 (K 前的不消费) */
             }
@@ -597,58 +600,35 @@ int build_main(int argc, char **argv)
         if (exit_override)
             fprintf(stderr, "        exit addr %#llx (int3)\n",
                     (unsigned long long)exit_override);
-        /* syscall 替换: PF_X 段内 0f 05 -> cc 90 */
-        size_t replaced = 0;
-        for (size_t i = 0; i < s.h.nsegs; i++) {
-            if (!(segs[i].flags & ET_SEG_X))
-                continue;
-            size_t base = payload_off + segs[i].payload_off;
-            for (uint64_t j = 0; j + 1 < segs[i].filesz; j++) {
-                if (blob.data[base + j] == 0x0f &&
-                    blob.data[base + j + 1] == 0x05) {
-                    blob.data[base + j] = 0xcc;
-                    blob.data[base + j + 1] = 0x90;
-                    replaced++;
-                }
-            }
-        }
-        fprintf(stderr, "        %zu syscall instructions replaced by "
-                "int3 (mocked)\n", replaced);
     }
 
-    /* 3.6 baremetal: syscall 回放表 (--checkpoints DIR/syscalls/ →
-       嵌入 blob 追加区)。
-       回放表布局 (偏移相对 replay 区起点):
-         +0   n_recs (u64)
-         rec × n (80B): {pc, sysno, rax, n_unmap, unmap_off,
-                         n_newseg, newseg_off, n_dirty, dirty_off, pad}
-         数据区:
-           unmap:  {vaddr} × n_unmap
-           newseg: {vaddr,filesz,memsz,flags}(32B) + data(filesz) × n_newseg
-           dirty:  {vaddr} + data(4096) × n_dirty
-       stub 处理器: 触发 int3 的 pc 匹配记录 → 应用差异 (unmap/mmap+
-       拷贝/mprotect + dirty 页覆盖) + 恢复 rax (B 的 syscall 返回值);
-       游标顺序消费 (单线程执行顺序 == 记录顺序)。 */
+    /* 3.5a baremetal: 解析 syscall 回放记录 (--checkpoints
+       DIR/syscalls/syscall.map → 内存中的 recs)。只保留切片区间
+       [syscall_start, syscall_end) 内的记录。记录 pc 修正放到 int3
+       替换之后 (见 3.5b)。 */
     replay_off = 0;
     replay_size = 0;
+    struct rec_tmp {
+        uint64_t pc, sysno, rax;
+        uint64_t n_unmap, n_newseg, n_dirty;
+        struct buf unmap, newseg, dirty;
+    } *recs = NULL;
+    size_t nrecs = 0, rec_cap = 0;
+    int have_map = 0;         /* 找到 syscall.map (有回放数据) */
     if (mode_baremetal && ckpts) {
         char mappath[PATH_MAX];
         snprintf(mappath, sizeof(mappath), "%s/syscalls/syscall.map", ckpts);
         FILE *mf = fopen(mappath, "r");
         if (mf) {
-            /* pass 1: 解析全部 diff, 收集到内存 */
-            struct rec_tmp {
-                uint64_t pc, sysno, rax;
-                uint64_t n_unmap, n_newseg, n_dirty;
-                struct buf unmap, newseg, dirty;
-            } *recs = NULL;
-            size_t nrecs = 0, cap = 0;
+            have_map = 1;
             size_t map_idx = 0;   /* 记录在 syscall.map 中的行号 */
             char line[1024];
             while (fgets(line, sizeof line, mf)) {
                 char fname[256];
+                char tag[8] = "";
                 uint64_t pc, sysno;
-                if (sscanf(line, "%llx %llu %255s", &pc, &sysno, fname) != 3)
+                if (sscanf(line, "%llx %llu %255s %7s", &pc, &sysno,
+                           fname, tag) < 3)
                     continue;
                 /* 只保留切片区间 [syscall_start, syscall_end) 内的记录:
                    切片从检查点 from 恢复, from 之前的 syscall 不执行 */
@@ -658,6 +638,20 @@ int build_main(int argc, char **argv)
                     continue;
                 }
                 map_idx++;
+                /* 悬空的被打断 syscall 记录 (map 第 4 字段 "I"):
+                   检查点 INTERRUPT 打断的在途 syscall, 记录在检查点之后
+                   补记; 切片从该检查点恢复时 pc 在 syscall 指令之后
+                   (resume_pc == rec.pc+2), 不会重执行它。若保留, 记录
+                   会错误消费下一条同 pc 的 syscall (libc 共享
+                   trampoline 场景, 曾致 read 被回放成已完成的
+                   nanosleep 而返回 EOF)。 */
+                if (tag[0] == 'I' && pc + 2 == resume_pc) {
+                    fprintf(stderr, "build: drop dangling interrupted "
+                            "syscall rec (pc %#llx, resume pc %#llx)\n",
+                            (unsigned long long)pc,
+                            (unsigned long long)resume_pc);
+                    continue;
+                }
                 char path[PATH_MAX];
                 snprintf(path, sizeof(path), "%s/syscalls/%s", ckpts, fname);
                 int dfd = open(path, O_RDONLY);
@@ -681,10 +675,11 @@ int build_main(int argc, char **argv)
                     continue;
                 }
                 size_t off = sizeof(h) + h.state_size;
-                if (nrecs == cap) {
-                    cap = cap ? cap * 2 : 8;
-                    recs = xrealloc(recs, cap * sizeof(*recs));
-                    memset(recs + nrecs, 0, (cap - nrecs) * sizeof(*recs));
+                if (nrecs == rec_cap) {
+                    rec_cap = rec_cap ? rec_cap * 2 : 8;
+                    recs = xrealloc(recs, rec_cap * sizeof(*recs));
+                    memset(recs + nrecs, 0, (rec_cap - nrecs) *
+                           sizeof(*recs));
                 }
                 struct rec_tmp *r = &recs[nrecs];
                 buf_init(&r->unmap);
@@ -716,90 +711,204 @@ int build_main(int argc, char **argv)
                     off += 4096;
                 }
                 free(f);
-                /* 修正 pc: 内核 entry-stop 的 instruction_pointer 是
-                   syscall 指令的下一条 (x86_64 0f05 长 2); int3 在
-                   pc-2。若 pc-2 处已被替换为 0xcc, 统一到替换地址 */
-                if (pc >= 2) {
-                    for (size_t i = 0; i < s.h.nsegs; i++) {
-                        if (pc - 2 >= segs[i].vaddr &&
-                            pc - 2 < segs[i].vaddr + segs[i].filesz) {
-                            size_t b = payload_off + segs[i].payload_off +
-                                       (pc - 2 - segs[i].vaddr);
-                            if (blob.data[b] == 0xcc)
-                                r->pc = pc - 2;
-                            break;
-                        }
-                    }
-                }
                 nrecs++;
             }
             fclose(mf);
-
-                /* pass 2: 布局 — rec 表连续 (80B/条), 数据区统一在后 */
-                if (nrecs) {
-                    struct buf replay;
-                    buf_init(&replay);
-                    if (blob.size & 7)
-                        buf_zero(&blob, 8 - (blob.size & 7)); /* 8B 对齐 */
-                    buf_zero(&replay, 8);                    /* n_recs */
-                uint64_t *rec_off = xmalloc(nrecs * 8);
-                for (size_t i = 0; i < nrecs; i++) {
-                    rec_off[i] = replay.size;
-                    buf_zero(&replay, 80);
-                }
-                uint64_t *unmap_off = xmalloc(nrecs * 8);
-                uint64_t *newseg_off = xmalloc(nrecs * 8);
-                uint64_t *dirty_off = xmalloc(nrecs * 8);
-                for (size_t i = 0; i < nrecs; i++) {
-                    unmap_off[i] = replay.size;
-                    buf_append(&replay, recs[i].unmap.data,
-                               recs[i].unmap.size);
-                }
-                for (size_t i = 0; i < nrecs; i++) {
-                    newseg_off[i] = replay.size;
-                    buf_append(&replay, recs[i].newseg.data,
-                               recs[i].newseg.size);
-                }
-                for (size_t i = 0; i < nrecs; i++) {
-                    dirty_off[i] = replay.size;
-                    buf_append(&replay, recs[i].dirty.data,
-                               recs[i].dirty.size);
-                }
-                memcpy(replay.data, &nrecs, 8);
-                for (size_t i = 0; i < nrecs; i++) {
-                    uint8_t *rc = replay.data + rec_off[i];
-                    uint64_t v;
-                    v = recs[i].pc;      memcpy(rc + 0, &v, 8);
-                    v = recs[i].sysno;   memcpy(rc + 8, &v, 8);
-                    v = recs[i].rax;     memcpy(rc + 16, &v, 8);
-                    v = recs[i].n_unmap; memcpy(rc + 24, &v, 8);
-                    v = unmap_off[i];    memcpy(rc + 32, &v, 8);
-                    v = recs[i].n_newseg; memcpy(rc + 40, &v, 8);
-                    v = newseg_off[i];   memcpy(rc + 48, &v, 8);
-                    v = recs[i].n_dirty; memcpy(rc + 56, &v, 8);
-                    v = dirty_off[i];    memcpy(rc + 64, &v, 8);
-                }
-                replay_off = blob.size;
-                buf_append(&blob, replay.data, replay.size);
-                replay_size = replay.size;
-                blob_total = blob.size;
-                fprintf(stderr, "build: %llu syscall replay records "
-                        "(%llu bytes)\n",
-                        (unsigned long long)nrecs,
-                        (unsigned long long)replay_size);
-                free(rec_off);
-                free(unmap_off);
-                free(newseg_off);
-                free(dirty_off);
-            }
-            for (size_t i = 0; i < nrecs; i++) {
-                free(recs[i].unmap.data);
-                free(recs[i].newseg.data);
-                free(recs[i].dirty.data);
-            }
-            free(recs);
+            if (nrecs)
+                fprintf(stderr, "build: %zu syscall records in window "
+                        "[%llu,%llu)\n",
+                        nrecs, (unsigned long long)syscall_start,
+                        (unsigned long long)syscall_end);
         }
     }
+
+    /* 3.5b baremetal: syscall 指令 → int3 替换
+       (kernel entry-stop 的 ip 是 syscall 指令的下一条; x86_64 0f05
+       长 2, int3 打在 pc-2。trace 被打断的 syscall 记录 pc 已修正为
+       syscall 地址本身, 检查 blob[pc] 即可)。 */
+    if (mode_baremetal) {
+        if (nrecs) {
+            /* 回放路径: 只替换 trace 记录过的 syscall 指令。
+               这是权威的 syscall 地址表, 不做全段字节扫描 —
+               直接扫描 0f 05 会误伤指令立即数/操作数中的同字节序列
+               (例如 movabs $0x50f → 48 b8 0f 05 ...), 静默改变切片
+               行为 (曾致 embed 值从 0x50f 变 0x90cc)。 */
+            size_t replaced = 0, dropped = 0;
+            for (size_t k = 0; k < nrecs; k++) {
+                uint64_t pc = recs[k].pc;
+                /* 常规记录: pc = entry-stop ip = syscall+2 */
+                if (pc >= 2) {
+                    uint8_t *s2 = NULL;
+                    for (size_t i = 0; i < s.h.nsegs; i++) {
+                        if (pc - 2 >= segs[i].vaddr &&
+                            pc - 2 < segs[i].vaddr + segs[i].filesz) {
+                            s2 = blob.data + payload_off +
+                                 segs[i].payload_off + (pc - 2 -
+                                                        segs[i].vaddr);
+                            break;
+                        }
+                    }
+                    if (s2 && s2[0] == 0x0f && s2[1] == 0x05) {
+                        s2[0] = 0xcc;
+                        s2[1] = 0x90;
+                        recs[k].pc = pc - 2;
+                        replaced++;
+                        continue;
+                    }
+                    if (s2 && s2[0] == 0xcc) {
+                        /* 已被替换 (退出点 int3 重叠/重复记录) */
+                        recs[k].pc = pc - 2;
+                        continue;
+                    }
+                }
+                /* 已修正记录 (trace 被打断的 syscall): pc 即 syscall */
+                {
+                    uint8_t *q = NULL;
+                    for (size_t i = 0; i < s.h.nsegs; i++) {
+                        if (pc >= segs[i].vaddr &&
+                            pc < segs[i].vaddr + segs[i].filesz) {
+                            q = blob.data + payload_off +
+                                segs[i].payload_off + (pc - segs[i].vaddr);
+                            break;
+                        }
+                    }
+                    if (q && q[0] == 0x0f && q[1] == 0x05) {
+                        q[0] = 0xcc;
+                        q[1] = 0x90;
+                        replaced++;
+                        continue;
+                    }
+                    if (q && q[0] == 0xcc)
+                        continue;   /* 已替换 */
+                }
+                warn("baremetal: syscall rec @ %#llx has no int3 site, "
+                     "record unused", (unsigned long long)pc);
+                dropped++;
+            }
+            fprintf(stderr, "        %zu syscall instructions replaced by "
+                    "int3 (replay), %zu dropped\n", replaced, dropped);
+        } else if (!have_map) {
+            /* 旧 mock 路径 (freeze 快照, 无 trace 回放表):
+               先用 x86-64 长度解码器从段起点顺序扫描 — 只把"完整解码
+               为 2 字节 0F 05 指令"的地址替换 (指令边界, 不误伤立即数);
+               遇到无法解码的位置 (段内嵌数据表等) 后, 剩余部分退回
+               模式扫描 (0f 05 → cc 90, 已知局限: 可能破坏该区域内指令
+               立即数, 仅作为无 trace 数据时的兜底)。 */
+            size_t replaced = 0;
+            for (size_t i = 0; i < s.h.nsegs; i++) {
+                if (!(segs[i].flags & ET_SEG_X))
+                    continue;
+                size_t base = payload_off + segs[i].payload_off;
+                size_t off = 0;
+                while (off + 1 < segs[i].filesz) {
+                    if (blob.data[base + off] == 0x0f &&
+                        blob.data[base + off + 1] == 0x05 &&
+                        x86_is_syscall(blob.data + base + off,
+                                       segs[i].filesz - off)) {
+                        blob.data[base + off] = 0xcc;
+                        blob.data[base + off + 1] = 0x90;
+                        replaced++;
+                        off += 2;
+                        continue;
+                    }
+                    int l = x86_len(blob.data + base + off,
+                                    segs[i].filesz - off);
+                    if (l <= 0)
+                        break;  /* 数据区: 退回模式扫描 */
+                    off += (size_t)l;
+                }
+                for (uint64_t j = 0; j + 1 < segs[i].filesz; j++) {
+                    if (j >= off &&
+                        blob.data[base + j] == 0x0f &&
+                        blob.data[base + j + 1] == 0x05) {
+                        blob.data[base + j] = 0xcc;
+                        blob.data[base + j + 1] = 0x90;
+                        replaced++;
+                    }
+                }
+            }
+            warn("baremetal without syscall replay data (freeze snapshot "
+                 "or bundle without syscalls/): pattern-based replacement "
+                 "may corrupt immediates containing 0f 05; prefer "
+                 "--checkpoints for authoritative replacement");
+            fprintf(stderr, "        %zu syscall instructions replaced by "
+                    "int3 (mock scan)\n", replaced);
+        }
+        /* 有回放 map 但窗口内无记录: 切片区间内没有 syscall, 无需替换 */
+    }
+
+    /* 3.6 baremetal: syscall 回放表 → 嵌入 blob 追加区。
+       回放表布局 (偏移相对 replay 区起点):
+         +0   n_recs (u64)
+         rec × n (80B): {pc, sysno, rax, n_unmap, unmap_off,
+                         n_newseg, newseg_off, n_dirty, dirty_off, pad}
+         数据区:
+           unmap:  {vaddr} × n_unmap
+           newseg: {vaddr,filesz,memsz,flags}(32B) + data(filesz) × n_newseg
+           dirty:  {vaddr} + data(4096) × n_dirty
+       stub 处理器: 触发 int3 的 pc 匹配记录 → 应用差异 (unmap/mmap+
+       拷贝/mprotect + dirty 页覆盖) + 恢复 rax (B 的 syscall 返回值);
+       游标顺序消费 (单线程执行顺序 == 记录顺序)。 */
+    if (nrecs) {
+        /* pass 2: 布局 — rec 表连续 (80B/条), 数据区统一在后 */
+        struct buf replay;
+        buf_init(&replay);
+        if (blob.size & 7)
+            buf_zero(&blob, 8 - (blob.size & 7)); /* 8B 对齐 */
+        buf_zero(&replay, 8);                    /* n_recs */
+        uint64_t *rec_off = xmalloc(nrecs * 8);
+        for (size_t i = 0; i < nrecs; i++) {
+            rec_off[i] = replay.size;
+            buf_zero(&replay, 80);
+        }
+        uint64_t *unmap_off = xmalloc(nrecs * 8);
+        uint64_t *newseg_off = xmalloc(nrecs * 8);
+        uint64_t *dirty_off = xmalloc(nrecs * 8);
+        for (size_t i = 0; i < nrecs; i++) {
+            unmap_off[i] = replay.size;
+            buf_append(&replay, recs[i].unmap.data, recs[i].unmap.size);
+        }
+        for (size_t i = 0; i < nrecs; i++) {
+            newseg_off[i] = replay.size;
+            buf_append(&replay, recs[i].newseg.data, recs[i].newseg.size);
+        }
+        for (size_t i = 0; i < nrecs; i++) {
+            dirty_off[i] = replay.size;
+            buf_append(&replay, recs[i].dirty.data, recs[i].dirty.size);
+        }
+        memcpy(replay.data, &nrecs, 8);
+        for (size_t i = 0; i < nrecs; i++) {
+            uint8_t *rc = replay.data + rec_off[i];
+            uint64_t v;
+            v = recs[i].pc;      memcpy(rc + 0, &v, 8);
+            v = recs[i].sysno;   memcpy(rc + 8, &v, 8);
+            v = recs[i].rax;     memcpy(rc + 16, &v, 8);
+            v = recs[i].n_unmap; memcpy(rc + 24, &v, 8);
+            v = unmap_off[i];    memcpy(rc + 32, &v, 8);
+            v = recs[i].n_newseg; memcpy(rc + 40, &v, 8);
+            v = newseg_off[i];   memcpy(rc + 48, &v, 8);
+            v = recs[i].n_dirty; memcpy(rc + 56, &v, 8);
+            v = dirty_off[i];    memcpy(rc + 64, &v, 8);
+        }
+        replay_off = blob.size;
+        buf_append(&blob, replay.data, replay.size);
+        replay_size = replay.size;
+        blob_total = blob.size;
+        fprintf(stderr, "build: %llu syscall replay records "
+                "(%llu bytes)\n",
+                (unsigned long long)nrecs,
+                (unsigned long long)replay_size);
+        free(rec_off);
+        free(unmap_off);
+        free(newseg_off);
+        free(dirty_off);
+    }
+    for (size_t i = 0; i < nrecs; i++) {
+        free(recs[i].unmap.data);
+        free(recs[i].newseg.data);
+        free(recs[i].dirty.data);
+    }
+    free(recs);
 
     /* 3.6 堆尾/栈段定位 (real 与 baremetal 共用)
        取第一个 [heap] 段: 真实 brk 区域 (mmap 的大块匿名段也可能被

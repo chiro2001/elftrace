@@ -44,10 +44,21 @@ tests/run_tests.sh   # 一键运行全部 17 项测试（basic/dbg/fd/ipc/cpp/fd
 
 - **采集**（trace.c）：PTRACE_SYSCALL 捕获每个 syscall 的 ENTRY（A）/EXIT
   （B）状态 → 离线 `collect_write_diff(A,B)` 写 `syscalls/sys_%06zu.elftrace`
-  + `syscall.map`（行号=索引）；被打断的 syscall 补记 A=上一检查点。
-- **构建**（build.c 3.6）：解析 map，只保留切片区间 `[syscall_start,
-  syscall_end)` 记录；pc 修正：entry-stop ip 是 syscall 下一条，blob 中
-  pc-2 处是 0xcc 则取 pc-2。布局 `n_recs + rec×80B + 数据区`。
+  + `syscall.map`（行号=索引）；被打断的 syscall 补记 A=上一检查点，map
+  行追加第 4 字段 `I`（build 据此丢弃悬空记录，见下）。
+- **构建**（build.c 3.5a/3.5b/3.6）：
+  - 3.5a 解析 map，只保留切片区间 `[syscall_start, syscall_end)` 记录；
+    **丢弃悬空的被打断记录**：`I` 标记且 `rec.pc+2 == resume_pc`（该
+    syscall 在恢复检查点时刻在途，恢复 pc 在其指令之后，切片不会重执行
+    它；保留会被下一条同 pc 的 syscall 误消费——libc 共享 trampoline
+    场景曾致 read 被回放成已完成的 nanosleep 而返回 EOF）。
+  - 3.5b **syscall→int3 定点替换**：只把回放记录对应的 syscall 指令
+    （entry-stop ip = syscall+2，指令在 pc-2；被打断记录 pc 已是指令
+    本身）替换为 int3。**禁止改回全段 `0f 05` 模式扫描**——会误伤指令
+    立即数中的同字节序列（如 `movabs $0x50f` → `48 b8 0f 05 ...` 被改
+    成 `cc 90`，静默改变切片行为；回归测试 tests/test_bm_edge.sh imm）。
+    无 trace 数据的旧 mock 路径（freeze 快照）保留模式扫描 + 警告。
+  - 3.6 布局回放表：`n_recs + rec×80B + 数据区`。
 - **stub 处理器**（stub_x86_64.S bm_handler~bm_done）：
   - 有回放表时把内核 sigframe 迁移到 `bm_safe_area`（blob+0x4CA0，
     容量上限 0x62C0-0x4CA0=0x1620）；**fpstate 统一拷贝到 SAFE+0xB50 并

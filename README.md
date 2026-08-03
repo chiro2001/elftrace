@@ -43,7 +43,9 @@ make                          # 需要 gcc/as/ld/objcopy
 ```
 
 - `--mode baremetal`：生成裸机切片——目标代码中的 syscall 指令被替换为
-  int3，运行时由 stub 的 SIGTRAP 处理器接管：
+  int3，运行时由 stub 的 SIGTRAP 处理器接管（trace 回放路径按
+  `syscalls/syscall.map` 记录地址**定点替换**，避免误伤指令立即数中的
+  `0f 05` 字节序列；无 trace 数据的旧 mock 路径仍为全段模式扫描）：
   - **syscall 回放表（trace 场景，优先）**：`trace` 用 PTRACE_SYSCALL 采集
     每个 syscall 入口/返回状态差异（`ckpts/syscalls/` 子目录），build 嵌入
     回放表（pc/syscall 号/返回值/unmap 段/newseg 段/dirty 页数据）；处理器

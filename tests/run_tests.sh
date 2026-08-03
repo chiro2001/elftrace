@@ -15,6 +15,8 @@
 #   thread   角落5: 多线程进程 (语义未定义, 验证不崩溃/主线程一致)
 #   append   角落6: O_APPEND 追加 fd 偏移语义
 #   bareheap 角落9: baremetal brk 边界 (mock 拒绝) + real 模式 brk 恢复
+#   bm_edge  baremetal 边界: 0f 05 立即数误替换回归 + 同 pc 循环 read
+#            dirty 回放 (游标顺序消费/悬空记录丢弃)
 #
 # 需要 kernel.yama.ptrace_scope=0 (或目标允许被跟踪)。
 set -u
@@ -23,12 +25,12 @@ ROOT=$(pwd)
 LOG="$ROOT/tmp/test_run.log"
 mkdir -p "$ROOT/tmp"
 
-TESTS="basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle baremetal imix"
+TESTS="basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle baremetal imix bm_edge"
 PASS=0
 FAIL=0
 
 # 清理残留测试进程 (避免干扰)
-for p in prog_simple prog_fd prog_fd_rw prog_cpp python3 prog_syscall prog_stack prog_bigmem prog_thread prog_append prog_bareheap; do
+for p in prog_simple prog_fd prog_fd_rw prog_cpp python3 prog_syscall prog_stack prog_bigmem prog_thread prog_append prog_bareheap prog_bm_imm prog_bm_loopread; do
     pgrep -x "$p" | xargs -r kill -9 2>/dev/null
 done
 sleep 0.3

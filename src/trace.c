@@ -67,6 +67,7 @@ struct trace_ctx {
     struct syscall_rec {
         uint64_t pc;                /* syscall 指令地址 */
         uint64_t sysno;
+        int interrupted;            /* INTERRUPT 打断的在途 syscall (A=近似) */
         struct collect_snapshot light_a;  /* 入口状态 + 内存基线 */
         struct collect_snapshot light_b;  /* 返回状态 + 内存 */
     } *syscalls;
@@ -182,6 +183,7 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
             struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
             r->pc = rip - 2;    /* syscall 指令 (x86_64 0f05 长 2) */
             r->sysno = 0;       /* EXIT-stop 无 syscall 号 */
+            r->interrupted = 1;
             if (tc->have_last) {
                 collect_snapshot_copy_light(&r->light_a, &tc->last);
                 cbuf_append(&r->light_a.payload, tc->last.payload.data,
@@ -261,6 +263,7 @@ static int collect_interrupt_sc(struct trace_ctx *tc)
                 struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
                 r->pc = psi.instruction_pointer - 2; /* syscall 指令 */
                 r->sysno = 0;   /* EXIT-stop 无 syscall 号 */
+                r->interrupted = 1;
                 if (tc->have_last) {
                     collect_snapshot_copy_light(&r->light_a, &tc->last);
                     cbuf_append(&r->light_a.payload,
@@ -535,9 +538,10 @@ main_done:
             char path[PATH_MAX];
             snprintf(path, sizeof(path), "%s/sys_%06zu.elftrace", sdir, k);
             collect_write_diff(&r->light_a, &r->light_b, path);
-            fprintf(mf, "%#llx %llu sys_%06zu.elftrace\n",
+            fprintf(mf, "%#llx %llu sys_%06zu.elftrace%s\n",
                     (unsigned long long)r->pc,
-                    (unsigned long long)r->sysno, k);
+                    (unsigned long long)r->sysno, k,
+                    r->interrupted ? " I" : "");
             collect_snapshot_free_light(&r->light_a);
             collect_snapshot_free_light(&r->light_b);
         }
