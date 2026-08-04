@@ -39,6 +39,64 @@
 /* aarch64: collect_freeze 用 jit 读到的 TPIDR_EL0 (NT_ARM_TLS 可能陈旧) */
 static unsigned long g_tls;
 
+#if defined(__aarch64__)
+/* 让目标自己执行 `mrs x0, tpidr_el0; brk #0x1234` 读 HW TPIDR_EL0
+ * (内核 NT_ARM_TLS regset 读 thread.uw.tp_value, 只在上下文切换时
+ * 同步, 从未被换出的目标读到 exec 后的陈旧 0)。目标执行后恢复
+ * 寄存器与页字节, 停在 brk 的 SIGTRAP-stop (可继续采集)。
+ * 结果存 g_tls。要求目标处于 ptrace-stop。 */
+void collect_tls_jit(pid_t pid)
+{
+    int st;
+    uint32_t snippet[2] = {0xd53bd040, 0xd420048d};
+    unsigned long scratch = 0;
+    char mp[64];
+
+    if (g_tls)
+        return;
+    snprintf(mp, sizeof(mp), "/proc/%d/maps", pid);
+    FILE *mf = fopen(mp, "r");
+    if (mf) {
+        char line[256];
+        while (fgets(line, sizeof line, mf)) {
+            unsigned long long s;
+            char perms[8];
+            if (sscanf(line, "%llx-%*llx %7s", &s, perms) == 2 &&
+                perms[0] == 'r' && perms[2] == 'x') {
+                scratch = (unsigned long)s;
+                break;
+            }
+        }
+        fclose(mf);
+    }
+    if (!scratch)
+        return;
+    unsigned long backup = ptrace(PTRACE_PEEKDATA, pid, scratch, 0);
+    ptrace(PTRACE_POKEDATA, pid, scratch,
+           (unsigned long)snippet[0] |
+               ((unsigned long)snippet[1] << 32));
+    struct user_regs_struct r, saved;
+    struct iovec io = {.iov_base = &r, .iov_len = sizeof(r)};
+    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &io) == 0) {
+        saved = r;
+        r.pc = scratch;
+        r.regs[30] = scratch;
+        ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io);
+        ptrace(PTRACE_CONT, pid, 0, 0);
+        if (waitpid(pid, &st, 0) > 0 && WIFSTOPPED(st)) {
+            struct user_regs_struct r2;
+            struct iovec io2 = {.iov_base = &r2, .iov_len = sizeof(r2)};
+            if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
+                       &io2) == 0)
+                g_tls = r2.regs[0];
+            io.iov_base = &saved;
+            ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io);
+        }
+    }
+    ptrace(PTRACE_POKEDATA, pid, scratch, backup);
+}
+#endif
+
 /* ---- 可扩展缓冲 ---- */
 void cbuf_init(struct cbuf *b)
 {
@@ -845,61 +903,7 @@ int collect_freeze(pid_t pid)
         return -1;
     }
 #if defined(__aarch64__)
-    /* 内核 NT_ARM_TLS 读 thread.uw.tp_value — 只在上下文切换时保存
-       TPIDR_EL0, 从未被换出的目标读到 exec 后的陈旧 0。对策: 在目标的
-       可执行文本页 jit `mrs x0, tpidr_el0; brk #0x1234`, 让目标自己
-       把 HW 寄存器读进 x0, 从 SIGTRAP-stop 的 regs 取 (目标随后恢复
-       原寄存器与页字节, 语义无扰动)。结果存到 collect_snapshot.tls 由
-       调用方写快照。 */
-    {
-        uint32_t snippet[2] = {0xd53bd040, 0xd420048d};
-        unsigned long scratch = 0;
-        char mp[64];
-        snprintf(mp, sizeof(mp), "/proc/%d/maps", pid);
-        FILE *mf = fopen(mp, "r");
-        if (mf) {
-            char line[256];
-            while (fgets(line, sizeof line, mf)) {
-                unsigned long long s;
-                char perms[8];
-                if (sscanf(line, "%llx-%*llx %7s", &s, perms) == 2 &&
-                    perms[0] == 'r' && perms[2] == 'x') {
-                    scratch = (unsigned long)s;
-                    break;
-                }
-            }
-            fclose(mf);
-        }
-        if (scratch) {
-            unsigned long backup =
-                ptrace(PTRACE_PEEKDATA, pid, scratch, 0);
-            ptrace(PTRACE_POKEDATA, pid, scratch,
-                   (unsigned long)snippet[0] |
-                       ((unsigned long)snippet[1] << 32));
-            struct user_regs_struct r, saved;
-            struct iovec io = {.iov_base = &r, .iov_len = sizeof(r)};
-            if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &io) == 0) {
-                saved = r;
-                r.pc = scratch;
-                r.regs[30] = scratch;
-                ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io);
-                ptrace(PTRACE_CONT, pid, 0, 0);
-                if (waitpid(pid, &st, 0) > 0 && WIFSTOPPED(st)) {
-                    struct user_regs_struct r2;
-                    struct iovec io2 = {.iov_base = &r2,
-                                        .iov_len = sizeof(r2)};
-                    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
-                               &io2) == 0)
-                        g_tls = r2.regs[0];
-                    /* 消费 brk 的 SIGTRAP: 恢复 regs 后目标继续处于
-                       ptrace-stop, 由后续采集流程处理 */
-                    io.iov_base = &saved;
-                    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io);
-                }
-            }
-            ptrace(PTRACE_POKEDATA, pid, scratch, backup);
-        }
-    }
+    collect_tls_jit(pid);
 #endif
     return 0;
 }

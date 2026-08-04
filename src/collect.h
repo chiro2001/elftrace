@@ -102,6 +102,11 @@ void collect_write(const struct collect_snapshot *sn, const char *out);
 void collect_detach_frozen(pid_t pid);
 /* 恢复运行 (PTRACE_CONT, 用于 trace) */
 void collect_resume(pid_t pid);
+#if defined(__aarch64__)
+/* 用 jit (mrs tpidr_el0; brk) 读目标 HW TPIDR_EL0 (NT_ARM_TLS 可能
+ * 陈旧); 要求目标处于 ptrace-stop。结果供后续采集使用。 */
+void collect_tls_jit(pid_t pid);
+#endif
 /* 释放 */
 void collect_free(struct collect_snapshot *sn);
 

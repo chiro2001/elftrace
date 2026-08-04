@@ -97,6 +97,19 @@ static void perf_open(struct trace_ctx *tc)
     attr.wakeup_events = 1;
 
     tc->perf_fd = syscall(__NR_perf_event_open, &attr, tc->pid, -1, -1, 0);
+    if (tc->perf_fd < 0) {
+        /* qemu TCG / 无 PMU 环境: 回退软件事件 (task-clock, 时间基
+           检查点)。指令数不再精确 (interval/IPC 断言会偏移), 但
+           PTRACE_SYSCALL 回放表照常采集。 */
+        warn("perf hardware instructions unavailable (%s), falling back "
+             "to task-clock (time-based checkpoints)", strerror(errno));
+        attr.type = PERF_TYPE_SOFTWARE;
+        attr.config = PERF_COUNT_SW_TASK_CLOCK;
+        attr.sample_period = 1000000000;   /* 1s 一个检查点 */
+        attr.sample_freq = 0;
+        tc->perf_fd = syscall(__NR_perf_event_open, &attr, tc->pid,
+                              -1, -1, 0);
+    }
     if (tc->perf_fd < 0)
         die("perf_event_open on %d (need perf_event_paranoid <= 2)", tc->pid);
 
@@ -302,6 +315,11 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
 
     if (!already_stopped && collect_interrupt_sc(tc) < 0)
         return;                 /* tracee 已退出 */
+
+#if defined(__aarch64__)
+    /* TPIDR_EL0: NT_ARM_TLS 可能陈旧, 用 jit 读 HW 值 (首次) */
+    collect_tls_jit(tc->pid);
+#endif
 
     /* 轻量采集 (冻结 ~us): 寄存器/掩码/xstate/fds/段表 */
     collect_state_light(tc->pid, &sn);
