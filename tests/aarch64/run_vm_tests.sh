@@ -112,6 +112,8 @@ run_case simple /bin/prog_simple real
 MARKER="MID|TOP" run_case stack /bin/prog_stack real
 ARGS="/fd.out" MARKER="OPENED" run_case fd /bin/prog_fd real
 MARKER="FILLED" run_case bigmem /bin/prog_bigmem real
+ARGS="/fd_rw.bin" MARKER="STAGE1" run_case fd_rw /bin/prog_fd_rw real
+ARGS="/fd_rw.bin" MARKER="STAGE1" run_case fd_rw /bin/prog_fd_rw replay
 run_case simple /bin/prog_simple baremetal
 run_case simple /bin/prog_simple replay
 
