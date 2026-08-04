@@ -33,6 +33,8 @@ gcc_a64() { ${CROSS}gcc -static -O0 -g -o "$WORK/$2" "$1"; }
 gcc_a64 tests/prog_simple.c prog_simple
 gcc_a64 tests/prog_stack.c prog_stack
 gcc_a64 tests/prog_fd_rw.c prog_fd_rw
+gcc_a64 tests/prog_fd.c prog_fd
+gcc_a64 tests/prog_bigmem.c prog_bigmem
 
 echo "== 组装 initramfs =="
 rm -rf "$WORK/initramfs"
@@ -56,15 +58,16 @@ FAILED=0
 # 通用用例: ref → (freeze|trace) → build → 切片 → rc/输出对比
 run_case() {
     local name=$1 prog=$2 mode=$3
+    local args=${ARGS:-}
     echo "=== $name ($mode) ==="
-    $prog > "/ref_$name.out" 2>&1
+    $prog $args > "/ref_$name.out" 2>&1
     local REF=$?
     if [ "$mode" = replay ]; then
         # trace 到目标退出 (软件事件回退, 时间基检查点; 回放表照常)
-        $prog > "/tr_$name.out" 2>&1 &
+        $prog $args > "/tr_$name.out" 2>&1 &
         local PID=$!
         for _ in $(seq 1 300); do
-            grep -qE "CHECKPOINT|MID|TOP" "/tr_$name.out" 2>/dev/null && break
+            grep -qE "${MARKER:-CHECKPOINT}" "/tr_$name.out" 2>/dev/null && break
             sleep 0.05
         done
         mkdir -p "/ckpts_$name"
@@ -76,10 +79,10 @@ run_case() {
             --checkpoints "/ckpts_$name" --from 0 > /dev/null 2>&1 \
             || { echo "  FAIL[$name]: build"; FAILED=1; return; }
     else
-        $prog > "/tr_$name.out" 2>&1 &
+        $prog $args > "/tr_$name.out" 2>&1 &
         local PID=$!
         for _ in $(seq 1 300); do
-            grep -qE "CHECKPOINT|MID|TOP" "/tr_$name.out" 2>/dev/null && break
+            grep -qE "${MARKER:-CHECKPOINT}" "/tr_$name.out" 2>/dev/null && break
             sleep 0.05
         done
         /bin/elftrace freeze $PID -o "/snap_$name.elftrace" > /dev/null 2>&1
@@ -106,9 +109,18 @@ run_case() {
 }
 
 run_case simple /bin/prog_simple real
-run_case stack  /bin/prog_stack  real
+MARKER="MID|TOP" run_case stack /bin/prog_stack real
+ARGS="/fd.out" MARKER="OPENED" run_case fd /bin/prog_fd real
+MARKER="FILLED" run_case bigmem /bin/prog_bigmem real
 run_case simple /bin/prog_simple baremetal
 run_case simple /bin/prog_simple replay
+
+# fd 内容断言 (AAABBB): 切片续写后文件应为完整内容
+if [ "$(cat /fd.out 2>/dev/null)" = "AAABBB" ]; then
+    echo "  [fd] content OK"
+else
+    echo "  FAIL[fd]: content [$(cat /fd.out 2>/dev/null)]"; FAILED=1
+fi
 
 echo "=== RESULT: $FAILED ==="
 poweroff -f
