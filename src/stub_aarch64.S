@@ -35,6 +35,8 @@
 #define SYS_setrlimit  164
 #define SYS_rt_sigreturn 139
 #define SYS_rt_sigaction 134
+#define SYS_brk         214
+#define SYS_getpid      172
 
 #define MAP_PRIVATE    0x02
 #define MAP_ANON       0x20
@@ -305,6 +307,25 @@ rlim_done:
     adr  x16, tls_snippet
     blr  x16                        /* msr tpidr_el0, x0; ret */
 tls_done:
+    /* 安装 SIGTRAP 处理器 (baremetal: brk #0 → bm_handler) */
+    ldr  x0, [x9, #RST_DESC_MODE]
+    cbz  x0, 5f                    /* real 模式不装 */
+    adrp x1, bm_sigact
+    add  x1, x1, :lo12:bm_sigact   /* act */
+    /* handler 需绝对地址: blob base + bm_handler 的 blob 偏移
+       (bm_handler - _start + STUB_ENTRY_OFF, 如 0x6540; 超 12 位
+       立即数, movz/movk 组合) */
+    movz x10, #((bm_handler - _start + STUB_ENTRY_OFF) & 0xffff)
+    movk x10, #((bm_handler - _start + STUB_ENTRY_OFF) >> 16), lsl #16
+    add  x10, x10, x9
+    str  x10, [x1]
+    mov  x0, #5                    /* SIGTRAP */
+    mov  x2, #0                    /* oact */
+    mov  x3, #8                    /* sigsetsize */
+    mov  x8, #SYS_rt_sigaction
+    svc  #0
+    tbnz x0, #63, bm_install_fail
+5:
     /* ======== 6. 构建 rt_sigframe ======== */
     adrp x19, stub_frame
     add  x19, x19, :lo12:stub_frame /* x19 = frame */
@@ -364,6 +385,363 @@ fpsimd_done:
     mov  x8, #94                    /* exit_group */
     svc  #0
     b    .
+
+bm_install_fail:
+    neg  x0, x0                    /* -errno → errno */
+    mov  x8, #94
+    svc  #0
+    b    .
+
+/* ===================== baremetal SIGTRAP 处理器 =====================
+ * 内核调用: x0=sig, x1=siginfo, x2=ucontext (帧在 sp, siginfo+ucontext)
+ * 流程:
+ *   1. 迁移内核信号帧 (~0x1200B) 到 STUB_FRAME_OFF 安全区
+ *      (dirty 回放覆盖目标栈页时帧不被破坏; aarch64 fpsimd 内嵌在
+ *      __reserved, 无需独立指针修正)
+ *   2. trigger = sc->pc - 4 (brk 地址)
+ *   3. 退出点 / exit_group → 真实退出
+ *   4. 回放表命中: unmap/mmap+mprotect/dirty + x0=rec.rax, pc=rec.pc+4
+ *   5. 无回放表: mock 路径按 x8 (syscall 号) 分派
+ *   6. rt_sigreturn (sp = 迁移后的帧)
+ *
+ * 帧偏移 (内核构建的 handler 帧): siginfo@+0, ucontext@+0x80,
+ * uc_mcontext@+0xB0 (实测), sc->pc@+0x108, sc->pstate@+0x110,
+ * sc->regs[i]@+0x08+i*8。
+ */
+bm_handler:
+    /* 处理器经内核信号投递进入, 目标寄存器已被恢复 — 重算 blob base */
+    adrp x9, _start
+    add  x9, x9, :lo12:_start
+    movz x10, #(STUB_ENTRY_OFF & 0xffff)
+    movk x10, #(STUB_ENTRY_OFF >> 16), lsl #16
+    sub  x9, x9, x10
+
+    mov  x19, sp                   /* 原帧 (目标栈上) */
+    adrp x20, stub_frame
+    add  x20, x20, :lo12:stub_frame  /* 迁移目标 */
+    mov  x0, x20
+    mov  x1, x19
+    mov  x2, #0x1200
+    bl   memcpy_bytes
+    mov  sp, x20
+    add  x21, x20, #0x130          /* sc = frame + 0x80 + 0xB0 */
+
+    /* trigger = sc->pc (aarch64 brk 的 sigcontext pc = brk 地址本身,
+       恢复时需 pc+4 跳过; 曾误按 -4 计算导致匹配错位/恢复回 brk 循环) */
+    ldr  x22, [x21, #0x108]
+
+    /* 退出点 (--to) */
+    ldr  x23, [x9, #RST_DESC_EXIT_ADDR]
+    cbz  x23, 1f
+    cmp  x22, x23
+    beq  bm_goto_exit
+1:
+    /* exit_group(94)/exit(93): 真实退出 */
+    ldr  x0, [x21, #0x48]          /* sc->regs[8] = syscall 号 */
+    cmp  x0, #94
+    beq  bm_real_exit
+    cmp  x0, #93
+    beq  bm_real_exit
+
+    /* 回放表 */
+    ldr  x24, [x9, #RST_DESC_REPLAY_SIZE]
+    cbz  x24, bm_mock_dispatch
+    ldr  x24, [x9, #RST_DESC_REPLAY_OFF]
+    add  x24, x24, x9              /* replay 起点 */
+    ldr  x25, [x24]                /* n_recs */
+    ldr  x26, [x9, #RST_DESC_REPLAY_CUR]
+bm_replay_scan:
+    cmp  x26, x25
+    b.hs bm_replay_miss
+    mov  x27, #80
+    mul  x27, x26, x27
+    add  x28, x24, x27
+    add  x28, x28, #8              /* rec */
+    ldr  x0, [x28]                 /* rec.pc */
+    cmp  x0, x22
+    beq  bm_replay_hit
+    add  x26, x26, #1
+    b    bm_replay_scan
+bm_replay_hit:
+    add  x26, x26, #1
+    str  x26, [x9, #RST_DESC_REPLAY_CUR]
+
+    /* unmap: munmap(vaddr, 1) */
+    ldr  x10, [x28, #24]
+    ldr  x11, [x28, #32]
+    add  x11, x11, x24
+bm_rp_unmap_loop:
+    cbz  x10, bm_rp_newseg
+    ldr  x0, [x11], #8
+    mov  x1, #1
+    mov  x8, #SYS_munmap
+    svc  #0
+    sub  x10, x10, #1
+    b    bm_rp_unmap_loop
+
+bm_rp_newseg:
+    /* newseg: mmap(vaddr,memsz,RW,FIXED|ANON) + 拷贝 + mprotect */
+    ldr  x10, [x28, #40]
+    ldr  x11, [x28, #48]
+    add  x11, x11, x24
+bm_rp_newseg_loop:
+    cbz  x10, bm_rp_dirty
+    ldr  x0, [x11]                 /* vaddr */
+    ldr  x1, [x11, #16]            /* memsz */
+    mov  x2, #3
+    mov  x3, #0x32
+    mov  x4, #-1
+    mov  x5, #0
+    mov  x8, #SYS_mmap
+    svc  #0
+    ldr  x2, [x11, #8]             /* filesz */
+    add  x1, x11, #32              /* src */
+    bl   memcpy_bytes              /* dst=x0, src=x1, len=x2 */
+    /* mprotect: ET_SEG(X=1,W=2,R=4) → PROT(R=1,W=2,X=4) */
+    ldr  x0, [x11]
+    ldr  x1, [x11, #16]
+    ldr  x2, [x11, #24]
+    mov  x3, #0
+    tbz  x2, #0, 2f
+    orr  x3, x3, #PROT_EXEC
+2:  tbz  x2, #1, 3f
+    orr  x3, x3, #PROT_WRITE
+3:  tbz  x2, #2, 4f
+    orr  x3, x3, #PROT_READ
+4:  mov  x2, x3
+    mov  x8, #SYS_mprotect
+    svc  #0
+    ldr  x2, [x11, #8]
+    add  x11, x11, #32
+    add  x11, x11, x2
+    sub  x10, x10, #1
+    b    bm_rp_newseg_loop
+
+bm_rp_dirty:
+    /* dirty: 整页覆盖 (数据内嵌 replay 区) */
+    ldr  x10, [x28, #56]
+    ldr  x11, [x28, #64]
+    add  x11, x11, x24
+bm_rp_dirty_loop:
+    cbz  x10, bm_rp_done
+    ldr  x0, [x11]                 /* dst */
+    add  x1, x11, #8               /* src */
+    mov  x2, #4096
+    bl   memcpy_bytes
+    add  x11, x11, #4096
+    add  x11, x11, #8
+    sub  x10, x10, #1
+    b    bm_rp_dirty_loop
+
+bm_rp_done:
+    /* x0 = rec.rax; pc = rec.pc + 4 */
+    ldr  x0, [x28, #16]
+    str  x0, [x21, #0x08]          /* sc->regs[0] */
+    ldr  x0, [x28]
+    add  x0, x0, #4
+    str  x0, [x21, #0x108]         /* sc->pc */
+    b    bm_clear_ss_nopc
+
+bm_replay_miss:
+    /* 无回放记录: 报错退出 (与 x86 一致) */
+    b    bm_unsupported
+
+bm_real_exit:
+    ldr  x0, [x21, #0x08]          /* sc->regs[0] = 退出码 */
+    mov  x8, #94
+    svc  #0
+    b    .
+
+bm_goto_exit:
+    /* 退出点: 打印指令数后退出 (baremetal 数量为构建期静态值) */
+    adrp x0, bm_exit_prefix
+    add  x1, x0, :lo12:bm_exit_prefix
+    mov  x0, #2
+    mov  x2, #bm_exit_prefix_len
+    mov  x8, #SYS_write
+    svc  #0
+    ldr  x0, [x9, #RST_DESC_IPC_PERIOD]
+    adrp x1, bm_out_buf
+    add  x1, x1, :lo12:bm_out_buf
+    bl   utoa
+    mov  x19, x0
+    adrp x0, bm_out_buf_end
+    add  x0, x0, :lo12:bm_out_buf_end
+    sub  x2, x0, x19
+    adrp x0, bm_out_buf
+    add  x1, x0, :lo12:bm_out_buf
+    mov  x0, #2
+    mov  x8, #SYS_write
+    svc  #0
+    adrp x0, bm_exit_suffix
+    add  x1, x0, :lo12:bm_exit_suffix
+    mov  x0, #2
+    mov  x2, #bm_exit_suffix_len
+    mov  x8, #SYS_write
+    svc  #0
+    mov  x0, #0
+    mov  x8, #94
+    svc  #0
+    b    .
+
+bm_clear_ss:
+    /* mock 路径: pc 跳过 brk (brk 的 sigcontext pc = brk 地址) */
+    ldr  x0, [x21, #0x108]
+    add  x0, x0, #4
+    str  x0, [x21, #0x108]
+bm_clear_ss_nopc:
+    /* pstate 清 SS (bit21), 防单步风暴 */
+    ldr  x0, [x21, #0x110]
+    and  x0, x0, #~(1 << 21)
+    str  x0, [x21, #0x110]
+    b    bm_rt
+
+bm_rt:
+    mov  sp, x20
+    mov  x8, #SYS_rt_sigreturn
+    svc  #0
+    b    .
+
+/* ---- mock 路径 (无回放表): 按 x8 分派 ---- */
+bm_mock_dispatch:
+    ldr  x0, [x21, #0x48]          /* x8 = syscall 号 */
+    cmp  x0, #94
+    beq  bm_mock_exit
+    cmp  x0, #93
+    beq  bm_mock_exit
+    cmp  x0, #63                   /* read → EOF */
+    beq  bm_mock_zero
+    cmp  x0, #64                   /* write → 假写全部 */
+    beq  bm_mock_write
+    cmp  x0, #56                   /* openat → -ENOENT */
+    beq  bm_mock_enoent
+    cmp  x0, #57                   /* close → 0 */
+    beq  bm_mock_zero
+    cmp  x0, #222                  /* mmap → -ENOMEM */
+    beq  bm_mock_enomem
+    cmp  x0, #226                  /* mprotect → 0 */
+    beq  bm_mock_zero
+    cmp  x0, #215                  /* munmap → 0 */
+    beq  bm_mock_zero
+    cmp  x0, #214                  /* brk */
+    beq  bm_mock_brk
+    cmp  x0, #172                  /* getpid → target_tid */
+    beq  bm_mock_getpid
+    cmp  x0, #129                  /* kill → 0 */
+    beq  bm_mock_zero
+    cmp  x0, #134                  /* rt_sigaction → 0 */
+    beq  bm_mock_zero
+    cmp  x0, #135                  /* rt_sigprocmask → 0 */
+    beq  bm_mock_zero
+    b    bm_unsupported
+
+bm_mock_exit:
+    ldr  x0, [x21, #0x08]          /* 退出码 */
+    mov  x8, #94
+    svc  #0
+    b    .
+
+bm_mock_write:
+    ldr  x0, [x21, #0x18]          /* sc->regs[2] = len */
+    str  x0, [x21, #0x08]
+    b    bm_clear_ss
+bm_mock_zero:
+    mov  x0, #0
+    str  x0, [x21, #0x08]
+    b    bm_clear_ss
+bm_mock_enoent:
+    mov  x0, #-2
+    str  x0, [x21, #0x08]
+    b    bm_clear_ss
+bm_mock_enomem:
+    mov  x0, #-12
+    str  x0, [x21, #0x08]
+    b    bm_clear_ss
+bm_mock_getpid:
+    ldr  x0, [x9, #RST_DESC_TARGET_TID]
+    str  x0, [x21, #0x08]
+    b    bm_clear_ss
+bm_mock_brk:
+    ldr  x0, [x21, #0x08]          /* sc->regs[0] = addr */
+    ldr  x1, [x9, #RST_DESC_BRK_BASE]
+    cbz  x0, 6f
+    cmp  x0, x1
+    b.ls 6f
+    mov  x1, x0
+    str  x1, [x9, #RST_DESC_BRK_BASE]
+6:  str  x1, [x21, #0x08]
+    b    bm_clear_ss
+
+bm_unsupported:
+    /* write(2, "elftrace baremetal: unsupported syscall ", len) */
+    adrp x0, bm_err_prefix
+    add  x1, x0, :lo12:bm_err_prefix
+    mov  x0, #2
+    mov  x2, #bm_err_prefix_len
+    mov  x8, #SYS_write
+    svc  #0
+    ldr  x0, [x21, #0x48]          /* syscall 号 */
+    adrp x1, bm_out_buf
+    add  x1, x1, :lo12:bm_out_buf
+    bl   utoa
+    mov  x19, x0                   /* digits 起点 */
+    adrp x0, bm_out_buf_end
+    add  x0, x0, :lo12:bm_out_buf_end
+    sub  x2, x0, x19               /* 长度 */
+    adrp x0, bm_out_buf
+    add  x1, x0, :lo12:bm_out_buf
+    mov  x0, #2
+    mov  x8, #SYS_write
+    svc  #0
+    adrp x0, bm_err_newline
+    add  x1, x0, :lo12:bm_err_newline
+    mov  x0, #2
+    mov  x2, #1
+    mov  x8, #SYS_write
+    svc  #0
+    mov  x0, #0x5e
+    mov  x8, #94
+    svc  #0
+    b    .
+
+/* utoa: x0 = 值 → 数字写入 bm_out_buf, 返回 x0 = 数字起点。
+ * 破坏 x0-x5。 */
+utoa:
+    adrp x2, bm_out_buf_end
+    add  x2, x2, :lo12:bm_out_buf_end
+    strb wzr, [x2, #-1]!           /* 终止符 */
+    mov  x3, #10
+7:  udiv x4, x0, x3
+    msub x5, x4, x3, x0
+    add  w5, w5, #'0'
+    strb w5, [x2, #-1]!
+    mov  x0, x4
+    cbnz x0, 7b
+    add  x0, x2, #1
+    ret
+
+/* ===================== baremetal 数据 ===================== */
+bm_sigact:
+    .quad bm_handler
+    .quad 4                        /* SA_SIGINFO */
+    .quad 0                        /* restorer */
+    .quad 0                        /* mask */
+
+bm_err_prefix:
+    .ascii "elftrace baremetal: unsupported syscall "
+bm_err_prefix_len = . - bm_err_prefix
+bm_err_newline:
+    .byte '\n'
+bm_exit_prefix:
+    .ascii "baremetal: "
+bm_exit_prefix_len = . - bm_exit_prefix
+bm_exit_suffix:
+    .ascii " instructions\n"
+bm_exit_suffix_len = . - bm_exit_suffix
+bm_out_buf:
+    .space 24
+bm_out_buf_end:
+    .balign 4
 
 /* ===================== 子过程 ===================== */
 
