@@ -1,11 +1,22 @@
-CC      ?= gcc
-LD      ?= ld
-OBJCOPY ?= objcopy
+# 目标架构: x86_64 (本机构建) / aarch64 (交叉构建)
+#   make                 # x86_64
+#   make ARCH=aarch64    # aarch64 交叉构建 (需 aarch64-linux-gnu-* 工具链)
+ARCH    ?= $(shell uname -m)
+ifeq ($(ARCH),aarch64)
+CROSS   := aarch64-linux-gnu-
+else
+ARCH    := x86_64
+CROSS   :=
+endif
+
+CC      := $(CROSS)gcc
+LD      := $(CROSS)ld
+OBJCOPY := $(CROSS)objcopy
 CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter
 CFLAGS  += -Iinclude
 LDFLAGS ?=
 
-BUILD   := build
+BUILD   ?= build
 SRC     := src
 INC     := include
 STUB_LD := $(SRC)/stub.ld
@@ -14,28 +25,28 @@ TOOLS   := $(BUILD)/elftrace
 OBJS    := $(BUILD)/main.o $(BUILD)/util.o $(BUILD)/freeze.o $(BUILD)/collect.o \
 	$(BUILD)/build.o $(BUILD)/dump.o $(BUILD)/dwarf.o $(BUILD)/trace.o \
 	$(BUILD)/inject.o $(BUILD)/bundle.o $(BUILD)/bundle_main.o \
-	$(BUILD)/stub_blob_x86_64.o $(BUILD)/disasm.o
+	$(BUILD)/stub_blob_$(ARCH).o $(BUILD)/disasm.o
 
 all: $(TOOLS)
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(BUILD)/stub_x86_64.o: $(SRC)/stub_x86_64.S $(INC)/elftrace_stub.h | $(BUILD)
-	$(CC) -c -I$(INC) -x assembler-with-cpp $(SRC)/stub_x86_64.S -o $@
+$(BUILD)/stub_$(ARCH).o: $(SRC)/stub_$(ARCH).S $(INC)/elftrace_stub.h | $(BUILD)
+	$(CC) -c -I$(INC) -x assembler-with-cpp $(SRC)/stub_$(ARCH).S -o $@
 
-$(BUILD)/stub_x86_64.bin: $(BUILD)/stub_x86_64.o $(STUB_LD)
-	$(LD) -T $(STUB_LD) -o $(BUILD)/stub_x86_64.elf $<
-	$(OBJCOPY) -O binary $(BUILD)/stub_x86_64.elf $@
+$(BUILD)/stub_$(ARCH).bin: $(BUILD)/stub_$(ARCH).o $(STUB_LD)
+	$(LD) -T $(STUB_LD) -o $(BUILD)/stub_$(ARCH).elf $<
+	$(OBJCOPY) -O binary $(BUILD)/stub_$(ARCH).elf $@
 
-$(BUILD)/stub_blob_x86_64.c: $(BUILD)/stub_x86_64.bin
+$(BUILD)/stub_blob_$(ARCH).c: $(BUILD)/stub_$(ARCH).bin
 	@echo '/* generated: do not edit */' > $@
 	@echo '#include <stddef.h>' >> $@
-	@echo 'const unsigned char stub_blob_x86_64[] = {' >> $@
+	@echo 'const unsigned char stub_blob_$(ARCH)[] = {' >> $@
 	@xxd -i $< | sed '1d' | head -n -1 >> $@
-	@echo 'const unsigned int stub_blob_x86_64_len = sizeof(stub_blob_x86_64);' >> $@
+	@echo 'const unsigned int stub_blob_$(ARCH)_len = sizeof(stub_blob_$(ARCH));' >> $@
 
-$(BUILD)/stub_blob_x86_64.o: $(BUILD)/stub_blob_x86_64.c
+$(BUILD)/stub_blob_$(ARCH).o: $(BUILD)/stub_blob_$(ARCH).c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/%.o: $(SRC)/%.c $(wildcard $(INC)/*.h) | $(BUILD)

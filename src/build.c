@@ -24,10 +24,15 @@
 #include "bundle.h"
 #include "util.h"
 #include "disasm.h"
+#include "arch.h"
 
-/* ---- 生成的 stub blob ---- */
+/* ---- 生成的 stub blob (按目标架构选择) ---- */
 extern const unsigned char stub_blob_x86_64[];
 extern const unsigned int stub_blob_x86_64_len;
+#if defined(__aarch64__)
+extern const unsigned char stub_blob_aarch64[];
+extern const unsigned int stub_blob_aarch64_len;
+#endif
 
 /* ---- 可扩展缓冲 (同 freeze) ---- */
 struct buf {
@@ -518,20 +523,36 @@ int build_main(int argc, char **argv)
         die("%s: not an elftrace file (magic %#x)", in, s.h.magic);
     if (s.h.version != ELFTRACE_VERSION)
         die("%s: unsupported version %u", in, s.h.version);
+    if (s.h.arch != ELFTRACE_ARCH_X86_64 &&
+        s.h.arch != ELFTRACE_ARCH_AARCH64)
+        die("%s: unsupported architecture %u", in, s.h.arch);
+#if defined(__aarch64__)
+    if (s.h.arch != ELFTRACE_ARCH_AARCH64)
+        die("%s: build on aarch64 requires aarch64 snapshot (arch %u)",
+            in, s.h.arch);
+#else
     if (s.h.arch != ELFTRACE_ARCH_X86_64)
-        die("%s: architecture %u not yet supported (x86_64 only)", in,
-            s.h.arch);
+        die("%s: build on x86_64 requires x86_64 snapshot (arch %u)",
+            in, s.h.arch);
+#endif
 
     /* 2. 构造 blob: 固定区 + segs 表 + fds 表 + 字符串 + payload */
     buf_init(&blob);
-    buf_append(&blob, stub_blob_x86_64, stub_blob_x86_64_len);
+#if defined(__aarch64__)
+    const unsigned char *stub = stub_blob_aarch64;
+    const unsigned int stub_len = stub_blob_aarch64_len;
+#else
+    const unsigned char *stub = stub_blob_x86_64;
+    const unsigned int stub_len = stub_blob_x86_64_len;
+#endif
+    buf_append(&blob, stub, stub_len);
     /* 固定区不足则补齐 (stub_blob 可能略大于/略小于 STUB_FIXED_SIZE:
        .org 保证 >= STUB_FIXED_SIZE, ld 可能在尾部追加少量对齐填充) */
     if (blob.size < STUB_FIXED_SIZE)
         buf_zero(&blob, STUB_FIXED_SIZE - blob.size);
     if (blob.size > STUB_FIXED_SIZE)
         fprintf(stderr, "build: note: stub blob %u bytes exceeds fixed area "
-                "%#x by %u (padding)\n", stub_blob_x86_64_len, STUB_FIXED_SIZE,
+                "%#x by %u (padding)\n", stub_len, STUB_FIXED_SIZE,
                 (unsigned)(blob.size - STUB_FIXED_SIZE));
 
     segs_off = blob.size;
@@ -585,7 +606,7 @@ int build_main(int argc, char **argv)
                     exit_override < segs[i].vaddr + segs[i].filesz) {
                     size_t off = payload_off + segs[i].payload_off +
                                  (exit_override - segs[i].vaddr);
-                    blob.data[off] = 0xcc;      /* int3 */
+                    arch_patch_syscall(blob.data + off); /* int3/brk */
                     hit = 1;
                     break;
                 }
@@ -688,7 +709,7 @@ int build_main(int argc, char **argv)
                 r->pc = pc;
                 r->sysno = sysno;
                 if (h.state_size >= 0x60)
-                    memcpy(&r->rax, f + sizeof(h) + 0x50, 8); /* regs.rax */
+                    memcpy(&r->rax, f + sizeof(h) + ARCH_REGS_RET_OFF, 8);
                 r->n_unmap = h.n_unmap;
                 r->n_newseg = h.n_newseg;
                 r->n_dirty = h.n_dirty;
@@ -722,10 +743,11 @@ int build_main(int argc, char **argv)
         }
     }
 
-    /* 3.5b baremetal: syscall 指令 → int3 替换
+    /* 3.5b baremetal: syscall 指令 → 断点替换
        (kernel entry-stop 的 ip 是 syscall 指令的下一条; x86_64 0f05
-       长 2, int3 打在 pc-2。trace 被打断的 syscall 记录 pc 已修正为
-       syscall 地址本身, 检查 blob[pc] 即可)。 */
+       长 2 → int3; aarch64 svc #0 (d4000001) 长 4 → brk #0 (d4200000),
+       断点打在 pc-ARCH_SYSCALL_LEN。trace 被打断的 syscall 记录 pc
+       已修正为 syscall 地址本身, 检查 blob[pc] 即可)。 */
     if (mode_baremetal) {
         if (nrecs) {
             /* 回放路径: 只替换 trace 记录过的 syscall 指令。
@@ -736,28 +758,28 @@ int build_main(int argc, char **argv)
             size_t replaced = 0, dropped = 0;
             for (size_t k = 0; k < nrecs; k++) {
                 uint64_t pc = recs[k].pc;
-                /* 常规记录: pc = entry-stop ip = syscall+2 */
-                if (pc >= 2) {
+                /* 常规记录: pc = entry-stop ip = syscall+len */
+                if (pc >= ARCH_SYSCALL_LEN) {
                     uint8_t *s2 = NULL;
                     for (size_t i = 0; i < s.h.nsegs; i++) {
-                        if (pc - 2 >= segs[i].vaddr &&
-                            pc - 2 < segs[i].vaddr + segs[i].filesz) {
+                        if (pc - ARCH_SYSCALL_LEN >= segs[i].vaddr &&
+                            pc - ARCH_SYSCALL_LEN <
+                                segs[i].vaddr + segs[i].filesz) {
                             s2 = blob.data + payload_off +
-                                 segs[i].payload_off + (pc - 2 -
-                                                        segs[i].vaddr);
+                                 segs[i].payload_off +
+                                 (pc - ARCH_SYSCALL_LEN - segs[i].vaddr);
                             break;
                         }
                     }
-                    if (s2 && s2[0] == 0x0f && s2[1] == 0x05) {
-                        s2[0] = 0xcc;
-                        s2[1] = 0x90;
-                        recs[k].pc = pc - 2;
+                    if (s2 && arch_is_syscall(s2, 4)) {
+                        arch_patch_syscall(s2);
+                        recs[k].pc = pc - ARCH_SYSCALL_LEN;
                         replaced++;
                         continue;
                     }
-                    if (s2 && s2[0] == 0xcc) {
+                    if (s2 && arch_is_breakpoint(s2, 4)) {
                         /* 已被替换 (退出点 int3 重叠/重复记录) */
-                        recs[k].pc = pc - 2;
+                        recs[k].pc = pc - ARCH_SYSCALL_LEN;
                         continue;
                     }
                 }
@@ -772,16 +794,16 @@ int build_main(int argc, char **argv)
                             break;
                         }
                     }
-                    if (q && q[0] == 0x0f && q[1] == 0x05) {
-                        q[0] = 0xcc;
-                        q[1] = 0x90;
+                    if (q && arch_is_syscall(q, 4)) {
+                        arch_patch_syscall(q);
                         replaced++;
                         continue;
                     }
-                    if (q && q[0] == 0xcc)
+                    if (q && arch_is_breakpoint(q, 4))
                         continue;   /* 已替换 */
                 }
-                warn("baremetal: syscall rec @ %#llx has no int3 site, "
+                warn("baremetal: syscall rec @ %#llx has no breakpoint "
+                     "site, "
                      "record unused", (unsigned long long)pc);
                 dropped++;
             }
@@ -789,24 +811,23 @@ int build_main(int argc, char **argv)
                     "int3 (replay), %zu dropped\n", replaced, dropped);
         } else if (!have_map) {
             /* 旧 mock 路径 (freeze 快照, 无 trace 回放表):
-               先用 x86-64 长度解码器从段起点顺序扫描 — 只把"完整解码
-               为 2 字节 0F 05 指令"的地址替换 (指令边界, 不误伤立即数);
-               遇到无法解码的位置 (段内嵌数据表等) 后, 剩余部分退回
-               模式扫描 (0f 05 → cc 90, 已知局限: 可能破坏该区域内指令
-               立即数, 仅作为无 trace 数据时的兜底)。 */
+               x86_64: 先用指令长度解码器从段起点顺序扫描, 只替换
+               "完整解码为 2 字节 0F 05 指令"的地址 (指令边界, 不误伤
+               立即数); 遇到无法解码的位置 (段内嵌数据表等) 后, 剩余
+               部分退回模式扫描。
+               aarch64: 定长 4 字节指令, 直接在 4 字节边界扫描 svc #0
+               (d4000001) → brk #0, 无解码器需求。 */
             size_t replaced = 0;
             for (size_t i = 0; i < s.h.nsegs; i++) {
                 if (!(segs[i].flags & ET_SEG_X))
                     continue;
                 size_t base = payload_off + segs[i].payload_off;
+#if defined(__x86_64__)
                 size_t off = 0;
                 while (off + 1 < segs[i].filesz) {
-                    if (blob.data[base + off] == 0x0f &&
-                        blob.data[base + off + 1] == 0x05 &&
-                        x86_is_syscall(blob.data + base + off,
+                    if (x86_is_syscall(blob.data + base + off,
                                        segs[i].filesz - off)) {
-                        blob.data[base + off] = 0xcc;
-                        blob.data[base + off + 1] = 0x90;
+                        arch_patch_syscall(blob.data + base + off);
                         replaced++;
                         off += 2;
                         continue;
@@ -821,11 +842,18 @@ int build_main(int argc, char **argv)
                     if (j >= off &&
                         blob.data[base + j] == 0x0f &&
                         blob.data[base + j + 1] == 0x05) {
-                        blob.data[base + j] = 0xcc;
-                        blob.data[base + j + 1] = 0x90;
+                        arch_patch_syscall(blob.data + base + j);
                         replaced++;
                     }
                 }
+#else
+                for (uint64_t j = 0; j + 4 <= segs[i].filesz; j += 4) {
+                    if (arch_is_syscall(blob.data + base + j, 4)) {
+                        arch_patch_syscall(blob.data + base + j);
+                        replaced++;
+                    }
+                }
+#endif
             }
             warn("baremetal without syscall replay data (freeze snapshot "
                  "or bundle without syscalls/): pattern-based replacement "
@@ -952,6 +980,7 @@ int build_main(int argc, char **argv)
     blob_patch_u64(blob.data, RST_DESC_STACK_VADDR, stack_vaddr);
     blob_patch_u64(blob.data, RST_DESC_RLIM_STACK_CUR, s.h.rlim_stack_cur);
     blob_patch_u64(blob.data, RST_DESC_RLIM_STACK_MAX, s.h.rlim_stack_max);
+    blob_patch_u64(blob.data, RST_DESC_TLS, s.h.tls);
     blob_patch_u64(blob.data, RST_DESC_REPLAY_OFF, replay_off);
     blob_patch_u64(blob.data, RST_DESC_REPLAY_SIZE, replay_size);
     blob_patch_u64(blob.data, RST_DESC_REPLAY_CUR, 0);
@@ -965,7 +994,7 @@ int build_main(int argc, char **argv)
                 breakpoint < segs[i].vaddr + segs[i].filesz) {
                 size_t off = payload_off + segs[i].payload_off +
                              (breakpoint - segs[i].vaddr);
-                blob.data[off] = 0xcc;
+                arch_patch_syscall(blob.data + off);
                 hit = 1;
                 break;
             }
@@ -1069,7 +1098,8 @@ int build_main(int argc, char **argv)
     eh.e_ident[EI_DATA] = ELFDATA2LSB;
     eh.e_ident[EI_VERSION] = EV_CURRENT;
     eh.e_type = ET_EXEC;
-    eh.e_machine = EM_X86_64;
+    eh.e_machine = s.h.arch == ELFTRACE_ARCH_AARCH64 ? EM_AARCH64
+                                                     : EM_X86_64;
     eh.e_version = EV_CURRENT;
     eh.e_entry = base + STUB_ENTRY_OFF;
     eh.e_phoff = 64;

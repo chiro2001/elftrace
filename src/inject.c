@@ -121,6 +121,7 @@ static unsigned long find_flag_page(pid_t pid)
     return 0;
 }
 
+#if defined(__x86_64__)
 static void emit_movabs(unsigned char **pp, unsigned char rex,
                         unsigned char op, uint64_t val)
 {
@@ -262,10 +263,12 @@ void build_stage1(unsigned char *buf, const unsigned char *stage2,
     /* stage2 副本紧跟其后 (由调用方拷贝) */
     memcpy(buf + STAGE1_SIZE, stage2, stage2_len);
 }
+#endif  /* __x86_64__: emit_movabs/build_stage1/build_stage2 */
 
 int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child,
                 uint64_t *inj_page)
 {
+#if defined(__x86_64__)
     unsigned long page1 = find_stage1_page(pid, regs->rip);
     unsigned long flag_page = find_flag_page(pid);
     unsigned char stage2[STAGE2_SIZE];
@@ -383,4 +386,10 @@ fail:
         ptrace(PTRACE_POKEDATA, pid, page1 + i, w);
     }
     return -1;
+#else
+    /* aarch64 stage2 注入尚未实现 (P4); trace 当前不依赖 COW 注入
+       (在线轻量采集 + 离线 dump), 返回 -1 即可 */
+    (void)pid; (void)regs; (void)child; (void)inj_page;
+    return -1;
+#endif
 }

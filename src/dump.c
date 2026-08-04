@@ -163,6 +163,37 @@ int dump_main(const char *path, int meta_only)
     }
 
     printf("== registers ==\n");
+#if defined(__aarch64__)
+    if (h.arch == ELFTRACE_ARCH_AARCH64 && h.regs_size >= 34 * 8) {
+        const uint64_t *r = (const uint64_t *)(f + h.regs_off);
+        printf("  x0 =%#llx x1 =%#llx x2 =%#llx x3 =%#llx\n"
+               "  x4 =%#llx x5 =%#llx x6 =%#llx x7 =%#llx\n"
+               "  x8 =%#llx x9 =%#llx x10=%#llx x11=%#llx\n"
+               "  x12=%#llx x13=%#llx x14=%#llx x15=%#llx\n"
+               "  x16=%#llx x17=%#llx x18=%#llx x19=%#llx\n"
+               "  x20=%#llx x21=%#llx x22=%#llx x23=%#llx\n"
+               "  x24=%#llx x25=%#llx x26=%#llx x27=%#llx\n"
+               "  x28=%#llx x29=%#llx x30=%#llx sp =%#llx\n"
+               "  pc =%#llx pstate=%#llx\n",
+               (unsigned long long)r[0], (unsigned long long)r[1],
+               (unsigned long long)r[2], (unsigned long long)r[3],
+               (unsigned long long)r[4], (unsigned long long)r[5],
+               (unsigned long long)r[6], (unsigned long long)r[7],
+               (unsigned long long)r[8], (unsigned long long)r[9],
+               (unsigned long long)r[10], (unsigned long long)r[11],
+               (unsigned long long)r[12], (unsigned long long)r[13],
+               (unsigned long long)r[14], (unsigned long long)r[15],
+               (unsigned long long)r[16], (unsigned long long)r[17],
+               (unsigned long long)r[18], (unsigned long long)r[19],
+               (unsigned long long)r[20], (unsigned long long)r[21],
+               (unsigned long long)r[22], (unsigned long long)r[23],
+               (unsigned long long)r[24], (unsigned long long)r[25],
+               (unsigned long long)r[26], (unsigned long long)r[27],
+               (unsigned long long)r[28], (unsigned long long)r[29],
+               (unsigned long long)r[30], (unsigned long long)r[31],
+               (unsigned long long)r[32], (unsigned long long)r[33]);
+    } else
+#endif
     if (h.arch == ELFTRACE_ARCH_X86_64 && h.regs_size >= 27 * 8) {
         const uint64_t *r = (const uint64_t *)(f + h.regs_off);
         printf("  rax=%#llx rbx=%#llx rcx=%#llx rdx=%#llx\n"

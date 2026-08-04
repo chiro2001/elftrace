@@ -33,6 +33,21 @@
 #define STUB_SIGMASK_OFF    0x1100
 #define STUB_SIGACTS_OFF    0x1108
 #define STUB_SIGACTS_SIZE   (64 * 40)    /* 64 x elftrace_sigact */
+#if defined(__aarch64__)
+/* aarch64: regs 272B (34x8), 后续区整体后移 */
+#define STUB_REGS_OFF       0x1B08
+#define STUB_REGS_SIZE      (34 * 8)     /* aarch64 struct pt_regs */
+#define STUB_MAPS_BUF       0x1C20
+#define STUB_MAPS_SIZE      0x1000
+#define STUB_IPC_ATTR       0x2C20
+#define STUB_IPC_SIGACT     0x2CA0
+#define STUB_STACK_OFF      0x2CD0
+#define STUB_STACK_SIZE     0x2000       /* 8KB */
+#define STUB_STACK_TOP      (STUB_STACK_OFF + STUB_STACK_SIZE)
+#define STUB_FRAME_OFF      0x4CD0       /* rt_sigreturn 信号帧 (aarch64 大) */
+#define STUB_FRAME_SIZE     0x1600       /* 5632B: siginfo+ucontext+fpsimd */
+#define STUB_ENTRY_OFF      0x62D0
+#else
 #define STUB_REGS_OFF       0x1B08
 #define STUB_REGS_SIZE      (27 * 8)     /* x86_64 struct pt_regs */
 #define STUB_MAPS_BUF       0x1BE0
@@ -45,6 +60,7 @@
 #define STUB_FRAME_OFF      0x4CC0       /* rt_sigreturn 信号帧 */
 #define STUB_FRAME_SIZE     0x1600       /* 5632B: ucontext + fpstate 区 */
 #define STUB_ENTRY_OFF      0x62C0
+#endif
 #define STUB_FIXED_SIZE     0x8000
 
 /* ---- rst_desc 字段偏移 (256B, 全 u64) ---- */
@@ -74,6 +90,7 @@
 #define RST_DESC_REPLAY_OFF  0xB8  /* baremetal syscall 回放表偏移 (blob 相对) */
 #define RST_DESC_REPLAY_SIZE 0xC0  /* 回放表大小 (0=无, 走旧 mock) */
 #define RST_DESC_REPLAY_CUR  0xC8  /* 回放表游标 (stub 运行时维护, 顺序消费) */
+#define RST_DESC_TLS         0xD0  /* aarch64 TPIDR_EL0 (x86_64 保留 0) */
 
 #define RST_DESC_MAGIC_VAL  0x5253544452455354  /* "RESTDSTR" */
 
@@ -111,6 +128,44 @@
 #define PT_REGS_SS       0xA0
 #define PT_REGS_FS_BASE  0xA8
 #define PT_REGS_GS_BASE  0xB0
+
+/* ---- aarch64 pt_regs 关键字段偏移 (user_pt_regs: regs[31]+sp+pc+pstate) ---- */
+#if defined(__aarch64__)
+#define PT_REGS_X0       0x00
+#define PT_REGS_X1       0x08
+#define PT_REGS_X2       0x10
+#define PT_REGS_X3       0x18
+#define PT_REGS_X4       0x20
+#define PT_REGS_X5       0x28
+#define PT_REGS_X6       0x30
+#define PT_REGS_X7       0x38
+#define PT_REGS_X8       0x40
+#define PT_REGS_X9       0x48
+#define PT_REGS_X10      0x50
+#define PT_REGS_X11      0x58
+#define PT_REGS_X12      0x60
+#define PT_REGS_X13      0x68
+#define PT_REGS_X14      0x70
+#define PT_REGS_X15      0x78
+#define PT_REGS_X16      0x80
+#define PT_REGS_X17      0x88
+#define PT_REGS_X18      0x90
+#define PT_REGS_X19      0x98
+#define PT_REGS_X20      0xA0
+#define PT_REGS_X21      0xA8
+#define PT_REGS_X22      0xB0
+#define PT_REGS_X23      0xB8
+#define PT_REGS_X24      0xC0
+#define PT_REGS_X25      0xC8
+#define PT_REGS_X26      0xD0
+#define PT_REGS_X27      0xD8
+#define PT_REGS_X28      0xE0
+#define PT_REGS_X29      0xE8
+#define PT_REGS_X30      0xF0
+#define PT_REGS_SP       0xF8
+#define PT_REGS_PC       0x100
+#define PT_REGS_PSTATE   0x108
+#endif
 
 /* ---- rt_sigreturn 信号帧偏移 (内核 asm/sigcontext.h + uapi) ---- */
 #define SIGFRAME_UC_FLAGS       0x00

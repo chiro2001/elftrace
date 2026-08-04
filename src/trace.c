@@ -31,6 +31,7 @@
 #include "elftrace.h"
 #include "collect.h"
 #include "util.h"
+#include "arch.h"
 
 int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child,
                 uint64_t *inj_page);
@@ -304,8 +305,8 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
 
     /* 轻量采集 (冻结 ~us): 寄存器/掩码/xstate/fds/段表 */
     collect_state_light(tc->pid, &sn);
-    if (tc->inj_page && sn.regs.rip >= tc->inj_page &&
-        sn.regs.rip < tc->inj_page + 4096) {
+    if (tc->inj_page && REG_PC(sn.regs) >= tc->inj_page &&
+        REG_PC(sn.regs) < tc->inj_page + 4096) {
         /* 冻结在注入代码中: 检查点无效, 放弃 (目标恢复运行) */
         ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);
         collect_free(&sn);
@@ -340,12 +341,12 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
            只消费 K 之后的 syscall 记录) */
         fprintf(f, "%llu 0x%llx %s %zu\n",
                 (unsigned long long)tc->count,
-                (unsigned long long)sn.regs.rip, base,
+                (unsigned long long)REG_PC(sn.regs), base,
                 tc->n_syscalls);
         fclose(f);
     }
     fprintf(stderr, "trace: ckpt %zu @ count %llu pc %#llx\n", tc->ckpt_no,
-            (unsigned long long)tc->count, (unsigned long long)sn.regs.rip);
+            (unsigned long long)tc->count, (unsigned long long)REG_PC(sn.regs));
 
     collect_free(&sn);
     if (tc->ckpt_no > 0 && tc->ckpt_no % 5 == 0)

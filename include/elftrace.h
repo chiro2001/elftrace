@@ -26,7 +26,7 @@
 #include <stdint.h>
 
 #define ELFTRACE_MAGIC          0x4554464C  /* "ELFT" (LE) */
-#define ELFTRACE_VERSION        4
+#define ELFTRACE_VERSION        5
 
 /* 架构 ID */
 #define ELFTRACE_ARCH_X86_64    1
@@ -76,6 +76,7 @@ typedef struct {
                                    用于调试节地址修正; 非 PIE 为 0 */
     uint64_t rlim_stack_cur;    /* RLIMIT_STACK 当前值 (切片进程恢复) */
     uint64_t rlim_stack_max;    /* RLIMIT_STACK 最大值 */
+    uint64_t tls;               /* aarch64 TPIDR_EL0 (x86_64 为 0) */
     uint64_t meta_off;          /* meta 区偏移 (采集环境信息, key=value 文本) */
     uint64_t meta_size;         /* meta 区大小 */
 } elftrace_hdr;

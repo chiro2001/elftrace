@@ -1,50 +1,553 @@
 /*
- * elftrace aarch64 恢复 stub (占位)
+ * elftrace aarch64 恢复 stub (real 模式最小恢复链)
  *
- * 接口与 x86_64 版一致 (见 elftrace_stub.h 的 blob 布局), 但寄存器布局与
- * 恢复机制不同。当前环境无 aarch64 机器, 此处仅保留实现框架与常量,
- * 待有硬件后按以下方案实现:
+ * 与 x86_64 版相同的 blob 布局 (见 elftrace_stub.h), 但寄存器为
+ * aarch64 user_pt_regs (34x8 = 272B), 信号帧为 aarch64 rt_sigframe。
  *
- * 1. 布局: 与 x86_64 相同的 blob 布局 (desc/fpu/sigmask/sigacts/regs/
- *    stack/sigframe), 但 STUB_REGS_SIZE = 34 x 8 = 272 字节
- *    (struct user_pt_regs: x0-x30, sp, pc, pstate)。
+ * 恢复流程 (_start → rt_sigreturn):
+ *   1. 内存段: 逐段 mmap(MAP_FIXED|ANON|RW) + 拷贝 + mprotect
+ *      ([stack] 段加 MAP_GROWSDOWN)
+ *   2. munmap loader 初始栈 (解析 /proc/self/maps 的 [stack])
+ *   3. fd: openat/dup2 重开
+ *   4. RLIMIT_STACK 恢复
+ *   5. TPIDR_EL0 (TLS): blob 是 RWX, jit `msr tpidr_el0, x0; ret`
+ *      片段让目标架构执行 (用户态唯一能写 TPIDR_EL0 的方式)
+ *   6. 构建 rt_sigframe (siginfo + ucontext + fpsimd) → sp = frame
+ *      → svc #0 (rt_sigreturn 139), 内核恢复 x0-x30/sp/pc/pstate
  *
- * 2. 恢复流程 (与 x86_64 对应):
- *    - 内存段: 逐段 mmap(MAP_FIXED|ANON) + 拷贝 + mprotect
- *    - munmap 初始栈 (解析 /proc/self/maps 的 [stack])
- *    - fd: openat/dup2 重开
- *    - 寄存器恢复: 两种方案二选一:
- *      a) 构建 ucontext 信号帧 (uc_mcontext.gp_regs 填 x0-x30 + sp + pc
- *         + pstate, uc_sigmask 填掩码, fpsimd 状态填 NT_FPREGSET 数据),
- *         然后 svc #0 (rt_sigreturn syscall 139), 由内核一次性恢复;
- *      b) 手工恢复: ldp 成对加载 x0-x30, mov sp, ldr pc (PC 由 x30 间接)。
- *      方案 a 与 x86_64 一致, 推荐。
+ * 寻址: blob 内一律 adrp+add :lo12:label (PIC); blob 可能 >1MB, 不能
+ * 只用 adr。blob base 存 x9 (入口一次性计算)。
  *
- * 3. 信号帧布局 (aarch64 rt_sigframe):
- *    struct rt_sigframe {
- *        struct siginfo info;       (128B)
- *        struct ucontext uc;
- *    };
- *    struct ucontext {
- *        unsigned long uc_flags;    (0x00)
- *        struct ucontext *uc_link;  (0x08)
- *        stack_t uc_stack;          (0x10, 24B)
- *        struct sigcontext uc_mcontext;  (0x28)
- *        sigset_t uc_sigmask;       (0x28 + sizeof(sigcontext))
- *    };
- *    struct sigcontext {
- *        __u64 fault_address;       (0x00)
- *        __u64 regs[31];            (0x08: x0-x30)
- *        __u64 sp;                  (0x100)
- *        __u64 pc;                  (0x108)
- *        __u64 pstate;              (0x110)
- *        __u8 __reserved[4096];     (0x118)
- *        struct _aarch64_ctx *reserved;  (0x1118)
- *    };
- *    (详情见内核 arch/arm64/include/asm/sigcontext.h / uapi)
- *
- * 4. IPC (perf_event_open): 与 x86_64 相同, syscall 号 241。
- *
- * 5. 汇编器: `as` + 链接脚本 src/stub.ld, objcopy 出 blob —— 构建规则
- *    参照 Makefile 中 stub_x86_64 的规则 (stub_blob_aarch64.c)。
+ * syscall 约定: x8=号, x0-x5=参数, svc #0, 返回 x0 (负值即 -errno)。
  */
+#include "elftrace_stub.h"
+
+/* ---- aarch64 syscall 号 (asm-generic/unistd.h) ---- */
+#define SYS_read       63
+#define SYS_write      64
+#define SYS_openat     56
+#define SYS_close      57
+#define SYS_lseek      62
+#define SYS_mmap       222
+#define SYS_mprotect   226
+#define SYS_munmap     215
+#define SYS_dup2       33
+#define SYS_setrlimit  164
+#define SYS_rt_sigreturn 139
+#define SYS_rt_sigaction 134
+
+#define MAP_PRIVATE    0x02
+#define MAP_ANON       0x20
+#define MAP_FIXED      0x10
+#define MAP_GROWSDOWN  0x0100
+#define PROT_READ      0x1
+#define PROT_WRITE     0x2
+#define PROT_EXEC      0x4
+
+#define AT_FDCWD       -100
+
+/* ---- 段/fd 记录字段 (与 build.c 一致) ---- */
+#define SEG_VADDR       0
+#define SEG_FILESZ      8
+#define SEG_MEMSZ       16
+#define SEG_FLAGS       24
+#define SEG_PAYLOAD_OFF 32
+
+#define FD_FD           0
+#define FD_FLAGS        8
+#define FD_MODE         16
+#define FD_POS          24
+#define FD_PATH_LEN     32
+#define FD_PATH_OFF     40
+
+/* ---- aarch64 rt_sigframe 偏移 (frame 基) ----
+ * struct rt_sigframe { siginfo(128B); ucontext; }
+ * 内核 uapi struct ucontext:
+ *   uc_flags(0x00) uc_link(0x08) uc_stack(0x10, 24B)
+ *   uc_sigmask(0x28) ... uc_mcontext(0xB0)
+ * sigcontext: fault(0) regs[31](0x08) sp(0x100) pc(0x108) pstate(0x110)
+ *             __reserved(0x118, 4096B)  → 0x1118
+ * (uapi 头显示 0xA8, 但 VM 实测内核把 mcontext 放在 0xB0 — 信号处理器
+ * 里 glibc 读 uc_mcontext.pc 正确、raw 扫描在 0xB0+0x108 找到 pc;
+ * 按 0x28 放 → pc/sp 读到零区 → badframe SIGSEGV)
+ */
+#define FRAME_UC         0x80
+#define FRAME_UC_SIGMASK (FRAME_UC + 0x28)        /* 内核 8B sigset */
+#define FRAME_SC         (FRAME_UC + 0xB0)        /* uc_mcontext (实测) */
+#define FRAME_SC_REGS    (FRAME_SC + 0x08)        /* x0-x30 */
+#define FRAME_SC_SP      (FRAME_SC + 0x100)
+#define FRAME_SC_PC      (FRAME_SC + 0x108)
+#define FRAME_SC_PSTATE  (FRAME_SC + 0x110)
+#define FRAME_FPSIMD     (FRAME_SC + 0x120)       /* __reserved 起 (16B 对齐) */
+
+#define FPSIMD_MAGIC     0x46508001
+#define FPSIMD_CTX_SIZE  528                     /* 8 + 512 + 4 + 4 */
+#define FPSIMD_DATA_SIZE 520                     /* vregs[32]+fpsr+fpcr */
+
+.section .rst, "awx"
+
+/* ===================== 恢复描述符 ===================== */
+.org STUB_DESC_OFF
+rst_desc:
+    .quad RST_DESC_MAGIC_VAL   /* magic   @0x00 */
+    .quad 1                    /* version @0x08 */
+    .quad 0                    /* flags   @0x10 (builder 填) */
+    .quad 0                    /* entry_pc @0x18 (builder 填) */
+    .quad 0                    /* n_segs  @0x20 (builder 填) */
+    .quad 0                    /* segs_off @0x28 (builder 填) */
+    .quad 0                    /* n_fds   @0x30 (builder 填) */
+    .quad 0                    /* fds_off @0x38 (builder 填) */
+    .quad STUB_FPU_OFF         /* fpu_off @0x40 */
+    .quad 0                    /* fpu_size @0x48 (builder 填) */
+    .quad STUB_SIGMASK_OFF     /* sigmask_off @0x50 */
+    .quad STUB_SIGACTS_OFF     /* sigacts_off @0x58 */
+    .quad STUB_REGS_OFF        /* regs_off @0x60 */
+    .quad 0                    /* ipc_period @0x68 (builder 填) */
+    .quad 0                    /* ipc_fd @0x70 (stub 运行时填) */
+    .quad 0                    /* ipc_buf_off @0x78 (stub 运行时填) */
+    .quad 0                    /* mode @0x80 (builder 填) */
+    .quad 0                    /* exit_addr @0x88 (builder 填) */
+    .quad 0                    /* brk_base @0x90 (builder 填) */
+    .quad 0                    /* target_tid @0x98 (builder 填) */
+    .quad 0                    /* stack_vaddr @0xA0 (builder 填) */
+    .quad 0                    /* rlim_stack_cur @0xA8 (builder 填) */
+    .quad 0                    /* rlim_stack_max @0xB0 (builder 填) */
+    .quad 0                    /* replay_off @0xB8 (builder 填) */
+    .quad 0                    /* replay_size @0xC0 (builder 填) */
+    .quad 0                    /* replay_cur @0xC8 (stub 运行时维护) */
+    .quad 0                    /* tls @0xD0 (builder 填: aarch64 TPIDR_EL0) */
+    .space 0x100 - (.-rst_desc)  /* 补足 256B */
+
+/* ===================== FPU 状态 (NT_FPREGSET 528B) ===================== */
+.org STUB_FPU_OFF
+fpu_blob:
+    .space STUB_FPU_CAP
+
+/* ===================== 信号掩码 ===================== */
+.org STUB_SIGMASK_OFF
+sigmask_blob:
+    .space 8
+
+/* ===================== sigactions ===================== */
+.org STUB_SIGACTS_OFF
+sigacts_blob:
+    .space STUB_SIGACTS_SIZE
+
+/* ===================== 寄存器快照 (272B) ===================== */
+.org STUB_REGS_OFF
+regs_blob:
+    .space STUB_REGS_SIZE
+
+/* ===================== maps 解析缓冲 ===================== */
+.org STUB_MAPS_BUF
+maps_buf:
+    .space STUB_MAPS_SIZE
+
+/* ===================== perf 属性 ===================== */
+.org STUB_IPC_ATTR
+ipc_attr:
+    .space 128
+
+/* ===================== ipc sigaction ===================== */
+.org STUB_IPC_SIGACT
+ipc_sigact:
+    .space 48
+
+/* ===================== stub 栈 ===================== */
+.org STUB_STACK_OFF
+stub_stack:
+    .space STUB_STACK_SIZE
+stub_stack_top:
+
+/* ===================== 信号帧 ===================== */
+.org STUB_FRAME_OFF
+stub_frame:
+    .space STUB_FRAME_SIZE
+
+/* ===================== 代码入口 ===================== */
+.org STUB_ENTRY_OFF
+.global _start
+_start:
+    /* 切到 blob 自带栈 */
+    adrp x0, stub_stack_top
+    add  x0, x0, :lo12:stub_stack_top
+    mov  sp, x0
+
+    /* x9 = blob base (全程保持); STUB_ENTRY_OFF 超 12 位立即数,
+       movz/movk 组合 */
+    adrp x9, _start
+    add  x9, x9, :lo12:_start
+    movz x10, #(STUB_ENTRY_OFF & 0xffff)
+    movk x10, #(STUB_ENTRY_OFF >> 16), lsl #16
+    sub  x9, x9, x10
+
+    /* ======== 1. 恢复内存段 ======== */
+    ldr  x14, [x9, #RST_DESC_N_SEGS]
+    ldr  x15, [x9, #RST_DESC_SEGS_OFF]
+    add  x15, x15, x9               /* x15 = segs 表绝对地址 */
+
+seg_loop:
+    cbz  x14, seg_done
+    mov  x16, x15                   /* x16 = seg */
+
+    /* mmap(vaddr, memsz, PROT_R|W, PRIVATE|ANON|FIXED[|GROWSDOWN], -1, 0) */
+    ldr  x0, [x16]                  /* vaddr */
+    ldr  x1, [x16, #SEG_MEMSZ]
+    mov  x2, #(PROT_READ|PROT_WRITE)
+    mov  x3, #(MAP_PRIVATE|MAP_ANON|MAP_FIXED)
+    ldr  x4, [x9, #RST_DESC_STACK_VADDR]
+    cbz  x4, 1f
+    cmp  x0, x4
+    bne  1f
+    orr  x3, x3, #MAP_GROWSDOWN
+1:
+    mov  x4, #-1
+    mov  x5, #0
+    mov  x8, #SYS_mmap
+    svc  #0
+    tbnz x0, #63, seg_next          /* 映射失败则跳过该段 */
+
+    /* memcpy(dst=mmap返回=vaddr, src=blob+payload_off, len=filesz) */
+    ldr  x2, [x16, #SEG_FILESZ]
+    ldr  x1, [x16, #SEG_PAYLOAD_OFF]
+    add  x1, x1, x9                 /* src = blob + payload_off */
+    bl   memcpy_bytes
+
+    /* mprotect(vaddr, memsz, ET_SEG_* → PROT_*) */
+    ldr  x0, [x16]
+    ldr  x1, [x16, #SEG_MEMSZ]
+    ldr  x2, [x16, #SEG_FLAGS]      /* ET: X=1 W=2 R=4 */
+    mov  x3, #0
+    tbz  x2, #0, 2f
+    orr  x3, x3, #PROT_EXEC
+2:
+    tbz  x2, #1, 3f
+    orr  x3, x3, #PROT_WRITE
+3:
+    tbz  x2, #2, 4f
+    orr  x3, x3, #PROT_READ
+4:
+    mov  x2, x3
+    mov  x8, #SYS_mprotect
+    svc  #0
+
+seg_next:
+    add  x15, x15, #48
+    sub  x14, x14, #1
+    b    seg_loop
+
+seg_done:
+    /* ======== 2. munmap loader 初始栈 (暂禁) ======== */
+
+    /* ======== 3. 恢复 fd ======== */
+    ldr  x0, [x9, #RST_DESC_FLAGS]
+    tbz  x0, #0, fd_done            /* RST_FLAG_RESTORE_FDS */
+    ldr  x14, [x9, #RST_DESC_N_FDS]
+    ldr  x15, [x9, #RST_DESC_FDS_OFF]
+    add  x15, x15, x9
+
+fd_loop:
+    cbz  x14, fd_done
+    ldr  x2, [x15, #FD_PATH_LEN]
+    cbz  x2, fd_next                /* 不支持的 fd 类型: 跳过 */
+    /* openat(AT_FDCWD, path, flags|O_LARGEFILE, mode) */
+    mov  x0, #AT_FDCWD
+    ldr  x1, [x15, #FD_PATH_OFF]
+    add  x1, x1, x9                 /* path */
+    ldr  x2, [x15, #FD_FLAGS]
+    orr  x2, x2, #0x8000            /* O_LARGEFILE */
+    ldr  x3, [x15, #FD_MODE]
+    mov  x8, #SYS_openat
+    svc  #0
+    tbnz x0, #63, fd_next
+    mov  x19, x0                    /* newfd */
+    ldr  x4, [x15, #FD_POS]
+    cbz  x4, 5f
+    mov  x0, x19
+    mov  x1, x4
+    mov  x2, #0                     /* SEEK_SET */
+    mov  x8, #SYS_lseek
+    svc  #0
+5:
+    mov  x0, x19
+    ldr  x1, [x15, #FD_FD]
+    mov  x8, #SYS_dup2
+    svc  #0
+    cmp  x19, x1
+    beq  fd_next                    /* newfd == target_fd: 不 close */
+    mov  x0, x19
+    mov  x8, #SYS_close
+    svc  #0
+fd_next:
+    add  x15, x15, #48
+    sub  x14, x14, #1
+    b    fd_loop
+fd_done:
+
+    /* ======== 4. RLIMIT_STACK ======== */
+    ldr  x0, [x9, #RST_DESC_RLIM_STACK_CUR]
+    cbz  x0, rlim_done
+    adrp x19, rlimit_stack
+    add  x19, x19, :lo12:rlimit_stack
+    ldr  x0, [x9, #RST_DESC_RLIM_STACK_CUR]
+    str  x0, [x19]
+    ldr  x0, [x9, #RST_DESC_RLIM_STACK_MAX]
+    str  x0, [x19, #8]
+    mov  x0, #3                     /* RLIMIT_STACK */
+    mov  x1, x19
+    mov  x8, #SYS_setrlimit
+    svc  #0
+rlim_done:
+
+    /* ======== 5. TPIDR_EL0 (TLS) ======== */
+    ldr  x0, [x9, #RST_DESC_TLS]
+    cbz  x0, tls_done
+    adr  x16, tls_snippet
+    blr  x16                        /* msr tpidr_el0, x0; ret */
+tls_done:
+    /* ======== 6. 构建 rt_sigframe ======== */
+    adrp x19, stub_frame
+    add  x19, x19, :lo12:stub_frame /* x19 = frame */
+
+    /* 清 frame (siginfo/ucontext/reserved 全零, 保证 terminator) */
+    mov  x0, x19
+    mov  x1, #STUB_FRAME_SIZE
+    mov  x2, #0
+    bl   memset_zero
+
+    /* regs 272B: blob+REGS_OFF → frame+FRAME_SC_REGS (含 sp/pc/pstate) */
+    add  x0, x19, #FRAME_SC_REGS   /* dst */
+    ldr  x1, [x9, #RST_DESC_REGS_OFF]
+    add  x1, x1, x9                /* src = blob + REGS_OFF */
+    mov  x2, #STUB_REGS_SIZE
+    bl   memcpy_bytes
+
+    /* pstate 清 SS (bit21) */
+    ldr  x0, [x19, #(FRAME_SC_PSTATE)]
+    and  x0, x0, #~(1 << 21)
+    str  x0, [x19, #(FRAME_SC_PSTATE)]
+
+    /* fpsimd: NT_FPREGSET (528B, 数据 520B) → FRAME_FPSIMD
+       {magic,size,vregs,fpsr,fpcr}。内核 restore_sigframe 强制要求
+       frame 的 __reserved 含 fpsimd context (缺失 → -EINVAL →
+       badframe → SIGSEGV)。 */
+    ldr  x2, [x9, #RST_DESC_FPU_SIZE]
+    cbz  x2, fpsimd_done
+    mov  x3, #FPSIMD_DATA_SIZE
+    cmp  x2, x3
+    csel x2, x3, x2, gt           /* min(fpu_size, 520) */
+    add  x0, x19, #FRAME_FPSIMD
+    movz w1, #(FPSIMD_MAGIC & 0xffff)
+    movk w1, #(FPSIMD_MAGIC >> 16), lsl #16
+    str  w1, [x0]
+    mov  w1, #FPSIMD_CTX_SIZE
+    str  w1, [x0, #4]
+    ldr  x1, [x9, #RST_DESC_FPU_OFF]
+    add  x1, x1, x9               /* src */
+    add  x0, x19, #(FRAME_FPSIMD + 8)
+    bl   memcpy_bytes
+fpsimd_done:
+
+    /* sigmask (内核 ucontext: uc_sigmask @ uc+0x28) */
+    ldr  x20, [x9, #RST_DESC_SIGMASK_OFF]
+    add  x20, x20, x9
+    ldr  x1, [x20]
+    str  x1, [x19, #FRAME_UC_SIGMASK]
+
+    /* rt_sigreturn: aarch64 内核从 sp 取 frame */
+    mov  sp, x19
+    mov  x8, #SYS_rt_sigreturn
+    svc  #0
+
+    /* 不可达 */
+    mov  x0, #0
+    mov  x8, #94                    /* exit_group */
+    svc  #0
+    b    .
+
+/* ===================== 子过程 ===================== */
+
+/* TLS jit 片段: TPIDR_EL0 用户态不能直接写, 但 blob 是 RWX,
+ * 执行这条特权指令即可 (x0 = TLS 值)。 */
+tls_snippet:
+    msr  tpidr_el0, x0
+    ret
+
+/* memset_zero(dst=x0, len=x1, byte=x2) — 破坏 x0-x3 */
+memset_zero:
+    mov  x3, x0
+    cbz  x1, 2f
+1:
+    strb w2, [x3], #1
+    subs x1, x1, #1
+    bne  1b
+2:
+    ret
+
+/* memcpy_bytes(dst=x0, src=x1, len=x2) — 破坏 x0-x4 */
+memcpy_bytes:
+    cbz  x2, 3f
+    lsr  x3, x2, #4
+    cbz  x3, 5f
+4:
+    ldp  x4, x5, [x1], #16
+    stp  x4, x5, [x0], #16
+    subs x3, x3, #1
+    bne  4b
+5:
+    and  x3, x2, #0xf
+    cbz  x3, 3f
+6:
+    ldrb w4, [x1], #1
+    strb w4, [x0], #1
+    subs x3, x3, #1
+    bne  6b
+3:
+    ret
+
+/* 解析 /proc/self/maps, 找到 [stack] 行, munmap 之。
+ * 破坏: x0-x8, x19-x20 */
+unmap_initial_stack:
+    /* openat(AT_FDCWD, "/proc/self/maps", O_RDONLY) */
+    adrp x1, str_maps
+    add  x1, x1, :lo12:str_maps
+    mov  x0, #AT_FDCWD
+    mov  x2, #0
+    mov  x8, #SYS_openat
+    svc  #0
+    tbnz x0, #63, uis_done
+    mov  x19, x0                    /* maps fd */
+    mov  x0, x19
+    adrp x1, maps_buf
+    add  x1, x1, :lo12:maps_buf
+    mov  x2, #STUB_MAPS_SIZE
+    mov  x8, #SYS_read
+    svc  #0
+    mov  x20, x0                    /* 读取字节数 */
+    mov  x0, x19
+    mov  x8, #SYS_close
+    svc  #0
+    tbnz x20, #63, uis_done
+    /* 在缓冲中查找 "[stack]" */
+    adrp x0, maps_buf
+    add  x0, x0, :lo12:maps_buf
+    mov  x1, x20
+    adrp x2, str_stack
+    add  x2, x2, :lo12:str_stack
+    mov  x3, #7
+    bl   find_substr
+    cbz  x0, uis_done
+    /* 回退到该行行首 */
+    mov  x1, x0
+uis_line:
+    cmp  x1, #0
+    beq  uis_got
+    ldrb w3, [x1, #-1]
+    cmp  w3, #'\n'
+    beq  uis_got
+    sub  x1, x1, #1
+    b    uis_line
+uis_got:
+    /* 解析行首 "start-end" (hex) */
+    mov  x3, x1
+    mov  x4, #0
+uis_num:
+    ldrb w5, [x3]
+    cmp  w5, #'0'
+    blo  uis_parse_done
+    cmp  w5, #'9'
+    bls  uis_digit
+    cmp  w5, #'a'
+    blo  uis_parse_done
+    cmp  w5, #'f'
+    bhi  uis_parse_done
+    sub  w5, w5, #('a' - 10)
+    b    uis_shift
+uis_digit:
+    sub  w5, w5, #'0'
+uis_shift:
+    lsl  x4, x4, #4
+    orr  x4, x4, x5
+    add  x3, x3, #1
+    b    uis_num
+uis_parse_done:
+    /* x4 = start; 若下一个是 '-', 解析 end */
+    ldrb w5, [x3]
+    cmp  w5, #'-'
+    bne  uis_done
+    mov  x5, x4                     /* start */
+    mov  x4, #0
+    add  x3, x3, #1
+uis_num2:
+    ldrb w6, [x3]
+    cmp  w6, #'0'
+    blo  uis_end2
+    cmp  w6, #'9'
+    bls  uis_digit2
+    cmp  w6, #'a'
+    blo  uis_end2
+    cmp  w6, #'f'
+    bhi  uis_end2
+    sub  w6, w6, #('a' - 10)
+    b    uis_shift2
+uis_digit2:
+    sub  w6, w6, #'0'
+uis_shift2:
+    lsl  x4, x4, #4
+    orr  x4, x4, x6
+    add  x3, x3, #1
+    b    uis_num2
+uis_end2:
+    sub  x6, x4, x5                 /* len */
+    mov  x0, x5
+    mov  x1, x6
+    mov  x8, #SYS_munmap
+    svc  #0
+uis_done:
+    ret
+
+/* find_substr(haystack=x0, haylen=x1, needle=x2, needlelen=x3) → x0
+ * 返回 needle 在 haystack 中的地址, 未找到返回 0。
+ * 破坏 x0-x4, x21-x27 (needle/长度先存到 x21-x27, 防内层循环覆盖)。 */
+find_substr:
+    cbz  x3, 9f
+    sub  x21, x1, x3
+    add  x21, x21, #1               /* 外层剩余尝试次数 */
+    cbz  x21, 9f
+    mov  x22, x2                    /* needle */
+    mov  x23, x3                    /* needlelen */
+    mov  x24, x0                    /* hay 游标 */
+    mov  x0, #0
+10:
+    mov  x25, x24                   /* 内层 hay 游标 */
+    mov  x26, x22                   /* 内层 needle 游标 */
+    mov  x27, x23                   /* 剩余 needle 长度 */
+    mov  x0, #0
+11:
+    ldrb w1, [x25], #1
+    ldrb w2, [x26], #1
+    cmp  w1, w2
+    bne  12f
+    subs x27, x27, #1
+    bne  11b
+    mov  x0, x24
+    ret
+12:
+    add  x24, x24, #1
+    subs x21, x21, #1
+    bne  10b
+9:
+    mov  x0, #0
+    ret
+
+/* ===================== 数据 ===================== */
+str_maps:
+    .asciz "/proc/self/maps"
+str_stack:
+    .asciz "[stack]"
+
+rlimit_stack:
+    .quad 0, 0
+
+/* 代码区末尾: 补齐到固定区大小 */
+    .org STUB_FIXED_SIZE

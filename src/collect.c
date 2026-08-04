@@ -28,11 +28,16 @@
 #include <sys/wait.h>
 #include <sys/uio.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <elf.h>
 
 #include "elftrace.h"
 #include "collect.h"
 #include "util.h"
+#include "arch.h"
+
+/* aarch64: collect_freeze 用 jit 读到的 TPIDR_EL0 (NT_ARM_TLS 可能陈旧) */
+static unsigned long g_tls;
 
 /* ---- 可扩展缓冲 ---- */
 void cbuf_init(struct cbuf *b)
@@ -628,21 +633,23 @@ const char *collect_meta(size_t *out_size)
     return meta;
 }
 
-/* ---- 判断目标是否处于系统调用中 (rip-2 为 syscall 指令) ---- */
+/* ---- 判断目标是否处于系统调用中 (pc-4/2 为 syscall 指令) ---- */
 static void detect_in_syscall(struct collect_snapshot *sn)
 {
-    uint8_t insn[2];
+    uint8_t insn[ARCH_SYSCALL_LEN];
 
-    if (sn->regs.orig_rax == (unsigned long)-1)
+    if (REG_SYSCALL_NR(sn->regs) == (unsigned long)-1)
         return;
-    if (sn->regs.rip < 2)
+    if (REG_PC(sn->regs) < ARCH_SYSCALL_LEN)
         return;
-    if (read_mem(sn->pid, sn->regs.rip - 2, 2, insn, 0) != 2)
+    if (read_mem(sn->pid, REG_PC(sn->regs) - ARCH_SYSCALL_LEN,
+                 ARCH_SYSCALL_LEN, insn, 0) != ARCH_SYSCALL_LEN)
         return;
-    if (insn[0] == 0x0f && insn[1] == 0x05) {
+    if (arch_is_syscall(insn, sizeof insn)) {
         sn->in_syscall = 1;
         warn("tracee %d frozen inside syscall %ld; in-flight syscall "
-             "will be lost in the slice", sn->pid, (long)sn->regs.orig_rax);
+             "will be lost in the slice", sn->pid,
+             (long)REG_SYSCALL_NR(sn->regs));
     }
 }
 
@@ -701,11 +708,12 @@ void collect_write(const struct collect_snapshot *sn, const char *out)
     h.version = ELFTRACE_VERSION;
     h.arch = sn->arch;
     h.flags = ELFTRACE_FLAG_NONE;
-    h.entry_pc = sn->regs.rip;
+    h.entry_pc = REG_PC(sn->regs);
     h.task_tid = sn->pid;
     h.exe_bias = sn->exe_bias;
     h.rlim_stack_cur = sn->rlim_stack_cur;
     h.rlim_stack_max = sn->rlim_stack_max;
+    h.tls = sn->tls;
 
     off = sizeof(elftrace_hdr);
     if (sn->meta && sn->meta_size) {
@@ -836,6 +844,63 @@ int collect_freeze(pid_t pid)
         ptrace(PTRACE_DETACH, pid, 0, 0);
         return -1;
     }
+#if defined(__aarch64__)
+    /* 内核 NT_ARM_TLS 读 thread.uw.tp_value — 只在上下文切换时保存
+       TPIDR_EL0, 从未被换出的目标读到 exec 后的陈旧 0。对策: 在目标的
+       可执行文本页 jit `mrs x0, tpidr_el0; brk #0x1234`, 让目标自己
+       把 HW 寄存器读进 x0, 从 SIGTRAP-stop 的 regs 取 (目标随后恢复
+       原寄存器与页字节, 语义无扰动)。结果存到 collect_snapshot.tls 由
+       调用方写快照。 */
+    {
+        uint32_t snippet[2] = {0xd53bd040, 0xd420048d};
+        unsigned long scratch = 0;
+        char mp[64];
+        snprintf(mp, sizeof(mp), "/proc/%d/maps", pid);
+        FILE *mf = fopen(mp, "r");
+        if (mf) {
+            char line[256];
+            while (fgets(line, sizeof line, mf)) {
+                unsigned long long s;
+                char perms[8];
+                if (sscanf(line, "%llx-%*llx %7s", &s, perms) == 2 &&
+                    perms[0] == 'r' && perms[2] == 'x') {
+                    scratch = (unsigned long)s;
+                    break;
+                }
+            }
+            fclose(mf);
+        }
+        if (scratch) {
+            unsigned long backup =
+                ptrace(PTRACE_PEEKDATA, pid, scratch, 0);
+            ptrace(PTRACE_POKEDATA, pid, scratch,
+                   (unsigned long)snippet[0] |
+                       ((unsigned long)snippet[1] << 32));
+            struct user_regs_struct r, saved;
+            struct iovec io = {.iov_base = &r, .iov_len = sizeof(r)};
+            if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &io) == 0) {
+                saved = r;
+                r.pc = scratch;
+                r.regs[30] = scratch;
+                ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io);
+                ptrace(PTRACE_CONT, pid, 0, 0);
+                if (waitpid(pid, &st, 0) > 0 && WIFSTOPPED(st)) {
+                    struct user_regs_struct r2;
+                    struct iovec io2 = {.iov_base = &r2,
+                                        .iov_len = sizeof(r2)};
+                    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
+                               &io2) == 0)
+                        g_tls = r2.regs[0];
+                    /* 消费 brk 的 SIGTRAP: 恢复 regs 后目标继续处于
+                       ptrace-stop, 由后续采集流程处理 */
+                    io.iov_base = &saved;
+                    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io);
+                }
+            }
+            ptrace(PTRACE_POKEDATA, pid, scratch, backup);
+        }
+    }
+#endif
     return 0;
 }
 
@@ -871,18 +936,21 @@ void collect_state_light(pid_t pid, struct collect_snapshot *sn)
     {
         struct iovec rv = {.iov_base = &sn->regs, .iov_len = sizeof(sn->regs)};
         if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &rv) < 0) {
+#if defined(__x86_64__)
+            /* aarch64 无 PTRACE_GETREGS, 只有 GETREGSET */
             if (ptrace(PTRACE_GETREGS, pid, 0, &sn->regs) < 0)
                 die("ptrace(GETREGS) on %d", pid);
+#else
+            die("ptrace(GETREGSET NT_PRSTATUS) on %d", pid);
+#endif
         }
     }
-#if defined(__x86_64__)
-    /* ptrace 停止机制 (尤其 PTRACE_SYSCALL) 可能在 eflags 残留 TF
-       (bit 8): 内核用单步在 syscall 边界停止, INTERRUPT-stop 时 TF
-       仍置位。切片恢复后目标每条指令触发单步 SIGTRAP (风暴),
-       baremetal 处理器误判为 syscall 触发。目标正常运行时的 eflags
-       不含 TF, 清除是正确语义。 */
-    sn->regs.eflags &= ~0x100UL;
-#endif
+    /* ptrace 停止机制 (尤其 PTRACE_SYSCALL) 可能残留单步/陷阱位
+       (x86: eflags TF; aarch64: pstate SS): 内核用单步在 syscall
+       边界停止, INTERRUPT-stop 时仍置位。切片恢复后目标每条指令
+       触发单步 SIGTRAP (风暴), baremetal 处理器误判为 syscall 触发。
+       目标正常运行时不含这些位, 清除是正确语义。 */
+    REG_CLEAR_TRAPS(sn->regs);
 
     /* FPU: 按架构选择 regset */
     sn->xstate = xcalloc(1, 8192);
@@ -927,6 +995,18 @@ void collect_state_light(pid_t pid, struct collect_snapshot *sn)
 
     /* 系统调用检测 */
     detect_in_syscall(sn);
+
+#if defined(__aarch64__)
+    /* TPIDR_EL0: 用户态不可读, 用 PTRACE_GETREGSET NT_ARM_TLS (0x409)
+       采集; stub 恢复时 jit msr tpidr_el0 (用户态唯一写入口) */
+    {
+        struct iovec tv = {.iov_base = &sn->tls, .iov_len = sizeof(sn->tls)};
+        if (ptrace(PTRACE_GETREGSET, pid, (void *)0x409, &tv) < 0)
+            sn->tls = 0;
+        if (sn->tls == 0)
+            sn->tls = g_tls;      /* collect_freeze 的 jit 采集值 */
+    }
+#endif
 
     /* 环境信息 (meta, static 缓存只采一次) */
     sn->meta = collect_meta(&sn->meta_size);
@@ -994,6 +1074,7 @@ void collect_snapshot_copy_light(struct collect_snapshot *dst,
     dst->exe_bias = src->exe_bias;
     dst->rlim_stack_cur = src->rlim_stack_cur;
     dst->rlim_stack_max = src->rlim_stack_max;
+    dst->tls = src->tls;
     dst->meta = src->meta;          /* static, 不拷贝 */
     dst->meta_size = src->meta_size;
     if (src->naux) {
