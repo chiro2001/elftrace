@@ -136,5 +136,21 @@ tests/run_tests.sh   # 一键运行全部 17 项测试（basic/dbg/fd/ipc/cpp/fd
 
 - 单线程（多线程切片语义未定义）；vdso/vvar/vsyscall 不恢复；
   sigactions 未采集；MAP_SHARED 按匿名副本；pipe/socket fd 跳过；
-  xstate 上限 4096；aarch64 仅接口预留。
+  xstate 上限 4096。
 - 改 `src/` 核心代码前先跑 `tests/run_tests.sh` 建立基线。
+
+## aarch64 (交叉构建 + qemu-system 验证)
+
+- 本机交叉构建: `make ARCH=aarch64 BUILD=build-aarch64 LDFLAGS=-static`
+  (需 aarch64-linux-gnu-* 工具链; 产物在 build-aarch64/, 已 gitignore)。
+- 本机验证: `tests/aarch64/run_vm_tests.sh` (qemu-system-aarch64 +
+  arm64 内核 + initramfs; 6 用例: real simple/stack/fd/bigmem +
+  baremetal mock/replay)。通过条件与 x64 对齐: rc/输出与 ref 全等。
+- qemu-user 无 ptrace、qemu TCG 无 PMU → trace 用软件事件回退。
+- **TPIDR_EL0 采集必须用 jit** (collect_tls_jit): 内核 NT_ARM_TLS 只在
+  上下文切换时同步, 从未被换出的目标读到陈旧 0。
+- **aarch64 brk 的 sigcontext pc = brk 地址本身**: baremetal 处理器
+  trigger=sc->pc, 恢复 pc=sc->pc+4。
+- 内核 ucontext: uc_mcontext 实测在 uc+0xB0, __reserved 16B 对齐
+  (sc+0x120), rt_sigreturn 强制 fpsimd context — 改 frame 布局前
+  必读 src/stub_aarch64.S 顶部的注释。

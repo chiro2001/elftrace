@@ -279,3 +279,41 @@ x86_64 stub 的结构逐段移植：
 - 交叉编译工具链：`aarch64-linux-gnu-gcc`（collect/build/trace 是
   主机侧工具，运行在 aarch64 主机上编译即可；stub 汇编用目标
   汇编器）。
+
+## 6. 迁移进展（2026-08，qemu-system 验证通过）
+
+本机 (x86_64) 已用 **qemu-system-aarch64 + Alpine arm64 内核 +
+initramfs** 打通完整工具链验证，`tests/aarch64/run_vm_tests.sh` 驱动：
+
+| 用例 | 结果 |
+|---|---|
+| simple real 切片 | rc/输出与 ref 全等 |
+| stack real 切片 (96MB 深栈) | rc/输出与 ref 全等 |
+| fd real 切片 (fd 恢复续写) | rc/输出/文件内容 (AAABBB) 全等 |
+| bigmem real 切片 (128MB) | rc/输出全等 |
+| baremetal mock (freeze) | rc 与 ref 全等 |
+| baremetal 回放表 (trace) | rc 与 ref 全等 |
+
+已实现: collect/trace/dump 架构抽象 (include/arch.h), stub_aarch64.S
+real 恢复链 + baremetal 处理器, build svc→brk 替换 + EM_AARCH64,
+Makefile ARCH=aarch64 交叉构建, TPIDR_EL0 jit 采集 (collect_tls_jit),
+trace perf 软件事件回退。
+
+关键发现 (踩坑记录):
+- **qemu-user 无 ptrace** (SEIZE/GETREGSET 返回 ENOSYS) → 必须用
+  qemu-system。
+- **qemu TCG 无 PMU** → perf 硬件指令事件不可用; trace 已加
+  PERF_TYPE_SOFTWARE task-clock 回退 (时间基检查点, 回放表照常)。
+- **内核 NT_ARM_TLS 只在上下文切换时同步** uw.tp_value, 从未被换出的
+  目标读到 exec 后的陈旧 0 → 用 jit (`mrs x0, tpidr_el0; brk`) 让目标
+  自己读 HW 寄存器。
+- **aarch64 brk 的 sigcontext pc = brk 地址本身 (非 +4)**; baremetal
+  处理器 trigger = sc->pc, 恢复 pc 需 +4 跳过 brk。
+- **内核 ucontext 布局**: uc_sigmask 在 uc+0x28, uc_mcontext 实测在
+  uc+0xB0 (uapi 头显示 0xA8 但 VM 实测为 0xB0); sigcontext.__reserved
+  16B 对齐 (sc+0x120); rt_sigreturn 强制要求 fpsimd context。
+- 处理器经内核进入后目标寄存器已恢复, 必须重算 blob base; sigaction
+  的 handler 必须是绝对地址 (blob base + blob 偏移)。
+
+未完成 (真机/继续): inject.c stage2 aarch64 (trace 当前不依赖),
+--ipc 指令数精确断言, DynamoRIO imix, SVE 状态, 完整 17 项测试矩阵。
