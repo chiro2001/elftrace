@@ -204,6 +204,22 @@ static uint64_t find_gap_near(const elftrace_seg *segs, size_t nsegs,
     return 0;
 }
 
+/* aarch64: svc 前 4 条指令内是否出现 movz x8, #imm (真 syscall 的
+ * 定式)。可执行段里的 0xd4000001 可能是数据表/跳转表内容 (libstdc++
+ * 大量出现), 只 patch 有 syscall 号装载定式的站点, 避免误伤。 */
+static int a64_mov_x8_before(const uint8_t *code, uint64_t filesz,
+                             uint64_t off)
+{
+    for (int k = 1; k <= 4; k++) {
+        if (off < (uint64_t)k * 4)
+            break;
+        uint32_t w = a64_insn(code + off - (uint64_t)k * 4);
+        if ((w & 0xFFE0001FU) == 0xD2800008U)
+            return 1;
+    }
+    return 0;
+}
+
 /* strict 模式构建: 收集站点 → 生成跳板/站点块 → patch 指令 →
  * 计算额外 PT_LOAD (跳板页/未来 newseg/栈预留)。
  * 返回 0 成功; 写 *pl_out/*npl_out。 */
@@ -309,6 +325,8 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             for (uint64_t j = 0; j + 4 <= segs[i].filesz; j += 4) {
                 if (!a64_is_svc0(a64_insn(basep + j)))
                     continue;
+                if (!a64_mov_x8_before(basep, segs[i].filesz, j))
+                    continue;   /* 数据表误报, 跳过 */
                 if (nsites == sites_cap) {
                     sites_cap = sites_cap ? sites_cap * 2 : 32;
                     sites = xrealloc(sites, sites_cap * sizeof(*sites));
@@ -449,7 +467,9 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
         }
     }
 
-    /* 4. 栈预留 (零填充, 在 [stack] 下方) */
+    /* 4. 栈预留 (零填充, 在 [stack] 下方; 只取空闲区间, 避免与
+       libc 等已有段重叠 — 预留过大时内核会先映射预留再被段覆盖,
+       find_gap_near 会把整个预留区间视为占用导致跳板无处安放) */
     if (stack_reserve) {
         uint64_t sv = 0;
         for (size_t i = 0; i < nsegs; i++) {
@@ -460,12 +480,24 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             }
         }
         if (sv && sv >= stack_reserve) {
-            if (!range_covered(segs, nsegs, pl, npl,
-                               sv - stack_reserve, stack_reserve))
-                spload_add(&pl, &npl, &pl_cap, sv - stack_reserve,
-                           stack_reserve, PF_R | PF_W);
+            /* 找栈下方最高段, 预留区从 max(sv-reserve, 该段尾) 开始 */
+            uint64_t below = 0x10000;
+            for (size_t i = 0; i < nsegs; i++) {
+                uint64_t e = segs[i].vaddr + segs[i].memsz;
+                if (e <= sv && e > below)
+                    below = e;
+            }
+            uint64_t start = sv > stack_reserve ? sv - stack_reserve : 0;
+            if (start < below)
+                start = below;
+            if (start < sv && sv - start >= (1UL << 20)) {
+                if (!range_covered(segs, nsegs, pl, npl,
+                                   start, sv - start))
+                    spload_add(&pl, &npl, &pl_cap, start, sv - start,
+                               PF_R | PF_W);
+            }
             fprintf(stderr, "strict: stack reserve %llu MB below %#llx\n",
-                    (unsigned long long)(stack_reserve >> 20),
+                    (unsigned long long)((sv - start) >> 20),
                     (unsigned long long)sv);
         }
     }
@@ -1462,6 +1494,9 @@ int build_main(int argc, char **argv)
 #else
                 for (uint64_t j = 0; j + 4 <= segs[i].filesz; j += 4) {
                     if (arch_is_syscall(blob.data + base + j, 4)) {
+                        if (!a64_mov_x8_before(blob.data + base,
+                                               segs[i].filesz, j))
+                            continue;   /* 数据表误报 */
                         arch_patch_syscall(blob.data + base + j);
                         replaced++;
                     }
