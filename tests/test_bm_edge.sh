@@ -9,6 +9,14 @@
 # baremetal 目标阶段无真实 syscall。
 set -u
 cd "$(dirname "$0")/.."
+
+# aarch64: 该测试用 x86 内联汇编构造 0f 05 立即数回归场景, 在 aarch64
+# 上无法编译 (svc 定长 4B 也不存在立即数误伤问题), 直接跳过。
+if [ "$(uname -m)" = "aarch64" ]; then
+    echo "SKIP: x86-specific baremetal edge test (aarch64)"
+    exit 0
+fi
+
 source tests/testlib.sh
 
 tf_setup

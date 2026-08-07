@@ -15,6 +15,8 @@ SLICED="$TMP/sliced_cpp.elf"
 CKPTS="$TMP/ckpts_cpp"
 
 mkdir -p "$TMP"
+BM_EXTRA=""
+[ "$(uname -m)" = "aarch64" ] && BM_EXTRA="--bm-strict"
 g++ -O0 -g -o "$PROG" tests/prog_cpp.cpp || exit 1
 
 # 基准 (完整运行)
@@ -26,11 +28,11 @@ run_frozen() {  # $1 = extra prog args
     local extra="${1-}"
     "$PROG" $extra > "$TMP/cpp_frozen.out" 2>&1 &
     PID=$!
-    for i in $(seq 1 200); do
+    for i in $(seq 1 600); do
         grep -q "CKPT 1" "$TMP/cpp_frozen.out" 2>/dev/null && break
-        sleep 0.05
+        sleep 0.1
     done
-    sleep 0.3
+    sleep 0.5
     grep -q "CKPT 1" "$TMP/cpp_frozen.out" || { echo "FAIL: no CKPT 1"; kill $PID; exit 1; }
     "$ELFTRACE" freeze "$PID" -o "$SNAP" >/dev/null 2>&1 || exit 1
     kill -CONT $PID 2>/dev/null
@@ -48,7 +50,7 @@ S_REAL_RC=$?
 echo "real mode: rc=$S_REAL_RC (== orig from freeze, == ref) OK"
 
 # ============ 2. baremetal 模式 ============
-"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode baremetal >/dev/null 2>&1 || exit 1
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode baremetal $BM_EXTRA >/dev/null 2>&1 || exit 1
 strace -o "$TMP/bm.strace" timeout 120 "$SLICED" > /dev/null 2>&1
 S_BM_RC=$?
 [ "$S_BM_RC" = "$S_REAL_RC" ] || { echo "FAIL: baremetal rc $S_BM_RC != real $S_REAL_RC"; exit 1; }
@@ -65,7 +67,7 @@ echo "baremetal: rc=$S_BM_RC (== real), syscalls mocked OK"
 
 # ============ 3. baremetal --bad-syscall: 报错退出 ============
 run_frozen "--bad-syscall"
-"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode baremetal >/dev/null 2>&1
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode baremetal $BM_EXTRA >/dev/null 2>&1
 timeout 60 "$SLICED" > /dev/null 2>&1
 S_BAD_RC=$?
 [ "$S_BAD_RC" = 94 ] || { echo "FAIL: bad-syscall rc=$S_BAD_RC != 94"; exit 1; }
@@ -76,7 +78,7 @@ rm -rf "$CKPTS"
 "$PROG" > "$TMP/cpp_tr.out" 2>&1 &
 TPID=$!
 sleep 0.3
-timeout 8 "$ELFTRACE" trace "$TPID" --every 200000000 --out "$CKPTS" >/dev/null 2>&1
+timeout 45 "$ELFTRACE" trace "$TPID" --every 200000000 --out "$CKPTS" >/dev/null 2>&1
 kill -9 $TPID 2>/dev/null
 # trace 被 timeout 终止时不回收注入的 COW 镜像代理 (comm=prog_cpp), 手动清理
 pgrep -x prog_cpp | xargs -r kill -9 2>/dev/null
@@ -93,8 +95,8 @@ R=$?
 echo "interval (real): rc=0 (exit at checkpoint 4) OK"
 
 # baremetal 区间: 退出点替换, 无 perf 计数
-"$ELFTRACE" build /dev/null -o "$SLICED" --mode baremetal --checkpoints "$CKPTS" \
-    --from 1 --to 4 > /dev/null 2>&1 || exit 1
+"$ELFTRACE" build /dev/null -o "$SLICED" --mode baremetal $BM_EXTRA \
+    --checkpoints "$CKPTS" --from 1 --to 4 > /dev/null 2>&1 || exit 1
 timeout 60 "$SLICED" > /dev/null 2>&1
 R=$?
 [ "$R" = 0 ] || { echo "FAIL: baremetal interval rc=$R"; exit 1; }

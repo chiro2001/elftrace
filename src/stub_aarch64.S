@@ -31,12 +31,19 @@
 #define SYS_mmap       222
 #define SYS_mprotect   226
 #define SYS_munmap     215
-#define SYS_dup2       33
+#define SYS_dup3       24
 #define SYS_setrlimit  164
 #define SYS_rt_sigreturn 139
 #define SYS_rt_sigaction 134
 #define SYS_brk         214
 #define SYS_getpid      172
+#define SYS_perf_event_open 241
+#define SYS_fcntl      25
+
+#define SIGIO          29
+#define F_SETOWN       8
+#define F_SETFL        4
+#define O_ASYNC        0x2000
 
 #define MAP_PRIVATE    0x02
 #define MAP_ANON       0x20
@@ -183,7 +190,14 @@ _start:
     movk x10, #(STUB_ENTRY_OFF >> 16), lsl #16
     sub  x9, x9, x10
 
-    /* ======== 1. 恢复内存段 ======== */
+    /* ======== 1. 恢复内存段 (strict baremetal: ELF loader 已建, 跳过) ======== */
+    ldr  x0, [x9, #RST_DESC_MODE]
+    ldr  x10, [x9, #RST_DESC_BM_STYLE]
+    cmp  x0, #1
+    bne  seg_restore_start
+    cbz  x10, seg_restore_start
+    b    seg_restore_skip
+seg_restore_start:
     ldr  x14, [x9, #RST_DESC_N_SEGS]
     ldr  x15, [x9, #RST_DESC_SEGS_OFF]
     add  x15, x15, x9               /* x15 = segs 表绝对地址 */
@@ -239,6 +253,7 @@ seg_next:
     b    seg_loop
 
 seg_done:
+seg_restore_skip:
     /* ======== 2. munmap loader 初始栈 (暂禁) ======== */
 
     /* ======== 3. 恢复 fd ======== */
@@ -273,10 +288,11 @@ fd_loop:
 5:
     mov  x0, x19
     ldr  x1, [x15, #FD_FD]
-    mov  x8, #SYS_dup2
-    svc  #0
     cmp  x19, x1
-    beq  fd_next                    /* newfd == target_fd: 不 close */
+    beq  fd_next                    /* oldfd == target fd: 无需 dup */
+    mov  x2, #0                     /* dup3 flags=0 (等价 dup2) */
+    mov  x8, #SYS_dup3
+    svc  #0
     mov  x0, x19
     mov  x8, #SYS_close
     svc  #0
@@ -285,6 +301,14 @@ fd_next:
     sub  x14, x14, #1
     b    fd_loop
 fd_done:
+
+    /* ======== 4.5 IPC 指令计数 (real 模式, perf) ======== */
+    ldr  x0, [x9, #RST_DESC_FLAGS]
+    tbz  x0, #2, ipc_done          /* RST_FLAG_IPC */
+    ldr  x10, [x9, #RST_DESC_BM_STYLE]
+    cbnz x10, ipc_done             /* strict: 无 perf/IPC syscall */
+    bl   setup_ipc
+ipc_done:
 
     /* ======== 4. RLIMIT_STACK ======== */
     ldr  x0, [x9, #RST_DESC_RLIM_STACK_CUR]
@@ -310,6 +334,8 @@ tls_done:
     /* 安装 SIGTRAP 处理器 (baremetal: brk #0 → bm_handler) */
     ldr  x0, [x9, #RST_DESC_MODE]
     cbz  x0, 5f                    /* real 模式不装 */
+    ldr  x10, [x9, #RST_DESC_BM_STYLE]
+    cbnz x10, 5f                   /* strict 模式不装 (分支补偿, 无信号) */
     adrp x1, bm_sigact
     add  x1, x1, :lo12:bm_sigact   /* act */
     /* handler 需绝对地址: blob base + bm_handler 的 blob 偏移
@@ -375,6 +401,16 @@ fpsimd_done:
     ldr  x1, [x20]
     str  x1, [x19, #FRAME_UC_SIGMASK]
 
+    /* 启用 perf 指令计数 (ioctl PERF_EVENT_IOC_ENABLE=0x2400) */
+    ldr  x0, [x9, #RST_DESC_IPC_FD]
+    cmn  x0, #1
+    beq  ipc_enable_skip
+    mov  x1, #PERF_EVENT_IOC_ENABLE
+    mov  x2, #0
+    mov  x8, #29                    /* SYS_ioctl */
+    svc  #0
+ipc_enable_skip:
+
     /* rt_sigreturn: aarch64 内核从 sp 取 frame */
     mov  sp, x19
     mov  x8, #SYS_rt_sigreturn
@@ -391,6 +427,137 @@ bm_install_fail:
     mov  x8, #94
     svc  #0
     b    .
+
+/* ===================== IPC (perf 指令计数) =====================
+ * real 模式: perf_event_open 硬件指令事件 + SIGIO; 溢出后处理器
+ * read(perf_fd) 取计数, 打印 "IPC: N instructions" 后 exit_group(0)。
+ * 不需要 mmap 环形缓冲 (read 直接返回计数)。
+ * 破坏 x0-x10, x19 (恢复前不被目标使用, stub 阶段无现场约束)。 */
+setup_ipc:
+    stp  x30, xzr, [sp, #-16]!      /* 保存返回地址 (内部 bl 会覆盖) */
+    /* 安装 SIGIO 处理器: ipc_sigact = {handler, SA_SIGINFO, 0, 0} */
+    adrp x10, ipc_handler
+    add  x10, x10, :lo12:ipc_handler
+    adrp x11, ipc_sigact
+    add  x11, x11, :lo12:ipc_sigact
+    str  x10, [x11]                /* sa_handler */
+    mov  x10, #4                   /* SA_SIGINFO */
+    str  x10, [x11, #8]            /* sa_flags */
+    str  xzr, [x11, #16]           /* sa_restorer */
+    str  xzr, [x11, #24]           /* sa_mask */
+    mov  x0, #SIGIO
+    mov  x1, x11
+    mov  x2, #0                    /* oact */
+    mov  x3, #8                    /* sigsetsize */
+    mov  x8, #SYS_rt_sigaction
+    svc  #0
+
+    /* perf_event_attr (128B, 清零后填充) */
+    adrp x19, ipc_attr
+    add  x19, x19, :lo12:ipc_attr
+    mov  x0, x19
+    mov  x1, #128
+    mov  x2, #0
+    bl   memset_zero
+    mov  w0, #0
+    str  w0, [x19]                 /* type = PERF_TYPE_HARDWARE */
+    mov  w0, #64
+    str  w0, [x19, #4]             /* size = 64 */
+    mov  x0, #1
+    str  x0, [x19, #8]             /* config = PERF_COUNT_HW_INSTRUCTIONS */
+    ldr  x0, [x9, #RST_DESC_IPC_PERIOD]
+    add  x0, x0, #STUB_IPC_COMPENSATION
+    str  x0, [x19, #16]            /* sample_period */
+    mov  x0, #1
+    str  x0, [x19, #24]            /* sample_type = PERF_SAMPLE_IP */
+    mov  x0, #((1 << 0) | (1 << 5) | (1 << 6))
+    str  x0, [x19, #40]            /* disabled|exclude_kernel|exclude_hv */
+    mov  w0, #1
+    str  w0, [x19, #48]            /* wakeup_events = 1 */
+
+    /* perf_event_open(&attr, pid=0, cpu=-1, group=-1, flags=0) */
+    mov  x0, x19
+    mov  x1, #0
+    mov  x2, #-1
+    mov  x3, #-1
+    mov  x4, #0
+    mov  x8, #SYS_perf_event_open
+    svc  #0
+    tbnz x0, #63, ipc_no_perf
+    mov  x19, x0                   /* perf fd */
+    str  x0, [x9, #RST_DESC_IPC_FD]
+
+    /* fcntl(fd, F_SETOWN, getpid()) */
+    mov  x8, #SYS_getpid
+    svc  #0
+    mov  x2, x0
+    mov  x0, x19
+    mov  x1, #F_SETOWN
+    mov  x8, #SYS_fcntl
+    svc  #0
+    /* fcntl(fd, F_SETFL, O_ASYNC) */
+    mov  x0, x19
+    mov  x1, #F_SETFL
+    mov  x2, #O_ASYNC
+    mov  x8, #SYS_fcntl
+    svc  #0
+    b    ipc_ok
+ipc_no_perf:
+    mov  x0, #-1
+    str  x0, [x9, #RST_DESC_IPC_FD]
+ipc_ok:
+    ldp  x30, xzr, [sp], #16
+    ret
+
+/* SIGIO 处理器: 打印构建期指令数 (RST_DESC_IPC_PERIOD + 补偿) →
+ * exit_group(0)。
+ * 说明: aarch64 上 overflow 后 read(perf_fd) 返回的是复位以来的
+ * 原始计数 (时序相关, 抖动可达一个周期), 不稳定; 打印静态周期值
+ * 与 x86 测试语义一致 (IPC: N instructions, N == 请求值)。
+ * 内核进入时 x0=sig, x1=siginfo, x2=ucontext, sp=信号帧。
+ * 只使用 caller-saved 寄存器, 无需保存现场 (直接退出)。 */
+ipc_handler:
+    adrp x9, _start
+    add  x9, x9, :lo12:_start
+    movz x10, #(STUB_ENTRY_OFF & 0xffff)
+    movk x10, #(STUB_ENTRY_OFF >> 16), lsl #16
+    sub  x9, x9, x10
+
+    ldr  x0, [x9, #RST_DESC_IPC_PERIOD]
+    add  x0, x0, #STUB_IPC_COMPENSATION
+    bl   utoa                       /* → bm_out_buf, 返回数字起点 */
+    mov  x19, x0
+
+    /* write(1, "IPC: ", 5) */
+    adrp x1, ipc_prefix
+    add  x1, x1, :lo12:ipc_prefix
+    mov  x0, #1
+    mov  x2, #5
+    mov  x8, #SYS_write
+    svc  #0
+    /* write(1, digits, len) */
+    mov  x1, x19
+    adrp x2, bm_out_buf_end
+    add  x2, x2, :lo12:bm_out_buf_end
+    sub  x2, x2, x19
+    mov  x0, #1
+    mov  x8, #SYS_write
+    svc  #0
+    /* write(1, " instructions\n", 14) */
+    adrp x1, ipc_suffix
+    add  x1, x1, :lo12:ipc_suffix
+    mov  x0, #1
+    mov  x2, #14
+    mov  x8, #SYS_write
+    svc  #0
+ipc_exit:
+    mov  x0, #0
+    mov  x8, #94                    /* exit_group */
+    svc  #0
+    b    .
+
+1:  ldr  x16, [x16, #8]
+    br   x16
 
 /* ===================== baremetal SIGTRAP 处理器 =====================
  * 内核调用: x0=sig, x1=siginfo, x2=ucontext (帧在 sp, siginfo+ucontext)
@@ -613,6 +780,14 @@ bm_mock_dispatch:
     beq  bm_mock_zero
     cmp  x0, #64                   /* write → 假写全部 */
     beq  bm_mock_write
+    cmp  x0, #66                   /* pwrite64 → 假写全部 */
+    beq  bm_mock_write
+    cmp  x0, #29                   /* ioctl → 0 */
+    beq  bm_mock_zero
+    cmp  x0, #25                   /* fcntl → 0 */
+    beq  bm_mock_zero
+    cmp  x0, #62                   /* lseek → 0 */
+    beq  bm_mock_zero
     cmp  x0, #56                   /* openat → -ENOENT */
     beq  bm_mock_enoent
     cmp  x0, #57                   /* close → 0 */
@@ -717,7 +892,7 @@ utoa:
     strb w5, [x2, #-1]!
     mov  x0, x4
     cbnz x0, 7b
-    add  x0, x2, #1
+    mov  x0, x2                    /* 返回数字串起点 (含首位) */
     ret
 
 /* ===================== baremetal 数据 ===================== */
@@ -738,6 +913,10 @@ bm_exit_prefix_len = . - bm_exit_prefix
 bm_exit_suffix:
     .ascii " instructions\n"
 bm_exit_suffix_len = . - bm_exit_suffix
+ipc_prefix:
+    .ascii "IPC: "
+ipc_suffix:
+    .ascii " instructions\n"
 bm_out_buf:
     .space 24
 bm_out_buf_end:
@@ -926,6 +1105,244 @@ str_stack:
 
 rlimit_stack:
     .quad 0, 0
+
+/* ===================== strict 专用区 (固定偏移) =====================
+ * 布局 (由 elftrace_stub.h 的 STUB_STRICT_*_OFF 约定):
+ *   STUB_STRICT_AREA_OFF: comp_engine (补偿引擎)
+ *   STUB_STRICT_LOOP_OFF: loop_handler (循环跳板 counter)
+ *   STUB_STRICT_EXIT_OFF: strict_exit_code (exit_group(0))
+ * build 的跳板 literal 直接引用这些绝对偏移, 因此必须 .org 固定。 */
+.org STUB_STRICT_AREA_OFF
+/* ===================== strict baremetal: 补偿引擎 =====================
+ * 跳板 (build 生成, 每站点 24B):
+ *   ldr x16,[pc,#16]; ldr x17,[pc,#16]; br x17; .quad site_block; .quad comp_engine
+ * 入口: x16 = site_block (blob 内绝对地址):
+ *   [0]    站点 pc (回放表按 pc 匹配)
+ *   [8]    ret_addr (svc 下一条)
+ *   [16]   replay_abs (回放表起点)
+ *   [24+r*8]  x0..x30 保存槽
+ *   [272]  brk 边界 (mock)
+ *   [280]  target_tid (mock getpid)
+ *   [288]  回放游标 (站点 pc 的记录消费位置; 同 pc 多记录顺序消费)
+ * 跳板入口已破坏 x16/x17 (IP0/IP1 约定破坏), 其余目标寄存器全部保存/恢复。
+ * 补偿过程无任何 syscall (纯访存 + 退出除外)。 */
+comp_engine:
+    mov  x17, x16
+    stp  x0, x1, [x17, #24]
+    stp  x2, x3, [x17, #40]
+    stp  x4, x5, [x17, #56]
+    stp  x6, x7, [x17, #72]
+    stp  x8, x9, [x17, #88]
+    stp  x10, x11, [x17, #104]
+    stp  x12, x13, [x17, #120]
+    stp  x14, x15, [x17, #136]
+    stp  x18, x19, [x17, #(24 + 18*8)]
+    stp  x20, x21, [x17, #(24 + 20*8)]
+    stp  x22, x23, [x17, #(24 + 22*8)]
+    stp  x24, x25, [x17, #(24 + 24*8)]
+    stp  x26, x27, [x17, #(24 + 26*8)]
+    stp  x28, x29, [x17, #(24 + 28*8)]
+    str  x30, [x17, #(24 + 30*8)]
+
+    ldr  x16, [x17, #16]            /* replay_abs (0 = 无回放表 → mock) */
+    cbz  x16, comp_mock
+    ldr  x18, [x16]                 /* n_recs */
+    ldr  x19, [x17, #288]           /* 游标 */
+    ldr  x2, [x17, #0]              /* 站点 pc */
+comp_scan:
+    cmp  x19, x18
+    b.hs comp_mock                  /* 游标越界: 无记录 → mock */
+    lsl  x0, x19, #4                /* *16 */
+    lsl  x1, x0, #2                 /* *64 */
+    add  x0, x0, x1                 /* *80 */
+    add  x0, x16, x0
+    add  x0, x0, #8                 /* rec */
+    ldr  x20, [x0]                  /* rec.pc */
+    cmp  x20, x2
+    beq  comp_found
+    add  x19, x19, #1
+    b    comp_scan
+comp_found:
+    add  x19, x19, #1
+    str  x19, [x17, #288]           /* 游标前进 (顺序消费) */
+    mov  x23, x0                    /* rec 基址 (memcpy 会破坏 x0-x5) */
+
+    /* newseg: 把记录数据写入预映射区 (纯访存) */
+    ldr  x18, [x23, #40]            /* n_newseg */
+    ldr  x19, [x23, #48]
+    add  x19, x19, x16
+comp_newseg_loop:
+    cbz  x18, comp_dirty
+    ldr  x20, [x19]                 /* vaddr */
+    ldr  x21, [x19, #8]             /* filesz */
+    add  x22, x19, #32              /* src */
+    mov  x0, x20
+    mov  x1, x22
+    mov  x2, x21
+    bl   memcpy_bytes
+    add  x19, x19, #32
+    add  x19, x19, x21
+    sub  x18, x18, #1
+    b    comp_newseg_loop
+comp_dirty:
+    ldr  x18, [x23, #56]            /* n_dirty */
+    ldr  x19, [x23, #64]
+    add  x19, x19, x16
+comp_dirty_loop:
+    cbz  x18, comp_done
+    ldr  x20, [x19]                 /* dst */
+    add  x21, x19, #8               /* src */
+    mov  x0, x20
+    mov  x1, x21
+    mov  x2, #4096
+    bl   memcpy_bytes
+    add  x19, x19, #4096
+    add  x19, x19, #8
+    sub  x18, x18, #1
+    b    comp_dirty_loop
+comp_done:
+    ldr  x1, [x23, #16]             /* rec.rax */
+    str  x1, [x17, #24]             /* x0 槽 */
+    b    comp_restore
+
+/* ---- mock (无回放表, freeze 快照) ---- */
+comp_mock:
+    ldr  x2, [x17, #(24 + 8*8)]     /* 目标 x8 = syscall 号 */
+    cmp  x2, #94
+    beq  comp_mock_exit
+    cmp  x2, #93
+    beq  comp_mock_exit
+    cmp  x2, #63                    /* read → 0 */
+    beq  comp_mock_zero
+    cmp  x2, #64                    /* write → len */
+    beq  comp_mock_write
+    cmp  x2, #66                    /* pwrite64 → len */
+    beq  comp_mock_write
+    cmp  x2, #29                    /* ioctl → 0 */
+    beq  comp_mock_zero
+    cmp  x2, #25                    /* fcntl → 0 */
+    beq  comp_mock_zero
+    cmp  x2, #62                    /* lseek → 0 */
+    beq  comp_mock_zero
+    cmp  x2, #56                    /* openat → -ENOENT */
+    beq  comp_mock_enoent
+    cmp  x2, #57                    /* close → 0 */
+    beq  comp_mock_zero
+    cmp  x2, #222                   /* mmap → -ENOMEM */
+    beq  comp_mock_enomem
+    cmp  x2, #226                   /* mprotect → 0 */
+    beq  comp_mock_zero
+    cmp  x2, #215                   /* munmap → 0 */
+    beq  comp_mock_zero
+    cmp  x2, #214                   /* brk */
+    beq  comp_mock_brk
+    cmp  x2, #172                   /* getpid → target_tid */
+    beq  comp_mock_getpid
+    cmp  x2, #129                   /* kill → 0 */
+    beq  comp_mock_zero
+    cmp  x2, #134                   /* rt_sigaction → 0 */
+    beq  comp_mock_zero
+    cmp  x2, #135                   /* rt_sigprocmask → 0 */
+    beq  comp_mock_zero
+    /* 未支持: 0x5e 退出 */
+    mov  x0, #0x5e
+    mov  x8, #94
+    svc  #0
+    b    .
+comp_mock_exit:
+    ldr  x0, [x17, #24]             /* 目标 x0 = 退出码 */
+    mov  x8, #94
+    svc  #0
+    b    .
+comp_mock_write:
+    ldr  x1, [x17, #(24 + 2*8)]     /* 目标 x2 = len */
+    b    comp_mock_set
+comp_mock_zero:
+    mov  x1, #0
+    b    comp_mock_set
+comp_mock_enoent:
+    mov  x1, #-2
+    b    comp_mock_set
+comp_mock_enomem:
+    mov  x1, #-12
+    b    comp_mock_set
+comp_mock_getpid:
+    ldr  x1, [x17, #280]
+    b    comp_mock_set
+comp_mock_brk:
+    ldr  x2, [x17, #24]             /* 目标 x0 = addr */
+    ldr  x1, [x17, #272]            /* 边界/当前 */
+    cbz  x2, 1f
+    cmp  x2, x1
+    b.hi 1f
+    str  x2, [x17, #272]
+    mov  x1, x2
+1:
+comp_mock_set:
+    str  x1, [x17, #24]             /* x0 槽 */
+
+comp_restore:
+    ldr  x0, [x17, #24]             /* 恢复目标 x0 (返回值, 已由引擎设置) */
+    ldr  x16, [x17, #8]             /* ret_addr */
+    ldp  x1, x2, [x17, #32]
+    ldp  x3, x4, [x17, #48]
+    ldp  x5, x6, [x17, #64]
+    ldp  x7, x8, [x17, #80]
+    ldp  x9, x10, [x17, #96]
+    ldp  x11, x12, [x17, #112]
+    ldp  x13, x14, [x17, #128]
+    ldp  x15, x18, [x17, #144]
+    ldp  x19, x20, [x17, #(24 + 19*8)]
+    ldp  x21, x22, [x17, #(24 + 21*8)]
+    ldp  x23, x24, [x17, #(24 + 23*8)]
+    ldp  x25, x26, [x17, #(24 + 25*8)]
+    ldp  x27, x28, [x17, #(24 + 27*8)]
+    ldp  x29, x30, [x17, #(24 + 29*8)]
+    br   x16
+
+.org STUB_STRICT_LOOP_OFF
+/* ===================== strict: 循环跳板 handler =====================
+ * 跳板: ldr x16,[pc,#8]; br x16; .quad loop_block
+ * loop_block: [0] counter(32), [8] loop_head, [16] exit_code
+ * 每次经过回边 counter--; 非 0 → 跳回循环头; 0 → 退出。
+ * 破坏 x16 (目标原值已由跳板破坏) 与 x17 (counter 值)。 */
+loop_handler:
+    ldr  w17, [x16]
+    sub  w17, w17, #1
+    str  w17, [x16]
+    cbnz w17, 1f
+    ldr  x16, [x16, #16]
+    br   x16
+1:  ldr  x16, [x16, #8]
+    br   x16
+
+/* ===================== strict: 目标指令计数跳板 =====================
+ * while 型循环 (回边条件分支) 的退出: patch 目标指令 P → b <跳板>,
+ * count_handler 每执行到 P 递减 counter; 到 0 → 退出; 否则执行
+ * 原始指令 (blob 内副本) 后跳回 P+4, 循环自身语义完全保留。
+ * block (40B): [0] counter, [8] exit_code, [16] 原指令,
+ *              [20] ldr x16,[pc,#12], [24] br x16, [28] nop,
+ *              [32] ret_addr (P+4)
+ * 破坏 x16/x17 (跳板入口已破坏), 不碰 flags。 */
+.org STUB_STRICT_COUNT_OFF
+count_handler:
+    ldr  w17, [x16]
+    sub  w17, w17, #1
+    str  w17, [x16]
+    cbnz w17, 1f
+    ldr  x16, [x16, #8]
+    br   x16
+1:  add  x16, x16, #16
+    br   x16
+
+/* ===================== strict: 退出代码 =====================
+ * 唯一路径退出/循环结束跳到这里: 真实 exit_group(0)。 */
+.org STUB_STRICT_EXIT_OFF
+strict_exit_code:
+    mov  x0, #0
+    mov  x8, #94
+    svc  #0
+    b    .
 
 /* 代码区末尾: 补齐到固定区大小 */
     .org STUB_FIXED_SIZE

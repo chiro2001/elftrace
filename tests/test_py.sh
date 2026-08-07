@@ -14,6 +14,8 @@ SNAP="$TMP/snap_py.elftrace"
 SLICED="$TMP/sliced_py.elf"
 
 mkdir -p "$TMP"
+BM_EXTRA=""
+[ "$(uname -m)" = "aarch64" ] && BM_EXTRA="--bm-strict"
 
 # 基准
 python3 "$SCRIPT" > "$TMP/py_ref.out" 2>&1
@@ -50,7 +52,7 @@ run_case() {  # $1 = 名称, $2 = 冻结方式 (freeze|stub), $3 = build 参数,
     local ORIG_RC=$?
     [ "$ORIG_RC" = "$REF_RC" ] || { echo "FAIL[$name]: orig rc=$ORIG_RC != ref $REF_RC"; return 1; }
 
-    "$ELFTRACE" build "$SNAP" -o "$SLICED" $bm >/dev/null 2>&1 || { echo "FAIL[$name]: build"; return 1; }
+    "$ELFTRACE" build "$SNAP" -o "$SLICED" $bm $BM_EXTRA >/dev/null 2>&1 || { echo "FAIL[$name]: build"; return 1; }
 
     local S_RC
     if [ -n "$is_bm" ]; then

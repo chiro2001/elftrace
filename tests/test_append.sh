@@ -39,11 +39,23 @@ grep -q "OPENED" "$TMP/append_frozen.out" || { echo "FAIL: OPENED not seen"; kil
 kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null
 
 # 3. 快照中该 fd 应带 O_APPEND 标志 (0102001 = O_LARGEFILE|O_APPEND|O_WRONLY)
+# 目标程序的 out.txt fd (stdout/stderr 也指向同一路径, 取带 O_APPEND 的)
 DUMP=$("$ELFTRACE" dump "$SNAP")
-FD_LINE=$(echo "$DUMP" | grep -E "^\s+fd [0-9]+ .*$F_FROZEN" | head -1)
-echo "fd record: ${FD_LINE##*fd }"
-echo "$FD_LINE" | grep -q "flags=0102001" \
-    || { echo "FAIL: O_APPEND flag not captured: ${FD_LINE##*fd }"; exit 1; }
+FD_LINE=""
+while read -r line; do
+    case "$line" in
+        *flags=*)
+            FLAGS=$(echo "$line" | sed -nE 's/.*flags=([0-9]+).*/\1/p')
+            FLAGS=$((8#$FLAGS))
+            if [ $(( FLAGS & 0x400 )) != 0 ]; then
+                FD_LINE="$line"
+                break
+            fi ;;
+    esac
+done <<< "$(echo "$DUMP" | grep -E "^\s+fd [0-9]+ .*$F_FROZEN")"
+echo "fd record: $FD_LINE"
+[ -n "$FD_LINE" ] \
+    || { echo "FAIL: no fd with O_APPEND captured for $F_FROZEN"; exit 1; }
 
 # 4. 组装 + 运行切片
 "$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real >/dev/null 2>&1 || { echo "FAIL: build"; exit 1; }

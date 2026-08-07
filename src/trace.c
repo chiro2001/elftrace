@@ -68,6 +68,7 @@ struct trace_ctx {
     struct syscall_rec {
         uint64_t pc;                /* syscall 指令地址 */
         uint64_t sysno;
+        uint64_t count;             /* 捕获时的 perf 指令计数 (窗口过滤用) */
         int interrupted;            /* INTERRUPT 打断的在途 syscall (A=近似) */
         struct collect_snapshot light_a;  /* 入口状态 + 内存基线 */
         struct collect_snapshot light_b;  /* 返回状态 + 内存 */
@@ -78,6 +79,15 @@ struct trace_ctx {
     uint64_t pend_pc, pend_sysno;
     int have_pending;
 };
+
+/* 读 perf 累计计数 (syscall 记录定位用; ring sample 可能滞后) */
+static uint64_t perf_count_now(struct trace_ctx *tc)
+{
+    uint64_t v = 0;
+    if (tc->perf_fd >= 0)
+        read(tc->perf_fd, &v, sizeof(v));
+    return v;
+}
 
 static void perf_open(struct trace_ctx *tc)
 {
@@ -195,8 +205,9 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
                                     (tc->n_syscalls + 1) *
                                     sizeof(*tc->syscalls));
             struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
-            r->pc = rip - 2;    /* syscall 指令 (x86_64 0f05 长 2) */
+            r->pc = rip - ARCH_SYSCALL_LEN;  /* syscall 指令 */
             r->sysno = 0;       /* EXIT-stop 无 syscall 号 */
+            r->count = perf_count_now(tc);
             r->interrupted = 1;
             if (tc->have_last) {
                 collect_snapshot_copy_light(&r->light_a, &tc->last);
@@ -222,6 +233,7 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
         struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
         r->pc = tc->pend_pc;
         r->sysno = tc->pend_sysno;
+        r->count = perf_count_now(tc);
         collect_snapshot_copy_light(&r->light_b, &sn);
         cbuf_append(&r->light_b.payload, sn.payload.data, sn.payload.size);
         /* A 基线 (入口状态+内存) 移入记录 */
@@ -275,8 +287,9 @@ static int collect_interrupt_sc(struct trace_ctx *tc)
                                         (tc->n_syscalls + 1) *
                                         sizeof(*tc->syscalls));
                 struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
-                r->pc = psi.instruction_pointer - 2; /* syscall 指令 */
+                r->pc = psi.instruction_pointer - ARCH_SYSCALL_LEN;
                 r->sysno = 0;   /* EXIT-stop 无 syscall 号 */
+                r->count = perf_count_now(tc);
                 r->interrupted = 1;
                 if (tc->have_last) {
                     collect_snapshot_copy_light(&r->light_a, &tc->last);
@@ -331,8 +344,31 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
         return;
     }
 
+    /* aarch64: 检查点捕获到在途 syscall (INTERRUPT 打断) 时, 恢复 pc
+       在 svc+4 (EXIT 态), 切片会跳过该 syscall 但内存未生效; 把 pc
+       调回 svc 使切片重执行它, 由回放记录应用内存变化并返回完整结果。 */
+#if defined(__aarch64__)
+    if (tc->n_syscalls > 0) {
+        struct syscall_rec *lastr = &tc->syscalls[tc->n_syscalls - 1];
+        if (lastr->interrupted &&
+            lastr->pc + ARCH_SYSCALL_LEN == REG_PC(sn.regs)) {
+            REG_SET_PC(sn.regs, lastr->pc);
+        }
+    }
+#endif
+
     /* 冻结期间直接读全量内存并即时写检查点 (diff 链) */
     collect_memory(tc->pid, &sn);
+    /* 无上一检查点时的在途记录: A 基线 = 当前检查点状态 (内存未生效,
+       与 B 的 diff 即 syscall 的内存变化) */
+    if (tc->n_syscalls > 0) {
+        struct syscall_rec *lastr = &tc->syscalls[tc->n_syscalls - 1];
+        if (lastr->interrupted && lastr->light_a.payload.size == 0) {
+            collect_snapshot_copy_light(&lastr->light_a, &sn);
+            cbuf_append(&lastr->light_a.payload, sn.payload.data,
+                        sn.payload.size);
+        }
+    }
     snprintf(path, sizeof(path), "%s/ckpt_%06zu.elftrace", tc->out,
              tc->ckpt_no);
     if (tc->ckpt_no == 0) {
@@ -476,6 +512,21 @@ int trace_main(int argc, char **argv)
                 if (kill(pid, 0) == 0)
                     ptrace(PTRACE_SYSCALL, pid, 0, 0);
             }
+            /* 兜底: aarch64 上 ptrace 频繁 syscall-stop 可能干扰 ring
+               sample 写入 (首样本后 head 不再前进), 直接读计数器值判断
+               是否越过下一检查点阈值。read 返回累计计数, 无样本时
+               依然可靠。 */
+            {
+                uint64_t val = 0;
+                if (read(tc.perf_fd, &val, sizeof(val)) == sizeof(val) &&
+                    val >= tc.count + tc.every) {
+                    uint64_t ip;
+                    while ((ip = perf_next_sample(&tc)) != 0) {}
+                    ckpt_take(&tc, 0);
+                    if (kill(pid, 0) == 0)
+                        ptrace(PTRACE_SYSCALL, pid, 0, 0);
+                }
+            }
         }
 
         if (g_stop)
@@ -557,10 +608,11 @@ main_done:
             char path[PATH_MAX];
             snprintf(path, sizeof(path), "%s/sys_%06zu.elftrace", sdir, k);
             collect_write_diff(&r->light_a, &r->light_b, path);
-            fprintf(mf, "%#llx %llu sys_%06zu.elftrace%s\n",
+            fprintf(mf, "%#llx %llu sys_%06zu.elftrace%s %llu\n",
                     (unsigned long long)r->pc,
                     (unsigned long long)r->sysno, k,
-                    r->interrupted ? " I" : "");
+                    r->interrupted ? " I" : "",
+                    (unsigned long long)r->count);
             collect_snapshot_free_light(&r->light_a);
             collect_snapshot_free_light(&r->light_b);
         }

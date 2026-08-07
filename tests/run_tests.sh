@@ -25,7 +25,7 @@ ROOT=$(pwd)
 LOG="$ROOT/tmp/test_run.log"
 mkdir -p "$ROOT/tmp"
 
-TESTS="basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle baremetal imix bm_edge"
+TESTS="basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle baremetal imix bm_edge strict realworld"
 PASS=0
 FAIL=0
 
@@ -41,7 +41,13 @@ for t in $TESTS; do
     printf "%-8s " "[$t]"
     TS="tests/test_$t.sh"
     [ "$t" = imix ] && TS="tests/IMIX/test_imix.sh"
-    if timeout 600 "$TS" > "$LOG" 2>&1; then
+    # aarch64 真机较慢: baremetal/realworld 需要更长超时
+    TIMEOUT=600
+    case "$t" in
+        baremetal) [ "$(uname -m)" = "aarch64" ] && TIMEOUT=1800 ;;
+        realworld) [ "$(uname -m)" = "aarch64" ] && TIMEOUT=1800 ;;
+    esac
+    if timeout "$TIMEOUT" "$TS" > "$LOG" 2>&1; then
         LAST=$(grep -E "^PASS" "$LOG" | tail -1)
         echo "PASS  (${LAST#PASS: })"
         PASS=$((PASS + 1))

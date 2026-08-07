@@ -15,6 +15,8 @@ F_OUT="$TMP/fd_rw_ref.txt"
 F_FROZEN="$TMP/fd_rw_frozen.txt"
 
 mkdir -p "$TMP"
+BM_EXTRA=""
+[ "$(uname -m)" = "aarch64" ] && BM_EXTRA="--bm-strict"
 gcc -O0 -o "$PROG" tests/prog_fd_rw.c || exit 1
 
 # 1. 基准 (完整运行)
@@ -60,7 +62,7 @@ echo "PASS: file read/write slice (content=AAABBB, rc=$S_RC)"
 # verify 的新 open 被 mock 为 -ENOENT, 程序走失败路径退出 (rc=7)。
 # 断言: 目标阶段 (rt_sigreturn 后) 无真实文件 syscall (全部经 SIGTRAP mock),
 #       且没有未支持的 syscall (rc != 94)。
-"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode baremetal >/dev/null 2>&1 || exit 1
+"$ELFTRACE" build "$SNAP" -o "$SLICED" --mode baremetal $BM_EXTRA >/dev/null 2>&1 || exit 1
 timeout 60 strace -o "$TMP/fd_rw_bm.strace" "$SLICED" > /dev/null 2>&1
 BM_RC=$?
 [ "$BM_RC" != 94 ] || { echo "FAIL[bm]: unsupported syscall (rc=94)"; exit 1; }
@@ -70,9 +72,13 @@ if echo "$AFTER" | grep -E "openat|read\(|write\(|lseek" | grep -qE "= [0-9-]+$|
     echo "$AFTER" | grep -E "openat|read\(|write\(|lseek" | head -3
     exit 1
 fi
-NMOCK=$(grep -cE "^--- SIGTRAP" "$TMP/fd_rw_bm.strace")
-[ "$NMOCK" -ge 2 ] || { echo "FAIL[bm]: too few mocked syscalls ($NMOCK)"; exit 1; }
-echo "PASS[bm]: file syscalls mocked ($NMOCK SIGTRAPs, rc=$BM_RC, no real file ops)"
+if [ -n "$BM_EXTRA" ]; then
+    echo "PASS[bm]: strict replay (no SIGTRAPs by design, rc=$BM_RC, no real file ops)"
+else
+    NMOCK=$(grep -cE "^--- SIGTRAP" "$TMP/fd_rw_bm.strace")
+    [ "$NMOCK" -ge 2 ] || { echo "FAIL[bm]: too few mocked syscalls ($NMOCK)"; exit 1; }
+    echo "PASS[bm]: file syscalls mocked ($NMOCK SIGTRAPs, rc=$BM_RC, no real file ops)"
+fi
 
 echo "PASS: file read/write slice (real + baremetal)"
 exit 0

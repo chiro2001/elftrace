@@ -62,6 +62,14 @@
 #define STUB_ENTRY_OFF      0x62C0
 #endif
 #define STUB_FIXED_SIZE     0x8000
+/* strict baremetal 专用区 (固定区末尾 0x400):
+ *   comp_engine (补偿引擎) / loop_handler (循环跳板) / strict_exit_code
+ * build 的跳板 literal 直接引用这些绝对偏移 */
+#define STUB_STRICT_AREA_OFF (STUB_FIXED_SIZE - 0x600)
+#define STUB_STRICT_COMP_OFF (STUB_STRICT_AREA_OFF)
+#define STUB_STRICT_LOOP_OFF (STUB_STRICT_AREA_OFF + 0x500)
+#define STUB_STRICT_COUNT_OFF (STUB_STRICT_AREA_OFF + 0x540)
+#define STUB_STRICT_EXIT_OFF (STUB_FIXED_SIZE - 0x20)
 
 /* ---- rst_desc 字段偏移 (256B, 全 u64) ---- */
 #define RST_DESC_MAGIC      0x00
@@ -91,6 +99,7 @@
 #define RST_DESC_REPLAY_SIZE 0xC0  /* 回放表大小 (0=无, 走旧 mock) */
 #define RST_DESC_REPLAY_CUR  0xC8  /* 回放表游标 (stub 运行时维护, 顺序消费) */
 #define RST_DESC_TLS         0xD0  /* aarch64 TPIDR_EL0 (x86_64 保留 0) */
+#define RST_DESC_BM_STYLE    0xD8  /* baremetal 风格: 0=legacy 信号/brk, 1=strict 分支补偿 */
 
 #define RST_DESC_MAGIC_VAL  0x5253544452455354  /* "RESTDSTR" */
 

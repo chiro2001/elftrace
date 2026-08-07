@@ -40,7 +40,7 @@ ELAPSED=$(($(date +%s) - START))
 
 # IPC 输出写入冻结前的 stdout 文件
 grep -q "IPC: " "$TMP/ipc_frozen.out" || { echo "FAIL: no IPC line in $(cat $TMP/ipc_frozen.out)"; exit 1; }
-COUNT=$(grep -oP 'IPC: \K[0-9]+' "$TMP/ipc_frozen.out" | head -1)
+COUNT=$(sed -nE 's/.*IPC: ([0-9]+).*/\1/p' "$TMP/ipc_frozen.out" | head -1)
 # 容差: 允许 0.5% 上浮 (信号路径/handler 开销)
 [ -n "$COUNT" ] && [ "$COUNT" -ge "$IPC_N" ] && [ "$COUNT" -le $((IPC_N + IPC_N / 200)) ] \
     || { echo "FAIL: count $COUNT not ~ $IPC_N"; exit 1; }

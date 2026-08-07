@@ -38,7 +38,9 @@ grep -q "SLEEP 1" "$TMP/syscall_frozen.out" || { echo "FAIL: SLEEP 1 not seen"; 
 IN_SYSCALL=""
 for i in $(seq 1 32); do
     W=$(cat /proc/$PID/wchan 2>/dev/null)
-    [ "$W" = "hrtimer_nanosleep" ] && { IN_SYSCALL=1; break; }
+    # x86: hrtimer_nanosleep; aarch64: __arm64_sys_nanosleep
+    [ "$W" = "hrtimer_nanosleep" ] || [ "$W" = "__arm64_sys_nanosleep" ] \
+        && { IN_SYSCALL=1; break; }
     sleep 0.05
 done
 [ -n "$IN_SYSCALL" ] || { echo "FAIL: target never observed in nanosleep (wchan=$W)"; kill $PID; exit 1; }

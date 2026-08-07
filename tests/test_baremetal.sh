@@ -20,6 +20,8 @@ cd "$(dirname "$0")/.."
 source tests/testlib.sh
 
 tf_setup
+BM_EXTRA=""
+[ "$(uname -m)" = "aarch64" ] && BM_EXTRA="--bm-strict"
 DRIO=$(ls -d ~/tools/DynamoRIO-* 2>/dev/null | head -1)
 TRACE_DIR="/mnt/elftrace-trace"
 
@@ -97,7 +99,7 @@ run_load() {
 
     # 4. baremetal 切片 (strace)
     "$TF_ELFTRACE" build "$CKPTS/ckpt_000000.elftrace" -o "$TF_TMP/bm_${name}_bm.elf" \
-        --mode baremetal --checkpoints "$CKPTS" --from 0 >/dev/null 2>&1 \
+        --mode baremetal $BM_EXTRA --checkpoints "$CKPTS" --from 0 >/dev/null 2>&1 \
         || { echo "  FAIL[$name]: build bm"; return 1; }
     timeout 120 strace -o "$TF_TMP/bm_${name}_bm.strace" "$TF_TMP/bm_${name}_bm.elf" \
         >/dev/null 2>&1

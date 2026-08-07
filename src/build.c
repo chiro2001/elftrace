@@ -25,6 +25,7 @@
 #include "util.h"
 #include "disasm.h"
 #include "arch.h"
+#include "a64.h"
 
 /* ---- 生成的 stub blob (按目标架构选择) ---- */
 extern const unsigned char stub_blob_x86_64[];
@@ -33,6 +34,7 @@ extern const unsigned int stub_blob_x86_64_len;
 extern const unsigned char stub_blob_aarch64[];
 extern const unsigned int stub_blob_aarch64_len;
 #endif
+
 
 /* ---- 可扩展缓冲 (同 freeze) ---- */
 struct buf {
@@ -92,6 +94,549 @@ static const char *sn_str(const struct snap *s, uint64_t off)
         return "";
     return (const char *)s->file + s->h.strings_off + off;
 }
+
+/* 回放记录 (build_main 解析 syscall.map 后的内存形态) */
+struct rec_tmp {
+    uint64_t pc, sysno, rax;
+    uint64_t n_unmap, n_newseg, n_dirty;
+    struct buf unmap, newseg, dirty;
+};
+
+/* strict 模式下的额外 PT_LOAD (由 ELF 组装段发射) */
+struct strict_pload {
+    uint64_t vaddr;
+    uint64_t filesz;
+    uint64_t memsz;
+    uint64_t flags;             /* PF_* */
+    uint64_t file_off;          /* 由组装段回填 */
+    const uint8_t *data;        /* filesz>0 时的文件数据 (NULL=纯 BSS) */
+};
+
+#if defined(__aarch64__)
+/* ===================== strict baremetal (ELF loader 型) =====================
+ *
+ * 目标: 切片运行期除开始 execve / 结束 exit_group 外无任何 syscall。
+ * 方案:
+ *   - 全部内存 (初始段 + 切片窗口内未来 newseg + 栈预留 + 跳板页)
+ *     用 PT_LOAD 由 ELF loader 建立, stub 不再 mmap/mprotect。
+ *   - 目标代码中的 svc #0 定点替换为 b <跳板>; 跳板 ldr x16+br 到
+ *     blob 内的站点块, comp 引擎保存现场 → 应用回放差异 (纯访存) →
+ *     伪造 x0 → 恢复现场 (仅 x16 被约定破坏) → 回到 svc 下一条。
+ *   - 退出点: 唯一路径 → 指令替换为 b <exit 跳板>; 循环内 → patch
+ *     回边 → b <loop 跳板>, 跳板 counter 决定何时退出。
+ *   - 结束 = 真实 exit_group (允许)。
+ */
+
+struct strict_site {
+    uint64_t pc;                /* 被 patch 的指令地址 */
+    int kind;                   /* 0=syscall 1=exit 2=loop */
+    uint64_t head;              /* loop: 循环头 */
+    uint64_t tramp_addr;        /* 跳板入口 */
+    uint64_t block_addr;        /* 站点块/循环描述块 (blob 绝对地址) */
+    int rec_id;                 /* syscall: 回放记录号 (-1=mock) */
+};
+
+static void spload_add(struct strict_pload **pl, size_t *n, size_t *cap,
+                       uint64_t vaddr, uint64_t memsz, uint64_t flags)
+{
+    if (!memsz)
+        return;
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 16;
+        *pl = xrealloc(*pl, *cap * sizeof(**pl));
+    }
+    struct strict_pload *p = &(*pl)[(*n)++];
+    memset(p, 0, sizeof(*p));
+    p->vaddr = vaddr;
+    p->memsz = memsz;
+    p->flags = flags;
+}
+
+/* 区间 [vaddr, vaddr+memsz) 是否已被初始段或已有 pload 覆盖 */
+static int range_covered(const elftrace_seg *segs, size_t nsegs,
+                         const struct strict_pload *pl, size_t npl,
+                         uint64_t vaddr, uint64_t memsz)
+{
+    uint64_t end = vaddr + memsz;
+    for (size_t i = 0; i < nsegs; i++) {
+        uint64_t se = segs[i].vaddr + segs[i].memsz;
+        if (vaddr >= segs[i].vaddr && end <= se)
+            return 1;
+    }
+    for (size_t i = 0; i < npl; i++) {
+        uint64_t pe = pl[i].vaddr + pl[i].memsz;
+        if (vaddr >= pl[i].vaddr && end <= pe)
+            return 1;
+    }
+    return 0;
+}
+
+/* 在 [near, near+128MB) 中找一个能容纳 size 的空闲页对齐区间 */
+static uint64_t find_gap_near(const elftrace_seg *segs, size_t nsegs,
+                              const struct strict_pload *pl, size_t npl,
+                              uint64_t near, uint64_t size)
+{
+    uint64_t cur = (near + 0xfff) & ~0xfffULL;
+    uint64_t lim = near + (128UL << 20);
+    while (cur + size <= lim) {
+        uint64_t end = cur + size;
+        int busy = 0;
+        for (size_t i = 0; i < nsegs; i++) {
+            if (cur < segs[i].vaddr + segs[i].memsz &&
+                end > segs[i].vaddr) {
+                busy = 1;
+                cur = (segs[i].vaddr + segs[i].memsz + 0xfff) & ~0xfffULL;
+                break;
+            }
+        }
+        if (busy)
+            continue;
+        for (size_t i = 0; i < npl; i++) {
+            if (cur < pl[i].vaddr + pl[i].memsz && end > pl[i].vaddr) {
+                busy = 1;
+                cur = (pl[i].vaddr + pl[i].memsz + 0xfff) & ~0xfffULL;
+                break;
+            }
+        }
+        if (!busy)
+            return cur;
+    }
+    return 0;
+}
+
+/* strict 模式构建: 收集站点 → 生成跳板/站点块 → patch 指令 →
+ * 计算额外 PT_LOAD (跳板页/未来 newseg/栈预留)。
+ * 返回 0 成功; 写 *pl_out/*npl_out。 */
+static int build_strict_aarch64(const struct snap *s, struct buf *blob,
+                                uint64_t base, uint64_t blob_total,
+                                uint64_t payload_off,
+                                const elftrace_seg *segs,
+                                struct rec_tmp *recs, size_t nrecs,
+                                int have_map,
+                                uint64_t exit_override,
+                                const uint64_t *ckpt_pcs, size_t nckpt_pcs,
+                                uint64_t count_from, uint64_t count_to,
+                                uint64_t stack_reserve,
+                                uint64_t replay_off,
+                                uint64_t heap_end,
+                                struct strict_pload **pl_out,
+                                size_t *npl_out, uint64_t *replay_abs)
+{
+    size_t nsegs = s->h.nsegs;
+    struct strict_site *sites = NULL;
+    size_t nsites = 0, sites_cap = 0;
+    struct strict_pload *pl = NULL;
+    size_t npl = 0, pl_cap = 0;
+    uint64_t exit_abs = base + STUB_STRICT_EXIT_OFF;
+    uint64_t comp_abs = base + STUB_STRICT_COMP_OFF;
+    uint64_t loop_abs = base + STUB_STRICT_LOOP_OFF;
+    uint64_t count_abs = base + STUB_STRICT_COUNT_OFF;
+    uint64_t rabs = base + replay_off;
+
+    /* 1. syscall 站点: 来自回放记录 (权威); 无记录时扫描 mock */
+    for (size_t k = 0; k < nrecs; k++) {
+        uint64_t site = recs[k].pc;
+        int found = 0;
+        /* 常规记录: pc = entry-stop ip = svc+4 */
+        if (site >= 4) {
+            const uint8_t *q = NULL;
+            for (size_t i = 0; i < nsegs; i++) {
+                if (site - 4 >= segs[i].vaddr &&
+                    site - 4 < segs[i].vaddr + segs[i].filesz) {
+                    q = blob->data + payload_off +
+                        segs[i].payload_off + (site - 4 - segs[i].vaddr);
+                    break;
+                }
+            }
+            if (q && a64_is_svc0(a64_insn(q))) {
+                site -= 4;
+                found = 1;
+            }
+        }
+        if (!found) {
+            const uint8_t *q = NULL;
+            for (size_t i = 0; i < nsegs; i++) {
+                if (site >= segs[i].vaddr &&
+                    site < segs[i].vaddr + segs[i].filesz) {
+                    q = blob->data + payload_off +
+                        segs[i].payload_off + (site - segs[i].vaddr);
+                    break;
+                }
+            }
+            if (q && a64_is_svc0(a64_insn(q)))
+                found = 1;
+        }
+        if (!found)
+            continue;           /* 站点不可定位: 丢弃 */
+        /* 回放表 rec.pc 统一为 svc 地址 (3.5b 的定点替换在 strict 模式
+           被跳过, 表里还是 entry-stop ip = svc+4; 引擎按站点 pc 匹配) */
+        {
+            uint8_t *recp = blob->data + replay_off + 8 + (size_t)k * 80;
+            memcpy(recp, &site, 8);
+        }
+        /* exit/exit_group 保持真实 (切片结束的合法 syscall) */
+        if (recs[k].sysno == 93 || recs[k].sysno == 94)
+            continue;
+        /* 同一 pc 的多条记录 (libc 共享 trampoline): 只建一个站点,
+           游标从首个记录索引开始顺序消费 (与 legacy 回放表游标一致) */
+        int dup = 0;
+        for (size_t j = 0; j < nsites; j++) {
+            if (sites[j].kind == 0 && sites[j].pc == site) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+        if (nsites == sites_cap) {
+            sites_cap = sites_cap ? sites_cap * 2 : 32;
+            sites = xrealloc(sites, sites_cap * sizeof(*sites));
+        }
+        struct strict_site *st = &sites[nsites++];
+        memset(st, 0, sizeof(*st));
+        st->pc = site;
+        st->kind = 0;
+        st->rec_id = (int)k;
+    }
+    if (!have_map) {
+        /* freeze 快照 (无 trace 回放数据): 全段扫描 svc → mock 站点 */
+        size_t scanned = 0;
+        for (size_t i = 0; i < nsegs; i++) {
+            if (!(segs[i].flags & ET_SEG_X))
+                continue;
+            const uint8_t *basep = blob->data + payload_off +
+                                   segs[i].payload_off;
+            for (uint64_t j = 0; j + 4 <= segs[i].filesz; j += 4) {
+                if (!a64_is_svc0(a64_insn(basep + j)))
+                    continue;
+                if (nsites == sites_cap) {
+                    sites_cap = sites_cap ? sites_cap * 2 : 32;
+                    sites = xrealloc(sites, sites_cap * sizeof(*sites));
+                }
+                struct strict_site *st = &sites[nsites++];
+                memset(st, 0, sizeof(*st));
+                st->pc = segs[i].vaddr + j;
+                st->kind = 0;
+                st->rec_id = -1;
+                scanned++;
+            }
+        }
+        if (scanned)
+            warn("strict: no replay map, %zu svc sites patched as mock "
+                 "(scan)", scanned);
+    }
+
+    /* 2. 退出点: 唯一路径埋 exit; 循环内 patch 回边 */
+    if (exit_override) {
+        int seg_idx = -1;
+        for (size_t i = 0; i < nsegs; i++) {
+            if (exit_override >= segs[i].vaddr &&
+                exit_override < segs[i].vaddr + segs[i].filesz) {
+                seg_idx = (int)i;
+                break;
+            }
+        }
+        if (seg_idx < 0)
+            die("exit point %#llx not in any captured segment",
+                (unsigned long long)exit_override);
+        uint64_t head = 0, backedge = 0;
+        const uint8_t *code = blob->data + payload_off +
+                              segs[seg_idx].payload_off;
+        int in_loop = a64_find_loop_backedge(code, segs[seg_idx].vaddr,
+                                             segs[seg_idx].filesz,
+                                             exit_override, &head,
+                                             &backedge);
+        /* 循环判定增强: 目标 PC 或回边在窗口检查点中出现 >= 2 次
+           才认为是"重复路径" (仅跑一次则直接埋 exit) */
+        int repeated = 0;
+        if (in_loop) {
+            size_t hits = 0;
+            for (size_t i = 0; i < nckpt_pcs; i++) {
+                if (ckpt_pcs[i] == exit_override ||
+                    ckpt_pcs[i] == backedge ||
+                    (ckpt_pcs[i] >= head && ckpt_pcs[i] <= backedge))
+                    hits++;
+            }
+            if (hits >= 2)
+                repeated = 1;
+        }
+        if (nsites == sites_cap) {
+            sites_cap = sites_cap ? sites_cap * 2 : 32;
+            sites = xrealloc(sites, sites_cap * sizeof(*sites));
+        }
+        struct strict_site *st = &sites[nsites++];
+        memset(st, 0, sizeof(*st));
+        if (in_loop && repeated) {
+            st->head = head;
+            /* K ≈ 窗口内该循环执行的迭代次数 */
+            uint64_t body_len = (backedge + 4 - head) / 4;
+            uint64_t total = count_to > count_from
+                                 ? count_to - count_from : 1;
+            size_t inloop = 0;
+            for (size_t i = 0; i < nckpt_pcs; i++) {
+                if (ckpt_pcs[i] >= head && ckpt_pcs[i] <= backedge)
+                    inloop++;
+            }
+            uint64_t frac = nckpt_pcs ? inloop * 100 / nckpt_pcs : 100;
+            uint64_t iters = total * frac / 100 / (body_len ? body_len : 1);
+            if (iters < 1)
+                iters = 1;
+            st->rec_id = (int)iters;    /* 复用字段存迭代数 */
+            /* 回边无条件 (do-while): patch 回边 → 跳板 counter;
+               回边条件 (while): 必须保留循环自身退出语义, 改为在
+               目标指令 P 上计数 (执行原指令后继续), 否则强制迭代
+               会破坏 j<n 之类条件导致越界。 */
+            uint32_t back_w = a64_insn(code + (backedge - segs[seg_idx].vaddr));
+            uint32_t exit_w = a64_insn(code +
+                                (exit_override - segs[seg_idx].vaddr));
+            int exit_pc_rel = a64_is_adr(exit_w) || a64_is_adrp(exit_w) ||
+                              a64_is_ldr_literal(exit_w) || a64_is_b(exit_w) ||
+                              a64_is_bl(exit_w) || a64_is_bcond(exit_w) ||
+                              a64_is_cbz(exit_w) || a64_is_cbnz(exit_w) ||
+                              a64_is_tbz(exit_w) || a64_is_tbnz(exit_w);
+            if (a64_is_b(back_w)) {
+                st->pc = backedge;
+                st->kind = 2;
+                fprintf(stderr, "strict: exit in do-while loop "
+                        "[%#llx,%#llx] @%#llx K=%llu (patch backedge)\n",
+                        (unsigned long long)head,
+                        (unsigned long long)backedge,
+                        (unsigned long long)exit_override,
+                        (unsigned long long)iters);
+            } else if (!exit_pc_rel) {
+                st->pc = exit_override;
+                st->kind = 3;
+                fprintf(stderr, "strict: exit in while loop "
+                        "[%#llx,%#llx] @%#llx K=%llu (count target insn)\n",
+                        (unsigned long long)head,
+                        (unsigned long long)backedge,
+                        (unsigned long long)exit_override,
+                        (unsigned long long)iters);
+            } else {
+                st->pc = exit_override;
+                st->kind = 1;
+                warn("strict: exit target is PC-relative in conditional "
+                     "loop; using first-hit exit (window approximate)");
+            }
+        } else {
+            st->pc = exit_override;
+            st->kind = 1;
+            fprintf(stderr, "strict: exit at unique path %#llx\n",
+                    (unsigned long long)exit_override);
+        }
+    }
+
+    if (!nsites) {
+        *pl_out = NULL;
+        *npl_out = 0;
+        free(sites);
+        return 0;
+    }
+
+    /* 3. 预映射未来 newseg (回放记录中的新段, 补偿代码直接写入) */
+    for (size_t k = 0; k < nrecs; k++) {
+        const uint8_t *nd = recs[k].newseg.data;
+        size_t off = 0;
+        for (uint64_t j = 0; j < recs[k].n_newseg; j++) {
+            uint64_t vaddr, filesz, memsz;
+            memcpy(&vaddr, nd + off, 8);
+            memcpy(&filesz, nd + off + 8, 8);
+            memcpy(&memsz, nd + off + 16, 8);
+            off += 32 + filesz;
+            if (!range_covered(segs, nsegs, pl, npl, vaddr, memsz))
+                spload_add(&pl, &npl, &pl_cap, vaddr, memsz,
+                           PF_R | PF_W | PF_X);
+        }
+    }
+
+    /* 4. 栈预留 (零填充, 在 [stack] 下方) */
+    if (stack_reserve) {
+        uint64_t sv = 0;
+        for (size_t i = 0; i < nsegs; i++) {
+            const char *nm = sn_str(s, segs[i].name_off);
+            if (strstr(nm, "[stack]")) {
+                sv = segs[i].vaddr;
+                break;
+            }
+        }
+        if (sv && sv >= stack_reserve) {
+            if (!range_covered(segs, nsegs, pl, npl,
+                               sv - stack_reserve, stack_reserve))
+                spload_add(&pl, &npl, &pl_cap, sv - stack_reserve,
+                           stack_reserve, PF_R | PF_W);
+            fprintf(stderr, "strict: stack reserve %llu MB below %#llx\n",
+                    (unsigned long long)(stack_reserve >> 20),
+                    (unsigned long long)sv);
+        }
+    }
+
+    /* 5. 站点块 (syscall: 304B; loop 回边: 24B; 计数退出: 40B) */
+    *replay_abs = rabs;
+    /* blob 当前尺寸可能非 16B 对齐 (payload 大小不定), 站点块内嵌
+       可执行指令 (计数退出 [16]/[32] 等) 必须对齐, 先补齐 */
+    if (blob->size & 15)
+        buf_zero(blob, 16 - (blob->size & 15));
+    for (size_t i = 0; i < nsites; i++) {
+        struct strict_site *st = &sites[i];
+        if (st->kind == 0) {
+            st->block_addr = base + blob->size;
+            buf_zero(blob, 304);   /* 24B 头 + 31×8 保存槽 + brk/tid/游标 */
+        } else if (st->kind == 2) {
+            st->block_addr = base + blob->size;
+            buf_zero(blob, 24);
+        } else if (st->kind == 3) {
+            st->block_addr = base + blob->size;
+            buf_zero(blob, 40);
+        }
+        if (blob->size & 15)      /* 每块 16B 对齐 (内嵌指令) */
+            buf_zero(blob, 16 - (blob->size & 15));
+    }
+    /* 填站点块内容 */
+    for (size_t i = 0; i < nsites; i++) {
+        struct strict_site *st = &sites[i];
+        if (st->kind == 0) {
+            uint8_t *b = blob->data + (st->block_addr - base);
+            uint64_t v;
+            v = st->pc;             memcpy(b + 0, &v, 8);
+            v = st->pc + 4;             memcpy(b + 8, &v, 8);
+            v = replay_off ? rabs : 0;  memcpy(b + 16, &v, 8);
+            v = heap_end;               memcpy(b + 272, &v, 8);
+            v = s->h.task_tid;          memcpy(b + 280, &v, 8);
+            v = (uint64_t)(st->rec_id >= 0 ? st->rec_id : 0);
+            memcpy(b + 288, &v, 8);     /* 游标初始 = 首个记录索引 */
+        } else if (st->kind == 2) {
+            uint8_t *b = blob->data + (st->block_addr - base);
+            uint64_t v;
+            v = (uint64_t)st->rec_id;   memcpy(b + 0, &v, 8);
+            v = st->head;               memcpy(b + 8, &v, 8);
+            memcpy(b + 16, &exit_abs, 8);
+        } else if (st->kind == 3) {
+            uint8_t *b = blob->data + (st->block_addr - base);
+            uint64_t v;
+            uint32_t w;
+            v = (uint64_t)st->rec_id;   memcpy(b + 0, &v, 8);  /* counter */
+            memcpy(b + 8, &exit_abs, 8);
+            /* 原始指令 (执行于 blob, 随后跳回 P+4; 仅限非 PC 相对) */
+            for (size_t k = 0; k < nsegs; k++) {
+                if (exit_override >= segs[k].vaddr &&
+                    exit_override < segs[k].vaddr + segs[k].filesz) {
+                    const uint8_t *q = blob->data + payload_off +
+                        segs[k].payload_off +
+                        (exit_override - segs[k].vaddr);
+                    memcpy(b + 16, q, 4);
+                    break;
+                }
+            }
+            w = 0x58000070U;    /* ldr x16, [pc, #12] → ret_addr */
+            memcpy(b + 20, &w, 4);
+            w = 0xD61F0200U;    /* br x16 */
+            memcpy(b + 24, &w, 4);
+            w = 0xD503201FU;    /* nop */
+            memcpy(b + 28, &w, 4);
+            v = st->pc + 4;     /* ret_addr */
+            memcpy(b + 32, &v, 8);
+        }
+    }
+
+    /* 6. 跳板页: 按可执行段分组, 每段一个 16B/站点 的页 */
+    for (size_t gi = 0; gi < nsegs; gi++) {
+        size_t cnt = 0;
+        for (size_t i = 0; i < nsites; i++) {
+            if (sites[i].pc >= segs[gi].vaddr &&
+                sites[i].pc < segs[gi].vaddr + segs[gi].filesz)
+                cnt++;
+        }
+        if (!cnt)
+            continue;
+        uint64_t need = ((cnt * 32 + 0xfff) & ~0xfffULL);
+        uint64_t taddr = find_gap_near(segs, nsegs, pl, npl,
+                                       segs[gi].vaddr + segs[gi].filesz,
+                                       need);
+        if (!taddr)
+            taddr = find_gap_near(segs, nsegs, pl, npl,
+                                  segs[gi].vaddr > need
+                                      ? segs[gi].vaddr - need : 0,
+                                  need);
+        if (!taddr)
+            die("strict: cannot place trampoline page near %#llx "
+                "(code too dense / >128MB away)",
+                (unsigned long long)segs[gi].vaddr);
+        spload_add(&pl, &npl, &pl_cap, taddr, need, PF_R | PF_W | PF_X);
+        uint8_t *page = xcalloc(1, need);
+        size_t o = 0;
+        for (size_t i = 0; i < nsites; i++) {
+            struct strict_site *st = &sites[i];
+            if (st->pc < segs[gi].vaddr ||
+                st->pc >= segs[gi].vaddr + segs[gi].filesz)
+                continue;
+            st->tramp_addr = taddr + o;
+            /* 32B 条目: ldr x16,[pc,#16]; ldr x17,[pc,#20]; br x17; nop;
+               .quad data_block; .quad handler_code */
+            uint32_t w;
+            w = 0x58000090U;        /* ldr x16, [pc, #16] */
+            memcpy(page + o, &w, 4);
+            w = 0x580000B1U;        /* ldr x17, [pc, #20] (第二个 literal) */
+            memcpy(page + o + 4, &w, 4);
+            w = 0xD61F0220U;        /* br x17 */
+            memcpy(page + o + 8, &w, 4);
+            w = 0xD503201FU;        /* nop */
+            memcpy(page + o + 12, &w, 4);
+            uint64_t block = st->block_addr;
+            uint64_t code = comp_abs;
+            if (st->kind == 1) {
+                block = exit_abs;   /* exit: 两槽都指向退出代码 */
+                code = exit_abs;
+            } else if (st->kind == 2) {
+                code = loop_abs;
+            } else if (st->kind == 3) {
+                code = count_abs;
+            }
+            memcpy(page + o + 16, &block, 8);
+            memcpy(page + o + 24, &code, 8);
+            o += 32;
+        }
+        /* 记录页面数据供组装段发射 */
+        for (size_t i = 0; i < npl; i++) {
+            if (pl[i].vaddr == taddr) {
+                pl[i].filesz = need;
+                pl[i].data = page;
+                break;
+            }
+        }
+    }
+
+    /* 7. patch 目标代码: svc/回边/退出指令 → b <跳板> */
+    for (size_t i = 0; i < nsites; i++) {
+        struct strict_site *st = &sites[i];
+        uint8_t *p = NULL;
+        for (size_t k = 0; k < nsegs; k++) {
+            if (st->pc >= segs[k].vaddr &&
+                st->pc < segs[k].vaddr + segs[k].filesz) {
+                p = blob->data + payload_off +
+                    segs[k].payload_off + (st->pc - segs[k].vaddr);
+                break;
+            }
+        }
+        if (!p) {
+            warn("strict: site %#llx not in payload, skipped",
+                 (unsigned long long)st->pc);
+            continue;
+        }
+        uint32_t w = a64_encode_b(st->pc, st->tramp_addr);
+        if (!w)
+            die("strict: cannot encode branch from %#llx to %#llx "
+                "(>128MB)",
+                (unsigned long long)st->pc,
+                (unsigned long long)st->tramp_addr);
+        memcpy(p, &w, 4);
+    }
+
+    *pl_out = pl;
+    *npl_out = npl;
+    free(sites);
+    return 0;
+}
+#endif /* __aarch64__ */
 
 /* 找出放置 blob 的空闲 gap */
 static uint64_t pick_base(const struct snap *s, uint64_t blob_size)
@@ -298,6 +843,8 @@ int build_main(int argc, char **argv)
     uint64_t ipc_period = 0;
     uint64_t breakpoint = 0;    /* 注入 int3 的地址 (0 = 无) */
     int mode_baremetal = 1;   /* 默认 baremetal */
+    int bm_strict = 0;        /* aarch64: ELF loader 型无 syscall baremetal */
+    uint64_t stack_reserve = 0;  /* strict: [stack] 下方预留字节 */
     const char *ckpts = NULL;   /* trace 检查点目录 */
     long from_ckpt = -1, to_ckpt = -1;
     struct snap s = {0};
@@ -316,6 +863,13 @@ int build_main(int argc, char **argv)
     uint64_t replay_off = 0;    /* baremetal syscall 回放表 (blob 相对) */
     uint64_t replay_size = 0;
     uint64_t stack_vaddr = 0;   /* [stack] 段 vaddr (MAP_GROWSDOWN) */
+    /* strict 循环判定用: 窗口内检查点 PC 与计数 */
+    uint64_t *ckpt_pcs = NULL;
+    size_t nckpt_pcs = 0;
+    uint64_t ckpt_count0 = 0, ckpt_count_to = 0;
+    struct strict_pload *sploads = NULL;
+    size_t n_sploads = 0;
+    uint64_t strict_replay_abs = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -331,6 +885,11 @@ int build_main(int argc, char **argv)
                 mode_baremetal = 1;
             else
                 die("--mode must be real or baremetal");
+        } else if (strcmp(argv[i], "--bm-strict") == 0) {
+            bm_strict = 1;
+        } else if (strcmp(argv[i], "--stack-reserve") == 0 &&
+                   i + 1 < argc) {
+            stack_reserve = strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--checkpoints") == 0 && i + 1 < argc) {
             ckpts = argv[++i];
             /* bundle 单文件: 解包到临时目录 */
@@ -350,13 +909,25 @@ int build_main(int argc, char **argv)
         } else {
             die("usage: elftrace build <file.elftrace> [-o out.elf] "
                 "[--mode real|baremetal] [--ipc N] [--checkpoints DIR] "
-                "[--from K] [--to M] [--breakpoint ADDR]");
+                "[--from K] [--to M] [--breakpoint ADDR] "
+                "[--bm-strict] [--stack-reserve N]");
         }
     }
     if (!in)
         die("usage: elftrace build <file.elftrace> [-o out.elf] "
             "[--mode real|baremetal] [--ipc N] [--checkpoints DIR] "
-            "[--from K] [--to M] [--breakpoint ADDR]");
+            "[--from K] [--to M] [--breakpoint ADDR] "
+            "[--bm-strict] [--stack-reserve N]");
+#if !defined(__aarch64__)
+    if (bm_strict)
+        die("--bm-strict is only supported on aarch64 builds");
+#endif
+    if (bm_strict && !mode_baremetal)
+        die("--bm-strict requires --mode baremetal");
+    if (stack_reserve && !bm_strict)
+        die("--stack-reserve requires --bm-strict");
+    if (bm_strict && stack_reserve == 0)
+        stack_reserve = 256UL << 20;   /* 默认预留 256MB (100M 指令切片) */
 
     /* --from/--to: 用 trace 检查点替代基础镜像并确定退出点 */
     uint64_t syscall_start = 0, syscall_end = UINT64_MAX;
@@ -367,6 +938,7 @@ int build_main(int argc, char **argv)
         uint64_t count0 = 0, ip0 = 0;
         uint64_t count_to = 0, ip_to = 0;
         long idx = 0, found_from = -1;
+        size_t ckpt_cap = 0;
 
         if (from_ckpt < 0)
             from_ckpt = 0;
@@ -382,6 +954,11 @@ int build_main(int argc, char **argv)
                             file, &nsys);
             if (nf < 3)
                 continue;
+            if (nckpt_pcs == ckpt_cap) {
+                ckpt_cap = ckpt_cap ? ckpt_cap * 2 : 64;
+                ckpt_pcs = xrealloc(ckpt_pcs, ckpt_cap * sizeof(*ckpt_pcs));
+            }
+            ckpt_pcs[nckpt_pcs++] = ip;
             if (idx == from_ckpt) {
                 snprintf(path, sizeof(path), "%s/%s", ckpts, file);
                 in = xstrdup(path);
@@ -401,6 +978,16 @@ int build_main(int argc, char **argv)
             idx++;
         }
         fclose(f);
+        /* 仅保留窗口内检查点 PC (循环判定用) */
+        {
+            size_t keep = 0;
+            for (size_t i = 0; i < nckpt_pcs; i++) {
+                if ((long)i >= from_ckpt &&
+                    (to_ckpt < 0 || (long)i <= to_ckpt))
+                    ckpt_pcs[keep++] = ckpt_pcs[i];
+            }
+            nckpt_pcs = keep;
+        }
         if (found_from < 0)
             die("checkpoint %ld not found in %s", from_ckpt, path);
         if (to_ckpt >= 0 && idx <= to_ckpt)
@@ -408,6 +995,10 @@ int build_main(int argc, char **argv)
         fprintf(stderr, "build: base = checkpoint %ld (count %llu, pc %#llx)\n",
                 found_from, (unsigned long long)count0,
                 (unsigned long long)ip0);
+        ckpt_count0 = count0;
+        ckpt_count_to = count_to;
+        if (to_ckpt < 0)
+            ckpt_count_to = UINT64_MAX;   /* 无 --to: 窗口延伸到末尾 */
 
         /* 增量检查点: 从 base (ckpt_000000 完整) 应用 1..from_ckpt 差异链,
            合成完整快照到临时文件。仅当检查点 1 是 diff 格式时启用;
@@ -476,9 +1067,10 @@ int build_main(int argc, char **argv)
 
         if (to_ckpt >= 0) {
             if (mode_baremetal) {
-                /* 退出地址 = 检查点 to 的 pc (替换该处指令) */
+                /* 退出地址 = 检查点 to 的 pc (替换该处指令);
+                   strict 模式退出由跳板/循环 counter 完成, 不装 perf IPC */
                 exit_override = ip_to;
-                if (ipc_period == 0)
+                if (!bm_strict && ipc_period == 0)
                     ipc_period = count_to - count0;
             } else {
                 /* real: 用 perf 计数 (ipc_period = 区间指令数) */
@@ -597,8 +1189,9 @@ int build_main(int argc, char **argv)
     fprintf(stderr, "build: blob %llu bytes at base %#llx\n",
             (unsigned long long)blob_total, (unsigned long long)base);
 
-    /* 3.5 baremetal: 段表加载后确定 brk 边界与退出地址的 blob 位置 */
-    if (mode_baremetal) {
+    /* 3.5 baremetal: 段表加载后确定 brk 边界与退出地址的 blob 位置
+       (strict 模式由 build_strict 统一处理, 跳过 brk 替换) */
+    if (mode_baremetal && !bm_strict) {
         if (exit_override) {
             int hit = 0;
             for (size_t i = 0; i < s.h.nsegs; i++) {
@@ -629,11 +1222,7 @@ int build_main(int argc, char **argv)
        替换之后 (见 3.5b)。 */
     replay_off = 0;
     replay_size = 0;
-    struct rec_tmp {
-        uint64_t pc, sysno, rax;
-        uint64_t n_unmap, n_newseg, n_dirty;
-        struct buf unmap, newseg, dirty;
-    } *recs = NULL;
+    struct rec_tmp *recs = NULL;
     size_t nrecs = 0, rec_cap = 0;
     int have_map = 0;         /* 找到 syscall.map (有回放数据) */
     if (mode_baremetal && ckpts) {
@@ -646,17 +1235,40 @@ int build_main(int argc, char **argv)
             char line[1024];
             while (fgets(line, sizeof line, mf)) {
                 char fname[256];
-                char tag[8] = "";
-                uint64_t pc, sysno;
-                if (sscanf(line, "%llx %llu %255s %7s", &pc, &sysno,
-                           fname, tag) < 3)
+                char f4[32] = "", f5[32] = "";
+                uint64_t pc, sysno, rec_count = UINT64_MAX;
+                int nf = sscanf(line, "%llx %llu %255s %31s %31s",
+                                &pc, &sysno, fname, f4, f5);
+                if (nf < 3)
                     continue;
-                /* 只保留切片区间 [syscall_start, syscall_end) 内的记录:
-                   切片从检查点 from 恢复, from 之前的 syscall 不执行 */
-                if (map_idx < syscall_start ||
-                    map_idx >= syscall_end) {
-                    map_idx++;
-                    continue;
+                int interrupted = 0;
+                if (nf >= 4) {
+                    if (strcmp(f4, "I") == 0) {
+                        interrupted = 1;   /* 旧格式: 4 字段被打断标记 */
+                        if (nf >= 5)
+                            rec_count = strtoull(f5, NULL, 10);
+                    } else {
+                        rec_count = strtoull(f4, NULL, 10);
+                    }
+                }
+                /* 只保留切片区间内的记录:
+                   - 新格式 (map 第 5 字段 = 捕获时 perf 计数): 按
+                     [count_from, count_to) 过滤 — manifest 的 nsys 字段
+                     滞后不可靠 (perf 溢出与 syscall-stop 异步处理,
+                     窗口内 syscall 会被误删)。
+                   - 旧格式: 按 manifest nsys 索引过滤 (兼容) */
+                if (rec_count != UINT64_MAX) {
+                    if (rec_count < ckpt_count0 ||
+                        rec_count >= ckpt_count_to) {
+                        map_idx++;
+                        continue;
+                    }
+                } else {
+                    if (map_idx < syscall_start ||
+                        map_idx >= syscall_end) {
+                        map_idx++;
+                        continue;
+                    }
                 }
                 map_idx++;
                 /* 悬空的被打断 syscall 记录 (map 第 4 字段 "I"):
@@ -666,7 +1278,8 @@ int build_main(int argc, char **argv)
                    会错误消费下一条同 pc 的 syscall (libc 共享
                    trampoline 场景, 曾致 read 被回放成已完成的
                    nanosleep 而返回 EOF)。 */
-                if (tag[0] == 'I' && pc + 2 == resume_pc) {
+                if (interrupted &&
+                    pc + ARCH_SYSCALL_LEN == resume_pc) {
                     fprintf(stderr, "build: drop dangling interrupted "
                             "syscall rec (pc %#llx, resume pc %#llx)\n",
                             (unsigned long long)pc,
@@ -748,7 +1361,7 @@ int build_main(int argc, char **argv)
        长 2 → int3; aarch64 svc #0 (d4000001) 长 4 → brk #0 (d4200000),
        断点打在 pc-ARCH_SYSCALL_LEN。trace 被打断的 syscall 记录 pc
        已修正为 syscall 地址本身, 检查 blob[pc] 即可)。 */
-    if (mode_baremetal) {
+    if (mode_baremetal && !bm_strict) {
         if (nrecs) {
             /* 回放路径: 只替换 trace 记录过的 syscall 指令。
                这是权威的 syscall 地址表, 不做全段字节扫描 —
@@ -931,13 +1544,6 @@ int build_main(int argc, char **argv)
         free(newseg_off);
         free(dirty_off);
     }
-    for (size_t i = 0; i < nrecs; i++) {
-        free(recs[i].unmap.data);
-        free(recs[i].newseg.data);
-        free(recs[i].dirty.data);
-    }
-    free(recs);
-
     /* 3.6 堆尾/栈段定位 (real 与 baremetal 共用)
        取第一个 [heap] 段: 真实 brk 区域 (mmap 的大块匿名段也可能被
        内核标为 [heap], 但真实 brk 指针是第一个) */
@@ -950,6 +1556,31 @@ int build_main(int argc, char **argv)
         if (strstr(nm, "[stack]"))
             stack_vaddr = segs[i].vaddr;
     }
+
+    /* 3.7 strict baremetal (aarch64): ELF loader 全内存 + 分支补偿 */
+#if defined(__aarch64__)
+    if (mode_baremetal && bm_strict) {
+        if (build_strict_aarch64(&s, &blob, base, blob_total, payload_off,
+                                 segs,
+                                 recs, nrecs, have_map, exit_override,
+                                 ckpt_pcs, nckpt_pcs,
+                                 ckpt_count0, ckpt_count_to,
+                                 stack_reserve, replay_off,
+                                 heap_end,
+                                 &sploads, &n_sploads,
+                                 &strict_replay_abs) != 0)
+            die("strict baremetal build failed");
+        blob_total = blob.size;
+        fprintf(stderr, "build: strict baremetal: %zu extra PT_LOADs\n",
+                n_sploads);
+    }
+#endif
+    for (size_t i = 0; i < nrecs; i++) {
+        free(recs[i].unmap.data);
+        free(recs[i].newseg.data);
+        free(recs[i].dirty.data);
+    }
+    free(recs);
 
     /* 4. 补丁 desc */
     if (memcmp(blob.data + RST_DESC_MAGIC, &(uint64_t){RST_DESC_MAGIC_VAL},
@@ -981,6 +1612,7 @@ int build_main(int argc, char **argv)
     blob_patch_u64(blob.data, RST_DESC_RLIM_STACK_CUR, s.h.rlim_stack_cur);
     blob_patch_u64(blob.data, RST_DESC_RLIM_STACK_MAX, s.h.rlim_stack_max);
     blob_patch_u64(blob.data, RST_DESC_TLS, s.h.tls);
+    blob_patch_u64(blob.data, RST_DESC_BM_STYLE, bm_strict ? 1 : 0);
     blob_patch_u64(blob.data, RST_DESC_REPLAY_OFF, replay_off);
     blob_patch_u64(blob.data, RST_DESC_REPLAY_SIZE, replay_size);
     blob_patch_u64(blob.data, RST_DESC_REPLAY_CUR, 0);
@@ -1016,10 +1648,14 @@ int build_main(int argc, char **argv)
     /* 5. 组装 ELF */
     buf_init(&file);
     Elf64_Ehdr eh;
-    Elf64_Phdr ph[2];
+    Elf64_Phdr *ph;
     Elf64_Shdr *sh;
     int nsh;
     int symtab_idx = -1, strtab_idx = -1;
+    int strict_elf = 0;
+#if defined(__aarch64__)
+    strict_elf = (mode_baremetal && bm_strict);
+#endif
 
     /* 节规划: 0=null, 1=.rst, 2..2+naux-1=aux(调试节), 2+naux=.shstrtab */
     nsh = 3 + s.h.aux_n;
@@ -1037,15 +1673,92 @@ int build_main(int argc, char **argv)
 
     /* ---- 布局:
        [0x000] ehdr (64)
-       [0x040] phdr x2 (112)  -> 0xC0
+       [0x040] phdr xN
        [0x1000] blob (blob_total)
-       [shoff]  aux 节数据 (调试节内容)
+       [之后]   strict: 各内存段/跳板页内容 (页对齐)
+       [之后]   aux 节数据 (调试节内容)
        [之后]   shstrtab 数据
        [e_shoff] 节头表
     */
     uint64_t blob_file_off = 0x1000;
-    uint64_t shoff = (blob_file_off + blob_total + 7) & ~7ULL;
-    uint64_t aux_data_off = shoff;
+    uint64_t data_off = (blob_file_off + blob_total + 0xfff) & ~0xfffULL;
+    uint64_t aux_data_off = data_off;
+
+    /* strict: 排序后的附加 PT_LOAD (初始段 + strict ploads) */
+    struct strict_emit {
+        uint64_t vaddr, filesz, memsz;
+        const uint8_t *data;
+        int is_seg;
+        size_t idx;
+    } *sem = NULL;
+    size_t n_sem = 0;
+    if (strict_elf) {
+        n_sem = s.h.nsegs + n_sploads;
+        sem = xcalloc(n_sem, sizeof(*sem));
+        for (size_t i = 0; i < s.h.nsegs; i++) {
+            sem[i].vaddr = segs[i].vaddr;
+            sem[i].filesz = segs[i].filesz;
+            sem[i].memsz = segs[i].memsz;
+            /* 必须用 blob 内的副本: syscall/退出点已在 blob payload 中
+               patch (b <跳板>), 快照文件里是原始指令 */
+            sem[i].data = blob.data + payload_off + segs[i].payload_off;
+            sem[i].is_seg = 1;
+            sem[i].idx = i;
+        }
+        for (size_t i = 0; i < n_sploads; i++) {
+            sem[s.h.nsegs + i].vaddr = sploads[i].vaddr;
+            sem[s.h.nsegs + i].filesz = sploads[i].filesz;
+            sem[s.h.nsegs + i].memsz = sploads[i].memsz;
+            sem[s.h.nsegs + i].data = sploads[i].data;
+            sem[s.h.nsegs + i].is_seg = 0;
+            sem[s.h.nsegs + i].idx = i;
+        }
+        /* 按 vaddr 稳定排序 (同 vaddr 保持追加顺序, 后者覆盖前者) */
+        for (size_t i = 1; i < n_sem; i++) {
+            struct strict_emit t = sem[i];
+            size_t j = i;
+            while (j > 0 && sem[j - 1].vaddr > t.vaddr) {
+                sem[j] = sem[j - 1];
+                j--;
+            }
+            sem[j] = t;
+        }
+    }
+    size_t nload = 2 + (strict_elf ? n_sem : 0);
+    ph = xcalloc(nload, sizeof(*ph));
+    size_t nload_used = 0;
+    ph[nload_used++] = (Elf64_Phdr){
+        .p_type = PT_LOAD,
+        .p_flags = PF_R | PF_W | PF_X,
+        .p_offset = blob_file_off,
+        .p_vaddr = base,
+        .p_paddr = base,
+        .p_filesz = blob_total,
+        .p_memsz = blob_total,
+        .p_align = 0x1000,
+    };
+    for (size_t i = 0; i < n_sem; i++) {
+        Elf64_Phdr *p = &ph[nload_used++];
+        p->p_type = PT_LOAD;
+        p->p_flags = PF_R | PF_W | PF_X;   /* strict: 统一 RWX, 补偿直接写 */
+        p->p_vaddr = sem[i].vaddr;
+        p->p_paddr = sem[i].vaddr;
+        p->p_filesz = sem[i].filesz;
+        p->p_memsz = sem[i].memsz;
+        p->p_align = 0x1000;
+        if (sem[i].filesz) {
+            p->p_offset = data_off;
+            data_off = (data_off + sem[i].filesz + 0xfff) & ~0xfffULL;
+        } else {
+            p->p_offset = data_off;   /* 纯 BSS: 无文件数据 */
+        }
+    }
+    ph[nload_used++].p_type = PT_GNU_STACK;
+    ph[nload - 1].p_flags = PF_R | PF_W;
+    ph[nload - 1].p_align = 0x10;
+    if (nload_used != nload)
+        die("internal: phdr count mismatch");
+    aux_data_off = data_off;
     for (size_t i = 0; i < s.h.aux_n; i++) {
         elftrace_aux *a = (elftrace_aux *)(s.file + s.h.aux_off) + i;
         size_t si = 2 + i;
@@ -1107,28 +1820,22 @@ int build_main(int argc, char **argv)
     eh.e_flags = 0;
     eh.e_ehsize = 64;
     eh.e_phentsize = sizeof(Elf64_Phdr);
-    eh.e_phnum = 2;
+    eh.e_phnum = (uint16_t)nload;
     eh.e_shentsize = sizeof(Elf64_Shdr);
     eh.e_shnum = nsh;
     eh.e_shstrndx = 2 + s.h.aux_n;
 
-    memset(&ph, 0, sizeof(ph));
-    ph[0].p_type = PT_LOAD;
-    ph[0].p_flags = PF_R | PF_W | PF_X;
-    ph[0].p_offset = blob_file_off;
-    ph[0].p_vaddr = base;
-    ph[0].p_paddr = base;
-    ph[0].p_filesz = blob_total;
-    ph[0].p_memsz = blob_total;
-    ph[0].p_align = 0x1000;
-    ph[1].p_type = PT_GNU_STACK;
-    ph[1].p_flags = PF_R | PF_W;
-    ph[1].p_align = 0x10;
-
     buf_append(&file, &eh, sizeof(eh));
-    buf_append(&file, &ph, sizeof(ph));
+    buf_append(&file, ph, nload * sizeof(*ph));
     buf_zero(&file, blob_file_off - file.size);
     buf_append(&file, blob.data, blob_total);
+    /* strict: 各内存段/跳板页内容 (按 phdr 顺序发射) */
+    for (size_t i = 0; i < n_sem; i++) {
+        if (!sem[i].filesz)
+            continue;
+        buf_zero(&file, ph[1 + i].p_offset - file.size);
+        buf_append(&file, sem[i].data, sem[i].filesz);
+    }
     /* aux 数据 */
     for (size_t i = 0; i < s.h.aux_n; i++) {
         elftrace_aux *a = (elftrace_aux *)(s.file + s.h.aux_off) + i;

@@ -154,3 +154,53 @@ tests/run_tests.sh   # 一键运行全部 17 项测试（basic/dbg/fd/ipc/cpp/fd
 - 内核 ucontext: uc_mcontext 实测在 uc+0xB0, __reserved 16B 对齐
   (sc+0x120), rt_sigreturn 强制 fpsimd context — 改 frame 布局前
   必读 src/stub_aarch64.S 顶部的注释。
+
+## aarch64 strict baremetal (--bm-strict, ELF loader 型)
+
+真机 (postmarketOS aarch64) 验证通过。目标: 运行期除 execve +
+exit_group 外零 syscall。
+
+- 内存布局: build 把所有初始段、窗口内未来 newseg (回放记录)、栈预留
+  (`--stack-reserve`, 默认 256MB)、跳板页全部发成 PT_LOAD, 由 ELF
+  loader 建立; stub 跳过运行时 mmap/mprotect/munmap。
+- syscall 替换: 目标代码 `svc #0` (d4000001) 定点替换为 `b <跳板>`;
+  跳板 32B 条目 (ldr x16,[pc,#16]; ldr x17,[pc,#20]; br x17; nop;
+  .quad data_block; .quad handler) → comp_engine (STUB_STRICT_COMP_OFF):
+  - 站点块 304B: pc / ret_addr / replay_abs / x0-x30 保存槽 / brk 边界 /
+    target_tid / 游标;
+  - 引擎按 pc 从游标顺序扫描回放表 (同 pc 多记录正确消费), 无表
+    (replay_abs=0) 或越界走 mock; 回放只做纯访存 (newseg/dirty 拷贝),
+    恢复现场 (x0=rax, 仅 x16/x17 破坏);
+  - **rec 指针必须保存在 x23** (memcpy 破坏 x0-x5, 曾致 dirty 循环后
+    rax 读错/越界)。
+- 退出点:
+  - 唯一路径: 目标指令 → `b <exit 跳板>` → strict_exit_code
+    (STUB_STRICT_EXIT_OFF, exit_group(0));
+  - do-while 循环 (回边无条件): patch 回边 → loop_handler
+    (STUB_STRICT_LOOP_OFF), counter 决定何时退出;
+  - while 循环 (回边条件): **不能 patch 回边** (会破坏循环退出语义,
+    如 j<n 越界); 改为 patch 目标指令 → count_handler
+    (STUB_STRICT_COUNT_OFF), 计数器到 0 → 退出, 否则执行 blob 内
+    原指令副本 (仅限非 PC 相对指令) 后跳回 P+4;
+  - 站点块/跳板必须 16B 对齐 (内嵌可执行指令; blob 尺寸可能非对齐,
+    build 已补)。
+- 采集侧:
+  - collect_tls_jit 对已 SIGSTOP 目标需要 SIGCONT 放行一次再等 brk;
+  - collect_snapshot_load 必须带出 tls/rlim/exe 字段 (增量合成否则丢);
+  - aarch64 syscall entry-stop 的 ip 指向 svc 本身 (detect_in_syscall
+    查 pc 而非 pc-4);
+  - syscall.map 每条记录追加捕获时 perf 计数 (第 5 字段), build 按
+    [count_from, count_to) 过滤窗口 (manifest 的 nsys 滞后不可靠);
+  - trace 的 perf ring sample 在频繁 syscall-stop 下可能首样本后哑掉,
+    有 read 计数器兜底。
+
+## aarch64 测试
+
+- tests/test_strict.sh: freeze mock / trace 回放中间窗口 / ioctl 设备
+  操作负载 (prog_ioctl.c)。
+- tests/test_realworld.sh: CRC32 文件校验 (prog_crc32.c)、RLE 压缩
+  (prog_lz.c)、JSON 数字解析 (prog_json.c) — 每负载 trace 全程 +
+  全窗口 strict 切片 (rc == ref) + 中间窗口切片 (rc=0, 零 syscall)。
+  注意: 真机每 syscall 采集约 20-40s (全量内存 diff), 数据量需控制在
+  trace 超时内 (32MB/4MB 块 ≈ 8-16 syscall)。
+- 其余 baremetal 测试在 aarch64 上自动加 --bm-strict。

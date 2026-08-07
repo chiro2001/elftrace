@@ -1,8 +1,11 @@
-# 目标架构: x86_64 (本机构建) / aarch64 (交叉构建)
-#   make                 # x86_64
-#   make ARCH=aarch64    # aarch64 交叉构建 (需 aarch64-linux-gnu-* 工具链)
+# 目标架构: x86_64 (本机构建) / aarch64
+#   make                  # 本机架构
+#   make ARCH=aarch64     # aarch64 (本机即 aarch64 时用原生工具链;
+#                         # 在 x86_64 交叉构建需 aarch64-linux-gnu-* 工具链)
 ARCH    ?= $(shell uname -m)
-ifeq ($(ARCH),aarch64)
+ifeq ($(ARCH),$(shell uname -m))
+CROSS   :=
+else ifeq ($(ARCH),aarch64)
 CROSS   := aarch64-linux-gnu-
 else
 ARCH    := x86_64
@@ -25,7 +28,7 @@ TOOLS   := $(BUILD)/elftrace
 OBJS    := $(BUILD)/main.o $(BUILD)/util.o $(BUILD)/freeze.o $(BUILD)/collect.o \
 	$(BUILD)/build.o $(BUILD)/dump.o $(BUILD)/dwarf.o $(BUILD)/trace.o \
 	$(BUILD)/inject.o $(BUILD)/bundle.o $(BUILD)/bundle_main.o \
-	$(BUILD)/stub_blob_$(ARCH).o $(BUILD)/disasm.o
+	$(BUILD)/stub_blob_$(ARCH).o $(BUILD)/disasm.o $(BUILD)/a64.o
 
 all: $(TOOLS)
 

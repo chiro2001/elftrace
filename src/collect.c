@@ -84,6 +84,12 @@ void collect_tls_jit(pid_t pid)
         ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io);
         ptrace(PTRACE_CONT, pid, 0, 0);
         if (waitpid(pid, &st, 0) > 0 && WIFSTOPPED(st)) {
+            /* 目标原本被 SIGSTOP 组停: CONT 后重新进入组停, jit 片段
+               没执行; 用 SIGCONT 放行一次再等 SIGTRAP (brk) */
+            if (WSTOPSIG(st) == SIGSTOP) {
+                ptrace(PTRACE_CONT, pid, 0, SIGCONT);
+                waitpid(pid, &st, 0);
+            }
             struct user_regs_struct r2;
             struct iovec io2 = {.iov_base = &r2, .iov_len = sizeof(r2)};
             if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
@@ -700,6 +706,19 @@ static void detect_in_syscall(struct collect_snapshot *sn)
         return;
     if (REG_PC(sn->regs) < ARCH_SYSCALL_LEN)
         return;
+#if defined(__aarch64__)
+    /* aarch64 syscall entry-stop 的 pc 指向 svc 指令本身
+       (与 x86 的 rip=下一条不同) */
+    if (read_mem(sn->pid, REG_PC(sn->regs), ARCH_SYSCALL_LEN, insn, 0)
+        != ARCH_SYSCALL_LEN)
+        return;
+    if (arch_is_syscall(insn, sizeof insn)) {
+        sn->in_syscall = 1;
+        warn("tracee %d frozen inside syscall %ld; in-flight syscall "
+             "will be lost in the slice", sn->pid,
+             (long)REG_SYSCALL_NR(sn->regs));
+    }
+#else
     if (read_mem(sn->pid, REG_PC(sn->regs) - ARCH_SYSCALL_LEN,
                  ARCH_SYSCALL_LEN, insn, 0) != ARCH_SYSCALL_LEN)
         return;
@@ -709,6 +728,7 @@ static void detect_in_syscall(struct collect_snapshot *sn)
              "will be lost in the slice", sn->pid,
              (long)REG_SYSCALL_NR(sn->regs));
     }
+#endif
 }
 
 /* ---- 写出 .elftrace ---- */
@@ -1206,6 +1226,15 @@ void collect_snapshot_load(const char *path, struct collect_snapshot *sn)
         sn->xstate_size = h.fpu_size;
     }
     memcpy(sn->sigmask, f + h.sigmask_off, sizeof(sn->sigmask));
+    /* 状态字段 (增量合成必须保留, 否则区间切片丢 TLS/rlimit/exe) */
+    sn->tls = h.tls;
+    sn->rlim_stack_cur = h.rlim_stack_cur;
+    sn->rlim_stack_max = h.rlim_stack_max;
+    sn->exe_bias = h.exe_bias;
+    if (h.exe_off) {
+        sn->exe_path = xstrdup((const char *)(f + h.strings_off +
+                                              h.exe_off));
+    }
     if (h.aux_n) {
         sn->aux = xcalloc(h.aux_n, sizeof(struct caux));
         for (size_t i = 0; i < h.aux_n; i++) {

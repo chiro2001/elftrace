@@ -25,6 +25,7 @@ make                          # 需要 gcc/as/ld/objcopy
 ./build/elftrace freeze <pid> -o snap.elftrace   # 冻结并采集
 ./build/elftrace dump snap.elftrace              # 查看中间文件
 ./build/elftrace build snap.elftrace -o sliced.elf     [--mode real|baremetal] [--ipc N] [--breakpoint ADDR]
+                                                [--bm-strict] [--stack-reserve N]
 # 注意: 默认 --mode baremetal (syscall 被 mock); real 模式需显式指定
 ./sliced.elf                  # 恢复执行
 
@@ -60,6 +61,19 @@ make                          # 需要 gcc/as/ld/objcopy
 - `--ipc N`：real 模式为 perf_event_open 指令计数退出（溢出触发 SIGIO，
   打印 `IPC: <count> instructions` 后退出，返回 0）；baremetal 模式需
   配合 `--checkpoints` 确定第 N 条指令的地址。
+- `--bm-strict`（仅 aarch64）：严格 baremetal 模式（ELF loader 型）。
+  - 全部内存（初始段 + 窗口内未来 newseg + 栈预留 + 跳板页）由
+    `PT_LOAD` 程序头直接建立，切片启动不调用 mmap/mprotect/munmap；
+  - 目标代码中的 `svc #0` 定点替换为 `b <跳板>`，纯分支补偿：跳板
+    保存现场 → 按回放表游标顺序消费记录（同一 pc 多记录正确）→
+    纯访存应用内存变化 → 恢复现场（仅 x16/x17 按 ABI 约定破坏）；
+  - 运行期除开始 execve、结束 exit_group 外**零 syscall**（无信号、
+    无 brk、无 rt_sigreturn 之外的系统调用；fd 恢复仍为启动期 syscall）；
+  - 退出点：唯一路径直接埋退出；while 型循环用“目标指令计数跳板”
+    （执行原指令后继续，保留循环语义）；do-while 型循环 patch 回边 +
+    counter；
+  - `--stack-reserve N`：在 `[stack]` 下方预留 N 字节（默认 256MB，
+    覆盖最长 100M 指令切片的栈增长）。
 - `--checkpoints DIR --from K --to M`：从 trace 检查点 K 恢复、在检查点
   M 处退出（real 用 perf 计数，baremetal 用指令替换）；区间指令数 =
   (M-K)×检查点间隔。

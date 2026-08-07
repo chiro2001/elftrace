@@ -28,6 +28,14 @@ SNAP="$TF_TMP/imix_snap.elftrace"
 SLICE_R="$TF_TMP/imix_slice_real.elf"
 SLICE_B="$TF_TMP/imix_slice_bm.elf"
 
+# aarch64: DynamoRIO 无 arm64 支持, topdown/perf 对比基准为 x86 标定,
+# 且需要 /mnt/elftrace-trace 与 perf CLI —— 全部跳过
+if [ "$(uname -m)" = "aarch64" ]; then
+    echo "SKIP: imix/topdown 验证为 x86_64 专属 (DynamoRIO/PMU 基准)"
+    exit 0
+fi
+command -v perf >/dev/null || { echo "SKIP: perf CLI 未安装"; exit 0; }
+
 [ -f "$IMIX_DIR/prog_imix.c" ] || { echo "FAIL: prog_imix.c 缺失"; exit 1; }
 [ -w "$TRACE_DIR" ] || { echo "FAIL: 需要可写的 trace 文件系统 ($TRACE_DIR, 防 dynamorio 输出撑爆主盘)"; exit 1; }
 tf_setup
