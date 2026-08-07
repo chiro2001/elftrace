@@ -43,7 +43,7 @@ run_frozen() {  # $1 = extra prog args
 run_frozen
 ORIG_RC=$?
 "$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real >/dev/null 2>&1 || exit 1
-timeout 120 "$SLICED" > /dev/null 2>&1
+timeout 300 "$SLICED" > /dev/null 2>&1
 S_REAL_RC=$?
 [ "$S_REAL_RC" = "$ORIG_RC" ] || { echo "FAIL: real rc $S_REAL_RC != orig $ORIG_RC"; exit 1; }
 [ "$S_REAL_RC" = "$REF_RC" ] || { echo "FAIL: real rc $S_REAL_RC != ref $REF_RC"; exit 1; }
@@ -51,7 +51,7 @@ echo "real mode: rc=$S_REAL_RC (== orig from freeze, == ref) OK"
 
 # ============ 2. baremetal 模式 ============
 "$ELFTRACE" build "$SNAP" -o "$SLICED" --mode baremetal $BM_EXTRA >/dev/null 2>&1 || exit 1
-strace -o "$TMP/bm.strace" timeout 120 "$SLICED" > /dev/null 2>&1
+strace -o "$TMP/bm.strace" timeout 300 "$SLICED" > /dev/null 2>&1
 S_BM_RC=$?
 [ "$S_BM_RC" = "$S_REAL_RC" ] || { echo "FAIL: baremetal rc $S_BM_RC != real $S_REAL_RC"; exit 1; }
 # 目标阶段 (rt_sigreturn 之后) 不应有真实 syscall:

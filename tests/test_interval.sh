@@ -116,7 +116,13 @@ print('%.4f' % e)")
     elif [ -n "$EC" ] && [ "$PI" -gt $((EC * 15 / 10)) ]; then
         echo "  [$K-$M] external: SKIP (perf stat scaled 失真 $PI vs stub $EC)"
     else
-        BASE=$((EXP + 240000))
+        # stub 恢复开销标定: x86_64 ~24 万条; aarch64 真机实测 ~93.8 万条
+        # (fd 恢复/内存拷贝/信号帧, 随负载固定)
+        if [ "$(uname -m)" = "aarch64" ]; then
+            BASE=$((EXP + 938000))
+        else
+            BASE=$((EXP + 240000))
+        fi
         ERR=$(python3 -c "
 e = abs(int('$PI') - $BASE) / $BASE * 100
 print('%.4f' % e)")

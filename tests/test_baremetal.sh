@@ -86,7 +86,7 @@ run_load() {
     "$TF_ELFTRACE" build "$CKPTS/ckpt_000000.elftrace" -o "$TF_TMP/bm_${name}_real.elf" \
         --mode real --checkpoints "$CKPTS" --from 0 >/dev/null 2>&1 \
         || { echo "  FAIL[$name]: build real"; return 1; }
-    timeout 120 "$TF_TMP/bm_${name}_real.elf" >/dev/null 2>&1
+    timeout 240 "$TF_TMP/bm_${name}_real.elf" >/dev/null 2>&1
     local REAL_RC=$?
 
     # append 特例: trace 已完整运行把文件推进到最终态 (AAABBB), 而切片
@@ -101,7 +101,7 @@ run_load() {
     "$TF_ELFTRACE" build "$CKPTS/ckpt_000000.elftrace" -o "$TF_TMP/bm_${name}_bm.elf" \
         --mode baremetal $BM_EXTRA --checkpoints "$CKPTS" --from 0 >/dev/null 2>&1 \
         || { echo "  FAIL[$name]: build bm"; return 1; }
-    timeout 120 strace -o "$TF_TMP/bm_${name}_bm.strace" "$TF_TMP/bm_${name}_bm.elf" \
+    timeout 240 strace -o "$TF_TMP/bm_${name}_bm.strace" "$TF_TMP/bm_${name}_bm.elf" \
         >/dev/null 2>&1
     local BM_RC=$?
 

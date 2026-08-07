@@ -34,7 +34,9 @@ run_case() {  # $1 = 名称, $2 = prog 参数, $3 = build 参数, $4 = 期望 rc
     wait $PID 2>/dev/null
     local ORIG_RC=$?
 
-    "$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real $bm $BM_EXTRA >/dev/null 2>&1 || { echo "FAIL[$name]: build"; return 1; }
+    local BM_ARGS=""
+    [ "$name" = "bm" ] && BM_ARGS="$BM_EXTRA"
+    "$ELFTRACE" build "$SNAP" -o "$SLICED" --mode real $bm $BM_ARGS >/dev/null 2>&1 || { echo "FAIL[$name]: build"; return 1; }
 
     local S_RC
     if [ -n "$bm" ]; then
