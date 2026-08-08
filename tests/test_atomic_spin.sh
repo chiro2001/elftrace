@@ -51,8 +51,9 @@ wait $PID 2>/dev/null
 NCK=$(wc -l < "$TF_TMP/spsc_ckpts/manifest.txt")
 [ "$NCK" -ge 8 ] || { echo "FAIL: only $NCK checkpoints"; exit 1; }
 
-# 选窗口: from = 首个有原子读序号增长的检查点 (消费者已启动), to 取
-# 后续检查点且其 pc 不是原子站点 (避免退出点与回放站点冲突)。
+# 选窗口: from = 首个"某站点序号增长且窗口内该站点有实际事件"的检查点
+# (消费者已启动并推进了队列), to 取后续检查点且其 pc 不是原子站点
+# (避免退出点与回放站点冲突)。
 WIN=$(python3 - "$TF_TMP/spsc_ckpts" <<'EOF'
 import struct, sys, os
 d = sys.argv[1]
@@ -78,10 +79,23 @@ def ords(k):
     return [struct.unpack_from("<Q", bb, o + i * 24)[0] for i in range(n_sites)]
 n = len([f for f in os.listdir(d + "/atomics") if f.startswith("ckpt_")])
 prev = ords(0)
+ev = open(d + "/atomics/events.bin", "rb").read()
+n_ev = struct.unpack_from("<Q", ev, 16)[0]
+events = []
+for i in range(n_ev):
+    sid, ordv, addr, val = struct.unpack_from("<QQQQ", ev, 24 + i * 32)
+    events.append((sid, ordv))
+def site_events_between(sid, lo, hi):
+    for (e_sid, e_ord) in events:
+        if e_sid == sid and lo < e_ord <= hi:
+            return True
+    return False
 from_k = None
-for k in range(1, n):
+for k in range(1, n - 1):
     cur = ords(k)
-    if any(cur[i] > prev[i] for i in range(n_sites)):
+    nxt = ords(k + 1)
+    if any(cur[i] > prev[i] and site_events_between(i, cur[i], nxt[i])
+           for i in range(n_sites)):
         from_k = k
         break
     prev = cur

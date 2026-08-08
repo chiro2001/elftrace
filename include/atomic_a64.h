@@ -25,9 +25,9 @@
 int a64_is_ldar(uint32_t w, int *is64, unsigned *rt, unsigned *rn);
 
 /* ---- 块/页布局 ---- */
-#define A64_ATOM_BLOCK_SIZE  0x220   /* 每站点块 (16B 对齐) */
+#define A64_ATOM_BLOCK_SIZE  0x240   /* 每站点块 (代码 + 数据区@0x200..0x238) */
 #define A64_ATOM_PAGE_SIZE   0x1000
-#define A64_ATOM_BLOCKS_PER_PAGE  6   /* 6*0x220=0xCC0, 7 个会跨页 */
+#define A64_ATOM_BLOCKS_PER_PAGE  7   /* 7*0x240=0xFC0 */
 
 /* 寄存器保存布局: 保存区顶 = 最终 sp (flags@0, x30@16, ..., x16@256,
  * x17@264), 总大小 272B。 */

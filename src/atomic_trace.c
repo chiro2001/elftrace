@@ -58,6 +58,7 @@ struct atomic_trace_ctx {
     size_t n_sites;
     uint64_t *pages;            /* 记录页地址 */
     size_t n_pages;
+    uint64_t dump_event_ptr;    /* 已转储事件游标 (绝对地址) */
 };
 
 int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
@@ -68,6 +69,8 @@ int inject_syscall(pid_t pid, const struct user_regs_struct *regs,
 
 #define SYS_mmap       222
 #define SYS_munmap     215
+
+static int atomic_events_append(struct atomic_trace_ctx *ctx);
 
 /* ---- /proc/pid/mem 读写 ---- */
 static int tmem_rw(pid_t pid, int wr, uint64_t addr, void *buf, size_t len)
@@ -225,6 +228,67 @@ static void write_u64(uint8_t **p, uint64_t v)
     *p += 8;
 }
 
+/* ---- 目标内 icache/dcache 刷新 ----
+ * /proc/pid/mem 写代码页后内核不保证指令缓存一致 (真机 A53 实测部分
+ * 生效), 让目标自己执行 dc cvau / ic ivau / dsb ish / isb。
+ * ranges: {start,end} 对, 放在事件缓冲区最后一页 (临时, 事件不会
+ * 写到这里之前)。目标必须处于 ptrace-stop。 */
+static int atomic_flush_ranges(pid_t pid,
+                               const struct user_regs_struct *regs,
+                               uint64_t list_abs, uint64_t n_ranges)
+{
+    uint32_t code[64];
+    size_t n = 0;
+    size_t cbz_off = 0, bne_off = 0, inner_off = 0, loop_off = 0,
+           b_off = 0, done_off = 0;
+
+    /* movz/movk x16 = list_abs */
+    uint64_t v = list_abs;
+    code[n++] = 0xD2800000U | ((uint32_t)(v & 0xffff) << 5) | 16U;
+    if (v & 0xFFFF0000ULL)
+        code[n++] = 0xF2800000U | (1U << 21) |
+                    ((uint32_t)((v >> 16) & 0xffff) << 5) | 16U;
+    if (v & 0xFFFFFFFF0000ULL)
+        code[n++] = 0xF2800000U | (2U << 21) |
+                    ((uint32_t)((v >> 32) & 0xffff) << 5) | 16U;
+    if (v & 0xFFFFFFFFFFFF0000ULL)
+        code[n++] = 0xF2800000U | (3U << 21) |
+                    ((uint32_t)((v >> 48) & 0xffff) << 5) | 16U;
+    code[n++] = 0xF9400213U;             /* ldr x19,[x16] = n_ranges */
+    code[n++] = 0x91002210U;             /* add x20,x16,#8 */
+    loop_off = n;
+    cbz_off = n;
+    code[n++] = 0xB4000000U | 19U;       /* cbz x19,done (占位) */
+    code[n++] = 0xF9400295U;             /* ldr x21,[x20] = start */
+    code[n++] = 0xF9408296U;             /* ldr x22,[x20,#16] = end */
+    code[n++] = 0xCB1502D7U;             /* sub x23,x22,x21 */
+    code[n++] = 0x9100FEF7U;             /* add x23,x23,#63 */
+    code[n++] = 0xD346FEF7U;             /* lsr x23,x23,#6 */
+    inner_off = n;
+    code[n++] = 0xD50B7B35U;             /* dc cvau,x21 */
+    code[n++] = 0xD50B7535U;             /* ic ivau,x21 */
+    code[n++] = 0x910102B5U;             /* add x21,x21,#64 */
+    bne_off = n;
+    code[n++] = 0x54000001U;             /* b.ne inner (占位) */
+    code[n++] = 0x91010294U;             /* add x20,x20,#16 */
+    code[n++] = 0xD1000673U;             /* sub x19,x19,#1 */
+    b_off = n;
+    code[n++] = 0x14000000U;             /* b loop (占位) */
+    done_off = n;
+    code[n++] = 0xD5033B9FU;             /* dsb ish */
+    code[n++] = 0xD5033FDFU;             /* isb */
+    code[n++] = 0xD4200000U;             /* brk #0 */
+
+    /* 回填: cbz → done; b.ne → inner; b → loop */
+    code[cbz_off] = 0xB4000000U |
+        (((uint32_t)(done_off - cbz_off) & 0x7FFFF) << 5) | 19U;
+    code[bne_off] = 0x54000001U |
+        (((uint32_t)(inner_off - bne_off) & 0x7FFFF) << 5);
+    code[b_off] = a64_encode_b((uint64_t)b_off * 4, (uint64_t)loop_off * 4);
+    (void)n_ranges;
+    return inject_run_snippet(pid, regs, code, n, NULL);
+}
+
 int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
                      const void *regs, const char *out, uint64_t buf_size)
 {
@@ -233,7 +297,6 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
     size_t n_sites = 0;
     struct seginfo *maps = NULL;
     size_t nmaps = 0;
-    int rc = -1;
     uint64_t ret = 0;
 
     if (!buf_size)
@@ -391,6 +454,30 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
             (unsigned long long)ctx->abuf_addr,
             (unsigned long long)(buf_size >> 20), ctx->n_pages);
 
+    /* 4.5 目标内 icache/dcache 刷新 (站点 patch 与跳板页生效;
+       /proc/pid/mem 写代码页后内核不保证指令缓存一致) */
+    {
+        size_t n_ranges = patched + ctx->n_pages;
+        size_t list_bytes = 8 + n_ranges * 16;
+        uint8_t *lst = xcalloc(1, list_bytes);
+        uint8_t *lp = lst;
+        write_u64(&lp, n_ranges);
+        for (size_t i = 0; i < n_sites; i++) {
+            if (!sites[i].page)
+                continue;
+            write_u64(&lp, sites[i].pc & ~0xfffULL);
+            write_u64(&lp, (sites[i].pc & ~0xfffULL) + 4096);
+        }
+        for (size_t i = 0; i < ctx->n_pages; i++) {
+            write_u64(&lp, ctx->pages[i]);
+            write_u64(&lp, ctx->pages[i] + 4096);
+        }
+        uint64_t list_abs = ctx->abuf_addr + ctx->abuf_size - 4096;
+        if (tmem_rw(pid, 1, list_abs, lst, list_bytes) == 0)
+            atomic_flush_ranges(pid, &ctx->regs, list_abs, n_ranges);
+        free(lst);
+    }
+
     ctx->armed = 1;
     *ctx_out = ctx;
 
@@ -507,7 +594,70 @@ int atomic_trace_ckpt(struct atomic_trace_ctx *ctx, size_t ckpt_no)
     }
     free(sb);
     free(state);
+    atomic_events_append(ctx);
     return rc;
+}
+
+/* 增量转储事件: 把 [dump_event_ptr, event_ptr) 追加到 events.bin
+ * (目标可能在任何时候退出, 不能只靠 finish 读缓冲区)。 */
+struct evfile_hdr {
+    uint64_t magic, version, n_events, bytes;
+};
+
+static int atomic_events_append(struct atomic_trace_ctx *ctx)
+{
+    char path[600];
+    snprintf(path, sizeof(path), "%s/atomics/events.bin", ctx->out);
+    uint64_t event_ptr = 0, events_base = 0, overflow = 0;
+    if (tmem_rw(ctx->pid, 0, ctx->abuf_addr + A64_ATB_OFF_EVENT_PTR,
+                &event_ptr, 8) < 0)
+        return -1;
+    tmem_rw(ctx->pid, 0, ctx->abuf_addr + A64_ATB_OFF_OVERFLOW,
+            &overflow, 8);
+    events_base = ctx->abuf_addr + A64_ATB_HDR_SIZE +
+                  ctx->n_sites * A64_ATB_STATE_SIZE;
+    if (ctx->dump_event_ptr == 0)
+        ctx->dump_event_ptr = events_base;
+    if (event_ptr < ctx->dump_event_ptr)
+        event_ptr = ctx->dump_event_ptr;    /* 目标重启等异常: 防回退 */
+    uint64_t n_new = (event_ptr - ctx->dump_event_ptr) / A64_ATB_EVENT_SIZE;
+
+    uint64_t total = 0;
+    FILE *f = fopen(path, "r+b");
+    if (!f) {
+        f = fopen(path, "wb");
+        if (!f)
+            return -1;
+        struct evfile_hdr hdr = {A64_AT_EVENTS_MAGIC, 1, 0, 0};
+        fwrite(&hdr, sizeof(hdr), 1, f);
+    } else {
+        struct evfile_hdr hdr;
+        if (fread(&hdr, sizeof(hdr), 1, f) == 1 &&
+            hdr.magic == A64_AT_EVENTS_MAGIC && hdr.version == 1)
+            total = hdr.n_events;
+    }
+    if (n_new) {
+        uint8_t *ev = xmalloc(n_new * A64_ATB_EVENT_SIZE);
+        if (tmem_rw(ctx->pid, 0, ctx->dump_event_ptr, ev,
+                    n_new * A64_ATB_EVENT_SIZE) == 0) {
+            fseek(f, 0, SEEK_END);
+            fwrite(ev, 1, n_new * A64_ATB_EVENT_SIZE, f);
+            ctx->dump_event_ptr += n_new * A64_ATB_EVENT_SIZE;
+            total += n_new;
+        }
+        free(ev);
+    }
+    /* 更新头: n_events */
+    {
+        struct evfile_hdr hdr = {A64_AT_EVENTS_MAGIC, 1, total,
+                                 total * A64_ATB_EVENT_SIZE};
+        fseek(f, 0, SEEK_SET);
+        fwrite(&hdr, sizeof(hdr), 1, f);
+    }
+    fclose(f);
+    if (overflow)
+        fprintf(stderr, "atomic: event buffer overflow flag set\n");
+    return 0;
 }
 
 /* 结束: INTERRUPT 停止 → 转储事件 → 恢复站点 → munmap 缓冲区 */
@@ -552,41 +702,8 @@ int atomic_trace_finish(struct atomic_trace_ctx *ctx)
         return 0;
     atomic_trace_step_out(ctx);
 
-    /* 转储事件 */
-    {
-        uint64_t event_ptr = 0, overflow = 0;
-        tmem_rw(pid, 0, ctx->abuf_addr + A64_ATB_OFF_EVENT_PTR,
-                &event_ptr, 8);
-        tmem_rw(pid, 0, ctx->abuf_addr + A64_ATB_OFF_OVERFLOW,
-                &overflow, 8);
-        uint64_t events_base = ctx->abuf_addr + A64_ATB_HDR_SIZE +
-                               ctx->n_sites * A64_ATB_STATE_SIZE;
-        uint64_t n_ev = event_ptr > events_base
-                            ? (event_ptr - events_base) / A64_ATB_EVENT_SIZE
-                            : 0;
-        char path[600];
-        snprintf(path, sizeof(path), "%s/atomics/events.bin", ctx->out);
-        uint8_t *eb = xmalloc(24 + n_ev * A64_ATB_EVENT_SIZE);
-        uint8_t *p = eb;
-        write_u64(&p, A64_AT_EVENTS_MAGIC);
-        write_u64(&p, 1);
-        write_u64(&p, n_ev);
-        write_u64(&p, n_ev * A64_ATB_EVENT_SIZE);
-        if (n_ev &&
-            tmem_rw(pid, 0, events_base, p, n_ev * A64_ATB_EVENT_SIZE) < 0)
-            warn("atomic: cannot read event buffer");
-        FILE *f = fopen(path, "wb");
-        if (f) {
-            fwrite(eb, 1, 24 + n_ev * A64_ATB_EVENT_SIZE, f);
-            fclose(f);
-        } else {
-            warn("atomic: cannot write %s", path);
-        }
-        free(eb);
-        fprintf(stderr, "atomic: dumped %llu events%s\n",
-                (unsigned long long)n_ev,
-                overflow ? " (BUFFER OVERFLOW)" : "");
-    }
+    /* 转储剩余事件 (增量文件已含各检查点前的事件) */
+    atomic_events_append(ctx);
 
     /* 恢复站点原指令 */
     for (size_t i = 0; i < ctx->n_sites; i++) {

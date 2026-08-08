@@ -74,6 +74,10 @@ static uint32_t add_x(unsigned rd, unsigned rn, unsigned imm)
 {
     return 0x91000000U | (imm << 10) | (rn << 5) | rd;
 }
+static uint32_t add_xr(unsigned rd, unsigned rn, unsigned rm)
+{
+    return 0x8B000000U | (rm << 16) | (rn << 5) | rd;
+}
 static uint32_t cmp_x(unsigned rn, unsigned rm)
 {
     return 0xEB00001FU | (rm << 16) | (rn << 5);
@@ -117,6 +121,7 @@ static void emit_restore(uint8_t **p)
     for (size_t i = sizeof(ldp_post_tab) / sizeof(ldp_post_tab[0]);
          i > 0; i--)
         put32(p, ldp_post_tab[i - 1]);
+    put32(p, 0xA8C147F0U);      /* ldp x16,x17,[sp],#16 (入口保存) */
 }
 
 int a64_is_ldar(uint32_t w, int *is64, unsigned *rt, unsigned *rn)
@@ -172,7 +177,7 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
 
     memset(out, 0, A64_ATOM_BLOCK_SIZE);
 
-    /* 入口 (固定 0x18 字节, 代码从 0x18 开始) */
+    /* 入口 (5 指令 + 8B 字面量 = 0x1C 字节, 代码从 0x1C 开始) */
     put32(&p, 0xA9BF47F0U);     /* stp x16,x17,[sp,#-16]! */
     put32(&p, orig_insn);       /* 原始 ldar (语义完全保留) */
     if (rt == 16)
@@ -181,9 +186,12 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
         put32(&p, INSN_NOP);
     put32(&p, ldr_lit(16, 8));  /* ldr x16,[pc,#8] */
     put32(&p, INSN_BR_X16);
-    put64(&p, block_abs);
-    /* p == out + 0x18 */
+    put64(&p, block_abs + 0x1C);    /* 记录入口 5 指令, 代码在 +0x1C */
+    /* p == out + 0x1C (sub) */
 
+    /* 入口 br 过来时 x16 = 代码地址 (block+0x1C); 数据区偏移按块基算,
+       先减回去 */
+    put32(&p, 0xD1007210U);     /* sub x16, x16, #0x1c (入口 5 指令) */
     emit_save(&p);
 
     /* 值 → x13 */
@@ -250,37 +258,36 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
     put32(&p, str_x_imm(21, 13, 24));   /* [event+24] = value */
     put32(&p, str_x_imm(18, 22, 0));    /* hdr.event_ptr = event+32 */
     uint8_t *skip_b = p;
-    put32(&p, bcond(0, 1));     /* b done (占位, 无条件跳转) */
+    put32(&p, 0x14000000U);     /* b done (占位, 无条件) */
     put32(&p, ldr_x16_imm(20, REC_OVERFLOW_ADDR_OFF)); /* &hdr.overflow */
     put32(&p, movz_x(21, 1, 0));
     put32(&p, str_x_imm(20, 21, 0));    /* hdr.overflow = 1 */
 
-    /* done: 恢复现场 + 跳回站点下一条 */
-    /* 关键: 把 ldar 的加载值写回 Rt 的保存槽 (ldar 语义: Rt = 加载值;
-       保存区是 ldar 执行前的快照) */
+    /* done: 把 ldar 的加载值写回 Rt 的保存槽 (ldar 语义: Rt = 加载值;
+       保存区是 ldar 执行前的快照; 所有提前跳转路径都经过这里),
+       然后恢复现场 + 跳回站点下一条 */
     {
         int rt_off = a64_atom_reg_save_off(rt);
         if (rt_off < 0)
             return 0;
+        uint8_t *done = p;
         put32(&p, str_x_imm(31, 13, (unsigned)rt_off));
-    }
-    uint8_t *done = p;
-    emit_restore(&p);
-    uint64_t b_off = (uint64_t)(p - out);
-    put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
+        emit_restore(&p);
 
-    /* 回填条件分支 */
-    {
+        /* 回填条件分支 */
         int32_t d1 = (int32_t)(done - tls_bne);
         int32_t d2 = (int32_t)(done - same_b);
         int32_t d3 = (int32_t)((skip_b + 4) - ovf_b);
-        int32_t d4 = (int32_t)(done - skip_b);
+        uint32_t w4 = a64_encode_b(block_abs + (uint64_t)(skip_b - out),
+                                   block_abs + (uint64_t)(done - out));
         uint32_t w;
         w = bcond(d1, 1);   memcpy(tls_bne, &w, 4);
         w = bcond(d2, 0);   memcpy(same_b, &w, 4);
         w = bcond(d3, 8);   memcpy(ovf_b, &w, 4);
-        w = bcond(d4, 1);   memcpy(skip_b, &w, 4);
+        memcpy(skip_b, &w4, 4);
     }
+    uint64_t b_off = (uint64_t)(p - out);
+    put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
 
     /* 数据区 */
     uint64_t v = tls;           memcpy(out + REC_TLS_OFF, &v, 8);
@@ -315,14 +322,15 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
 
     memset(out, 0, A64_ATOM_BLOCK_SIZE);
 
-    /* 入口 (固定 0x18 字节) */
+    /* 入口 (5 指令 + 8B 字面量 = 0x1C 字节) */
     put32(&p, 0xA9BF47F0U);     /* stp x16,x17 */
     put32(&p, INSN_NOP);
     put32(&p, ldr_lit(16, 8));
     put32(&p, INSN_BR_X16);
-    put64(&p, block_abs);
-    /* p == out + 0x18 */
+    put64(&p, block_abs + 0x18);    /* 回放入口 4 指令, 代码在 +0x18 */
+    /* p == out + 0x18 (sub) */
 
+    put32(&p, 0xD1006210U);     /* sub x16, x16, #0x18 (入口 4 指令) */
     emit_save(&p);
 
     /* 序号 = ++ordinal */
@@ -342,7 +350,7 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     put32(&p, bcond(0, 2));     /* b.hs have_run (占位) */
     put32(&p, movz_x(24, 24, 0));       /* x24 = 24 (运行段条目大小) */
     put32(&p, mul_x(24, 23, 24));       /* x24 = (cursor+1)*24 */
-    put32(&p, add_x(24, 24, 22));       /* next run base */
+    put32(&p, add_xr(24, 24, 22));      /* next run base */
     put32(&p, ldr_x_imm(24, 25, 0));    /* next.start */
     put32(&p, cmp_x(25, 19));
     uint8_t *hi_b = p;
@@ -354,7 +362,7 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     /* 当前运行段基址 */
     put32(&p, movz_x(24, 24, 0));
     put32(&p, mul_x(24, 20, 24));       /* cursor*24 */
-    put32(&p, add_x(24, 24, 22));
+    put32(&p, add_xr(24, 24, 22));
     put32(&p, ldr_x_imm(24, 25, 0));    /* run.start */
     put32(&p, cmp_x(25, 19));
     uint8_t *lo_b = p;
@@ -372,7 +380,7 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     /* 真实 acquire 屏障: 对原地址执行 ldar (值丢弃), 保证排序语义 */
     put32(&p, is64 ? INSN_LDAR_X29_X27 : INSN_LDAR_W29_X27);
     uint8_t *set_jmp = p;
-    put32(&p, bcond(0, 1));     /* b set (占位, 无条件) */
+    put32(&p, 0x14000000U);     /* b set (占位, 无条件) */
     uint8_t *use_real = p;
     if (rn == 31)
         put32(&p, add_x(27, 31, A64_ATOM_SAVE_SIZE));
@@ -380,6 +388,7 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
         put32(&p, ldr_x_imm(31, 27, (unsigned)rn_off));
     put32(&p, is64 ? (0xC8DFFC00U | (27U << 5) | 13U) :
                      (0x88DFFC00U | (27U << 5) | 13U));
+    put32(&p, mov_x(23, 13));           /* 真实值 → x23 (set 统一写槽) */
     uint8_t *set = p;
     /* 把最终值写入 Rt 的保存槽 (恢复时弹出) */
     put32(&p, str_x_imm(31, 23, (unsigned)rt_off));
@@ -393,13 +402,14 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
         int32_t d2 = (int32_t)(have - hi_b);
         int32_t d3 = (int32_t)(use_real - lo_b);
         int32_t d4 = (int32_t)(use_real - ne_b);
-        int32_t d5 = (int32_t)(set - set_jmp);
+        uint32_t w5 = a64_encode_b(block_abs + (uint64_t)(set_jmp - out),
+                                   block_abs + (uint64_t)(set - out));
         uint32_t w;
         w = bcond(d1, 2);   memcpy(hs_b, &w, 4);
         w = bcond(d2, 8);   memcpy(hi_b, &w, 4);
         w = bcond(d3, 3);   memcpy(lo_b, &w, 4);
         w = bcond(d4, 1);   memcpy(ne_b, &w, 4);
-        w = bcond(d5, 1);   memcpy(set_jmp, &w, 4);
+        memcpy(set_jmp, &w5, 4);
     }
 
     {
