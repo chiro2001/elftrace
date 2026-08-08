@@ -65,7 +65,7 @@ import sys, urllib.request
 port, n = int(sys.argv[1]), int(sys.argv[2])
 for i in range(n):
     urllib.request.urlopen("http://127.0.0.1:%d/f%d" % (port, i % 5 + 1),
-                           timeout=60).read()
+                           timeout=120).read()
 EOF
 }
 

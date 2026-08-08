@@ -25,7 +25,6 @@
 #include <sys/uio.h>
 #include <stddef.h>
 #include <linux/perf_event.h>
-#include <dirent.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <limits.h>
@@ -193,74 +192,6 @@ static void syscall_stream_rec(struct trace_ctx *tc, struct syscall_rec *r,
     tc->have_prev_b = 1;
 }
 
-/* ---- 多线程一致性 ----
- * ptrace 只冻结主线程; HTTP 这类负载的 worker 线程会继续写内存,
- * collect_memory 读到的检查点/边界快照可能撕裂 (Torn snapshot),
- * 导致切片从不可能的内存状态恢复 (实测同一 trace 的 ckpt 2/3 恢复
- * 即崩, ckpt 4 正常)。这里用 tgkill(SIGSTOP) 停住其他线程, 读完后
- * SIGCONT 恢复; 不碰主线程 (由 ptrace-stop 控制, 避免挂起信号)。 */
-struct thr_stop { pid_t *tids; size_t n; };
-
-static int stop_other_threads(pid_t pid, struct thr_stop *ts)
-{
-    ts->tids = NULL;
-    ts->n = 0;
-    char task[64], path[256];
-    snprintf(task, sizeof task, "/proc/%d/task", pid);
-    for (int tries = 0; tries < 400; tries++) {
-        DIR *d = opendir(task);
-        if (!d)
-            return -1;
-        struct dirent *e;
-        int all_stopped = 1;
-        while ((e = readdir(d))) {
-            if (e->d_name[0] == '.')
-                continue;
-            pid_t tid = atoi(e->d_name);
-            if (tid == pid)
-                continue;           /* 主线程由 ptrace 控制 */
-            if (syscall(SYS_tgkill, pid, tid, SIGSTOP) < 0 &&
-                errno != ESRCH)
-                all_stopped = 0;
-            snprintf(path, sizeof path, "%s/%s/stat", task, e->d_name);
-            FILE *f = fopen(path, "r");
-            char st[16] = "";
-            if (f) {
-                if (fscanf(f, "%*d %*s %15s", st) != 1)
-                    st[0] = 0;
-                fclose(f);
-            }
-            /* T/t=stop, Z/X=退出: 都不会执行用户代码 */
-            if (st[0] != 'T' && st[0] != 't' && st[0] != 'Z' &&
-                st[0] != 'X')
-                all_stopped = 0;
-        }
-        closedir(d);
-        if (all_stopped)
-            return 0;
-        usleep(2000);
-    }
-    return -1;
-}
-
-static void resume_other_threads(pid_t pid)
-{
-    char task[64];
-    snprintf(task, sizeof task, "/proc/%d/task", pid);
-    DIR *d = opendir(task);
-    if (!d)
-        return;
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.')
-            continue;
-        pid_t tid = atoi(e->d_name);
-        if (tid != pid)
-            syscall(SYS_tgkill, pid, tid, SIGCONT);
-    }
-    closedir(d);
-}
-
 /* syscall 入口/返回停止处理 (PTRACE_SYSCALL 模式)
  * entry: 只记录待定 pc/sysno (内存快照不再需要: diff 基线是上一
  *         syscall 边界, 见 syscall_stream_rec)
@@ -293,12 +224,7 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
                diff 基线 = 上一 syscall 边界。 */
             struct collect_snapshot b = {.pid = tc->pid};
             collect_state_light(tc->pid, &b);
-            struct thr_stop ts;
-            int ok = stop_other_threads(tc->pid, &ts);
             collect_memory(tc->pid, &b);
-            if (ok == 0)
-                resume_other_threads(tc->pid);
-            free(ts.tids);
             tc->syscalls = xrealloc(tc->syscalls,
                                     (tc->n_syscalls + 1) *
                                     sizeof(*tc->syscalls));
@@ -319,12 +245,7 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
         }
         struct collect_snapshot sn = {.pid = tc->pid};
         collect_state_light(tc->pid, &sn);
-        struct thr_stop ts;
-        int ok = stop_other_threads(tc->pid, &ts);
         collect_memory(tc->pid, &sn);
-        if (ok == 0)
-            resume_other_threads(tc->pid);
-        free(ts.tids);
         tc->syscalls = xrealloc(tc->syscalls,
                                 (tc->n_syscalls + 1) *
                                 sizeof(*tc->syscalls));
@@ -387,12 +308,7 @@ static int collect_interrupt_sc(struct trace_ctx *tc)
                     ptrace(PTRACE_SYSCALL, pid, 0, 0);
                     continue;
                 }
-                struct thr_stop ts;
-                int ok = stop_other_threads(pid, &ts);
                 collect_memory(pid, &b);
-                if (ok == 0)
-                    resume_other_threads(pid);
-                free(ts.tids);
                 tc->syscalls = xrealloc(tc->syscalls,
                                         (tc->n_syscalls + 1) *
                                         sizeof(*tc->syscalls));
@@ -469,7 +385,10 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
     {
         uint64_t cpc = REG_PC(sn.regs);
         for (size_t k = 0; k < tc->n_syscalls; k++) {
-            if (tc->syscalls[k].pc + ARCH_SYSCALL_LEN == cpc) {
+            /* 普通记录 pc = svc+4, 打断记录 pc = svc; 检查点可能停在
+               两者之一, 都回退到 svc */
+            if (tc->syscalls[k].pc == cpc ||
+                tc->syscalls[k].pc + ARCH_SYSCALL_LEN == cpc) {
                 REG_SET_PC(sn.regs, cpc - ARCH_SYSCALL_LEN);
                 fprintf(stderr, "trace: ckpt %zu at syscall boundary "
                         "pc %#llx, rewind to svc\n",
@@ -481,12 +400,7 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
 #endif
 
     /* 冻结期间直接读全量内存并即时写检查点 (diff 链) */
-    struct thr_stop ts;
-    int ok = stop_other_threads(tc->pid, &ts);
     collect_memory(tc->pid, &sn);
-    if (ok == 0)
-        resume_other_threads(tc->pid);
-    free(ts.tids);
     snprintf(path, sizeof(path), "%s/ckpt_%06zu.elftrace", tc->out,
              tc->ckpt_no);
     if (tc->ckpt_no == 0) {
