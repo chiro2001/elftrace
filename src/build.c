@@ -102,6 +102,9 @@ struct rec_tmp {
     uint64_t n_unmap, n_newseg, n_dirty;
     uint64_t orig_count;        /* 捕获时 perf 计数 (原始空间) */
     struct buf unmap, newseg, dirty;
+    /* --byte-runs: 按 probe 预状态压缩后的回放格式 */
+    uint64_t n_newseg_run, n_dirty_run;
+    struct buf newseg_run, dirty_run;
 };
 
 /* strict 模式下的额外 PT_LOAD (由 ELF 组装段发射) */
@@ -731,7 +734,8 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
         /* 回放表 rec.pc 统一为 svc 地址 (3.5b 的定点替换在 strict 模式
            被跳过, 表里还是 entry-stop ip = svc+4; 引擎按站点 pc 匹配) */
         {
-            uint8_t *recp = blob->data + replay_off + 8 + (size_t)k * 80;
+            /* 回放表: n_recs(8) + fmt(8) + rec×80 */
+            uint8_t *recp = blob->data + replay_off + 16 + (size_t)k * 80;
             memcpy(recp, &site, 8);
         }
         /* exit/exit_group 保持真实 (切片结束的合法 syscall) */
@@ -1348,6 +1352,80 @@ static void blob_patch_u64(uint8_t *blob, uint64_t off, uint64_t val)
     memcpy(blob + off, &val, 8);
 }
 
+/* 生成一条 newseg/dirty 的 32B granule 记录:
+ *   非空时向 out 追加 entry {vaddr u64, n_gran u32, mode u32,
+ *   size u32, pad u32}:
+ *     mode=1: {off u32, data[32]} × n_gran (稀疏 granule 拷贝)
+ *     mode=2: data[size] 整段 (密集内容, 整段拷贝更省指令)
+ *   末个不完整 granule 以 0 填充 (BSS 语义, 防越界写)。
+ * 返回 1 = 发射, 0 = 预状态与目标一致 (整体跳过)。 */
+static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
+                              const uint8_t *oldp, const uint8_t *newp,
+                              size_t n, uint32_t *mode_out,
+                              uint32_t *gran_out)
+{
+    uint64_t ng = 0, full = 0;
+    for (size_t g = 0; g < n; g += 32) {
+        size_t len = n - g < 32 ? n - g : 32;
+        if (memcmp(oldp + g, newp + g, len) != 0) {
+            ng++;
+            full += len;
+        }
+    }
+    if (!ng)
+        return 0;
+    uint32_t mode = full >= 1536 ? 2 : 1;   /* 密集 → 整段 */
+    if (mode_out)
+        *mode_out = mode;
+    if (gran_out)
+        *gran_out = (uint32_t)ng;
+    uint32_t n32 = (uint32_t)ng;
+    uint32_t size = (uint32_t)(mode == 2 ? n : ng * 32);
+    uint32_t pad = 0;
+    buf_append(out, &vaddr, 8);
+    buf_append(out, &n32, 4);
+    buf_append(out, &mode, 4);
+    buf_append(out, &size, 4);
+    buf_append(out, &pad, 4);
+    if (mode == 2) {
+        buf_append(out, newp, n);
+        return 1;
+    }
+    for (size_t g = 0; g < n; g += 32) {
+        size_t len = n - g < 32 ? n - g : 32;
+        if (memcmp(oldp + g, newp + g, len) == 0)
+            continue;
+        uint32_t off = (uint32_t)g;
+        uint8_t gran[32] = {0};
+        memcpy(gran, newp + g, len);
+        buf_append(out, &off, 4);
+        buf_append(out, gran, 32);
+    }
+    return 1;
+}
+
+/* 读入 probe dump 文件 (strict 全页切片的预状态) */
+static uint8_t *read_probe(const char *path, size_t *outsz)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        die("cannot open probe dump %s", path);
+    struct stat st;
+    if (fstat(fd, &st) < 0)
+        die("fstat %s", path);
+    uint8_t *f = xmalloc(st.st_size);
+    size_t roff = 0;
+    while (roff < (size_t)st.st_size) {
+        ssize_t r = read(fd, f + roff, (size_t)st.st_size - roff);
+        if (r < 0)
+            die("read %s", path);
+        roff += (size_t)r;
+    }
+    close(fd);
+    *outsz = (size_t)st.st_size;
+    return f;
+}
+
 /* 应用差异文件到合成快照 (增量检查点重建) */
 static void apply_diff(struct collect_snapshot *sn, const char *path)
 {
@@ -1528,6 +1606,9 @@ int build_main(int argc, char **argv)
     uint64_t exit_count_override = 0; /* --bm-exit-count: 覆盖循环 K */
     uint64_t from_count = 0, to_count = 0;
     int have_from_count = 0, have_to_count = 0;
+    const char *probe_dump_path = NULL; /* --probe-dump: 预状态 dump */
+    const char *byte_runs_path = NULL;  /* --byte-runs: 压缩回放表 */
+    uint64_t replay_fmt = 0;            /* 0=整页, 1=字节 run (表内 u64) */
     /* strict 循环判定用: 窗口内检查点 PC 与计数 */
     uint64_t *ckpt_pcs = NULL;
     size_t nckpt_pcs = 0;
@@ -1564,6 +1645,12 @@ int build_main(int argc, char **argv)
         } else if (strcmp(argv[i], "--stack-reserve") == 0 &&
                    i + 1 < argc) {
             stack_reserve = strtoull(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--probe-dump") == 0 &&
+                   i + 1 < argc) {
+            probe_dump_path = argv[++i];
+        } else if (strcmp(argv[i], "--byte-runs") == 0 &&
+                   i + 1 < argc) {
+            byte_runs_path = argv[++i];
         } else if (strcmp(argv[i], "--from-count") == 0 && i + 1 < argc) {
             from_count = strtoull(argv[++i], NULL, 10);
             have_from_count = 1;
@@ -1591,6 +1678,7 @@ int build_main(int argc, char **argv)
                 "[--mode real|baremetal] [--ipc N] [--checkpoints DIR] "
                 "[--from K] [--to M] [--breakpoint ADDR] "
                 "[--bm-strict] [--bm-exit-count N] [--stack-reserve N] "
+                "[--probe-dump FILE] [--byte-runs FILE] "
                 "[--from-count N] [--to-count N]");
         }
     }
@@ -1599,6 +1687,7 @@ int build_main(int argc, char **argv)
             "[--mode real|baremetal] [--ipc N] [--checkpoints DIR] "
             "[--from K] [--to M] [--breakpoint ADDR] "
             "[--bm-strict] [--bm-exit-count N] [--stack-reserve N] "
+            "[--probe-dump FILE] [--byte-runs FILE] "
             "[--from-count N] [--to-count N]");
 #if !defined(__aarch64__)
     if (bm_strict)
@@ -1608,6 +1697,10 @@ int build_main(int argc, char **argv)
         die("--bm-strict requires --mode baremetal");
     if (stack_reserve && !bm_strict)
         die("--stack-reserve requires --bm-strict");
+    if (probe_dump_path && !bm_strict)
+        die("--probe-dump requires --bm-strict");
+    if (byte_runs_path && !bm_strict)
+        die("--byte-runs requires --bm-strict");
     if (bm_strict && stack_reserve == 0)
         stack_reserve = 256UL << 20;   /* 默认预留 256MB (100M 指令切片) */
 
@@ -2111,6 +2204,149 @@ int build_main(int argc, char **argv)
         }
     }
 
+    /* 3.55 --byte-runs: 用 probe dump (strict 全页切片各边界的真实
+       预状态) 把 newseg/dirty 压缩成字节 run。预状态 == 录制内容的
+       页面整体跳过 (主线程自身已复现的写入, 约占一半), 其余按
+       {off,len,data} 发射。回放表 fmt=1。 */
+    if (byte_runs_path) {
+        if (nrecs == 0)
+            die("--byte-runs requires syscall replay records in window");
+        size_t psz = 0;
+        uint8_t *pf = read_probe(byte_runs_path, &psz);
+        uint64_t magic, ver;
+        memcpy(&magic, pf, 8);
+        memcpy(&ver, pf + 8, 8);
+        if (magic != PROBE_FILE_MAGIC || ver != PROBE_FILE_VERSION)
+            die("--byte-runs: bad probe dump %s", byte_runs_path);
+        size_t pos = PROBE_HDR_SIZE;
+        uint64_t n_dirty_total = 0, n_newseg_total = 0;
+        uint64_t n_dirty_emit = 0, n_newseg_emit = 0;
+        uint64_t n_gran_entries = 0, n_full_entries = 0, n_gran_total = 0;
+        size_t orig_nrecs = nrecs;
+        size_t i;
+        for (i = 0; i < nrecs; i++) {
+            struct rec_tmp *r = &recs[i];
+            /* probe 覆盖的完整前缀: 预计算本条记录所需字节 */
+            uint64_t need = 0;
+            {
+                const uint8_t *nd2 = r->newseg.data;
+                for (uint64_t j = 0; j < r->n_newseg; j++) {
+                    uint64_t fs;
+                    memcpy(&fs, nd2 + 8, 8);
+                    need += 16 + fs;
+                    nd2 += 32 + fs;
+                }
+                need += r->n_dirty * (16 + 4096);
+            }
+            if (pos + need > psz)
+                break;      /* probe 切片提前退出, 只覆盖前缀 */
+            buf_init(&r->newseg_run);
+            buf_init(&r->dirty_run);
+            const uint8_t *nd = r->newseg.data;
+            for (uint64_t j = 0; j < r->n_newseg; j++) {
+                uint64_t vv, fs;
+                memcpy(&vv, nd, 8);
+                memcpy(&fs, nd + 8, 8);
+                if (pos + 16 + fs > psz)
+                    die("probe truncated at newseg rec %zu", i);
+                uint64_t pv, plen;
+                memcpy(&pv, pf + pos, 8);
+                memcpy(&plen, pf + pos + 8, 8);
+                if (pv != vv || plen != fs)
+                    die("probe newseg mismatch rec %zu (%#llx vs %#llx)",
+                        i, (unsigned long long)pv,
+                        (unsigned long long)vv);
+                uint32_t mode = 0, ng = 0;
+                uint32_t em = emit_granules(&r->newseg_run, vv,
+                                            pf + pos + 16, nd + 32, fs,
+                                            &mode, &ng);
+                r->n_newseg_run += em;
+                if (mode == 2)
+                    n_full_entries++;
+                else if (em) {
+                    n_gran_entries++;
+                    n_gran_total += ng;
+                }
+                pos += 16 + fs;
+                nd += 32 + fs;
+                n_newseg_total++;
+            }
+            const uint8_t *dp = r->dirty.data;
+            for (uint64_t j = 0; j < r->n_dirty; j++) {
+                uint64_t vv;
+                memcpy(&vv, dp, 8);
+                dp += 8;
+                if (pos + 16 + 4096 > psz)
+                    die("probe truncated at dirty rec %zu", i);
+                uint64_t pv, plen;
+                memcpy(&pv, pf + pos, 8);
+                memcpy(&plen, pf + pos + 8, 8);
+                if (pv != vv || plen != 4096)
+                    die("probe dirty mismatch rec %zu (%#llx vs %#llx)",
+                        i, (unsigned long long)pv,
+                        (unsigned long long)vv);
+                uint32_t mode = 0, ng = 0;
+                uint32_t em = emit_granules(&r->dirty_run, vv,
+                                            pf + pos + 16, dp, 4096,
+                                            &mode, &ng);
+                r->n_dirty_run += em;
+                if (mode == 2)
+                    n_full_entries++;
+                else if (em) {
+                    n_gran_entries++;
+                    n_gran_total += ng;
+                }
+                pos += 16 + 4096;
+                dp += 4096;
+                n_dirty_total++;
+            }
+            n_newseg_emit += r->n_newseg_run;
+            n_dirty_emit += r->n_dirty_run;
+        }
+        if (i < orig_nrecs) {
+            fprintf(stderr,
+                    "build: byte-runs: probe covers %zu/%zu records "
+                    "(probe slice exited before window end); truncating\n",
+                    i, orig_nrecs);
+            nrecs = i;
+            if (nrecs == 0)
+                die("--byte-runs: probe covers no records");
+            /* 重新判定 syscall 密集锚点 (截断后窗口终点语义) */
+            syscall_dense = 0;
+            if (ckpt_count_to != UINT64_MAX && ckpt_count_to > ckpt_count0) {
+                uint64_t win = ckpt_count_to - ckpt_count0;
+                uint64_t last = recs[nrecs - 1].orig_count;
+                if (last != UINT64_MAX && last < ckpt_count_to) {
+                    uint64_t tail = ckpt_count_to - last;
+                    if (tail <= win / 5)
+                        syscall_dense = 1;
+                }
+            }
+        } else if (pos != psz) {
+            die("--byte-runs: probe size mismatch (%zu vs %zu)",
+                pos, psz);
+        }
+        free(pf);
+        replay_fmt = 1;
+        fprintf(stderr,
+                "build: byte-runs: %llu dirty/%llu newseg recorded, "
+                "%llu/%llu emitted (%llu granule entries, %llu full, "
+                "%llu granules; %.1f%%/%.1f%% skipped)\n",
+                (unsigned long long)n_dirty_total,
+                (unsigned long long)n_newseg_total,
+                (unsigned long long)n_dirty_emit,
+                (unsigned long long)n_newseg_emit,
+                (unsigned long long)n_gran_entries,
+                (unsigned long long)n_full_entries,
+                (unsigned long long)n_gran_total,
+                n_dirty_total ? 100.0 * (n_dirty_total - n_dirty_emit) /
+                                    n_dirty_total
+                              : 0.0,
+                n_newseg_total ? 100.0 * (n_newseg_total - n_newseg_emit) /
+                                    n_newseg_total
+                              : 0.0);
+    }
+
     /* 3.5b baremetal: syscall 指令 → 断点替换
        (kernel entry-stop 的 ip 是 syscall 指令的下一条; x86_64 0f05
        长 2 → int3; aarch64 svc #0 (d4000001) 长 4 → brk #0 (d4200000),
@@ -2262,6 +2498,7 @@ int build_main(int argc, char **argv)
         if (blob.size & 7)
             buf_zero(&blob, 8 - (blob.size & 7)); /* 8B 对齐 */
         buf_zero(&replay, 8);                    /* n_recs */
+        buf_zero(&replay, 8);                    /* fmt (0=整页, 1=字节 run) */
         uint64_t *rec_off = xmalloc(nrecs * 8);
         for (size_t i = 0; i < nrecs; i++) {
             rec_off[i] = replay.size;
@@ -2276,13 +2513,22 @@ int build_main(int argc, char **argv)
         }
         for (size_t i = 0; i < nrecs; i++) {
             newseg_off[i] = replay.size;
-            buf_append(&replay, recs[i].newseg.data, recs[i].newseg.size);
+            buf_append(&replay,
+                       replay_fmt ? recs[i].newseg_run.data
+                                  : recs[i].newseg.data,
+                       replay_fmt ? recs[i].newseg_run.size
+                                  : recs[i].newseg.size);
         }
         for (size_t i = 0; i < nrecs; i++) {
             dirty_off[i] = replay.size;
-            buf_append(&replay, recs[i].dirty.data, recs[i].dirty.size);
+            buf_append(&replay,
+                       replay_fmt ? recs[i].dirty_run.data
+                                  : recs[i].dirty.data,
+                       replay_fmt ? recs[i].dirty_run.size
+                                  : recs[i].dirty.size);
         }
         memcpy(replay.data, &nrecs, 8);
+        memcpy(replay.data + 8, &replay_fmt, 8);
         for (size_t i = 0; i < nrecs; i++) {
             uint8_t *rc = replay.data + rec_off[i];
             uint64_t v;
@@ -2291,9 +2537,11 @@ int build_main(int argc, char **argv)
             v = recs[i].rax;     memcpy(rc + 16, &v, 8);
             v = recs[i].n_unmap; memcpy(rc + 24, &v, 8);
             v = unmap_off[i];    memcpy(rc + 32, &v, 8);
-            v = recs[i].n_newseg; memcpy(rc + 40, &v, 8);
+            v = replay_fmt ? recs[i].n_newseg_run : recs[i].n_newseg;
+            memcpy(rc + 40, &v, 8);
             v = newseg_off[i];   memcpy(rc + 48, &v, 8);
-            v = recs[i].n_dirty; memcpy(rc + 56, &v, 8);
+            v = replay_fmt ? recs[i].n_dirty_run : recs[i].n_dirty;
+            memcpy(rc + 56, &v, 8);
             v = dirty_off[i];    memcpy(rc + 64, &v, 8);
         }
         replay_off = blob.size;
@@ -2342,6 +2590,69 @@ int build_main(int argc, char **argv)
                 n_sploads);
     }
 #endif
+    /* probe dump: 诊断构建 — 把每个 newseg/dirty 应用前的预状态
+       (段内容 / 4096B 页) 追加到 blob 内的缓冲, 退出时由 stub 写盘。
+       随后 --byte-runs 用它计算"切片实际需要补写的字节": 主线程自身
+       已复现的写入自动归零跳过, 只有并发线程/分歧修正字节进入回放表,
+       且按切片真实预状态计算 run 天然规避整页/字节 run 的分歧崩溃。 */
+    if (probe_dump_path) {
+        if (nrecs == 0)
+            die("--probe-dump requires syscall replay records in window");
+        uint64_t n_dirty_total = 0, n_newseg_total = 0;
+        uint64_t probe_bytes = PROBE_HDR_SIZE;
+        for (size_t i = 0; i < nrecs; i++) {
+            n_dirty_total += recs[i].n_dirty;
+            probe_bytes += recs[i].n_dirty * (16 + 4096);
+            const uint8_t *nd = recs[i].newseg.data;
+            for (uint64_t j = 0; j < recs[i].n_newseg; j++) {
+                uint64_t fs;
+                memcpy(&fs, nd + 8, 8);
+                n_newseg_total++;
+                probe_bytes += 16 + fs;
+                nd += 32 + fs;
+            }
+        }
+        /* probe 缓冲放在栈预留段的底部 (纯 BSS, 不占文件):
+           不能追加到 blob 尾部 — blob 延伸区可能与目标段 (如 heap
+           VMA) 重叠, stub 写缓冲会直接污染目标内存。栈预留与目标
+           [stack] 同属高地址, Python 主线程栈不会深挖到预留段底部。 */
+        size_t ri = SIZE_MAX;
+        uint64_t rmax = 0;
+        for (size_t i = 0; i < n_sploads; i++) {
+            if (sploads[i].flags == (PF_R | PF_W) &&
+                sploads[i].memsz > rmax) {
+                rmax = sploads[i].memsz;
+                ri = i;
+            }
+        }
+        if (ri == SIZE_MAX)
+            die("--probe-dump: no RW stack reserve to host probe buffer");
+        uint64_t need = probe_bytes + (1UL << 20);   /* 1MB 余量 */
+        if (sploads[ri].memsz < need)
+            sploads[ri].memsz = need;
+        uint64_t probe_abs = sploads[ri].vaddr;
+        uint64_t v;
+        v = 1;
+        blob_patch_u64(blob.data, RST_DESC_PROBE_ENABLED, v);
+        v = probe_abs;
+        blob_patch_u64(blob.data, RST_DESC_PROBE_BUF_ABS, v);
+        v = PROBE_HDR_SIZE;   /* 运行时追加起点 (跳过 16B 头) */
+        blob_patch_u64(blob.data, RST_DESC_PROBE_BUF_SIZE, v);
+        uint64_t path_off = blob.size;
+        if (path_off & 7)
+            buf_zero(&blob, 8 - (path_off & 7));
+        path_off = blob.size;
+        buf_append(&blob, probe_dump_path, strlen(probe_dump_path) + 1);
+        v = base + path_off;
+        blob_patch_u64(blob.data, RST_DESC_PROBE_PATH_ABS, v);
+        blob_total = blob.size;
+        fprintf(stderr, "build: probe dump -> %s (%llu dirty, %llu newseg, "
+                        "%.1f MB buffer)\n",
+                probe_dump_path,
+                (unsigned long long)n_dirty_total,
+                (unsigned long long)n_newseg_total,
+                probe_bytes / 1048576.0);
+    }
 #if defined(__aarch64__)
     free(ab.sites);
     free(ab.runs);

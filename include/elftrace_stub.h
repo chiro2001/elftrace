@@ -61,15 +61,17 @@
 #define STUB_FRAME_SIZE     0x1600       /* 5632B: ucontext + fpstate 区 */
 #define STUB_ENTRY_OFF      0x62C0
 #endif
-#define STUB_FIXED_SIZE     0x8000
-/* strict baremetal 专用区 (固定区末尾 0x400):
+/* 固定区 64KB: strict 专用区搬到末尾 4KB, 容纳补偿引擎 + 字节 run
+ * 回放 + probe dump 代码 (原 32KB 下 strict 区只剩 0x400, 放不下)。 */
+#define STUB_FIXED_SIZE     0x10000
+/* strict baremetal 专用区 (固定区末尾 0x1000):
  *   comp_engine (补偿引擎) / loop_handler (循环跳板) / strict_exit_code
  * build 的跳板 literal 直接引用这些绝对偏移 */
-#define STUB_STRICT_AREA_OFF (STUB_FIXED_SIZE - 0x600)
+#define STUB_STRICT_AREA_OFF (STUB_FIXED_SIZE - 0x1000)
 #define STUB_STRICT_COMP_OFF (STUB_STRICT_AREA_OFF)
-#define STUB_STRICT_LOOP_OFF (STUB_STRICT_AREA_OFF + 0x500)
-#define STUB_STRICT_COUNT_OFF (STUB_STRICT_AREA_OFF + 0x540)
-#define STUB_STRICT_EXIT_OFF (STUB_FIXED_SIZE - 0x20)
+#define STUB_STRICT_LOOP_OFF (STUB_STRICT_AREA_OFF + 0x900)
+#define STUB_STRICT_COUNT_OFF (STUB_STRICT_AREA_OFF + 0x940)
+#define STUB_STRICT_EXIT_OFF (STUB_FIXED_SIZE - 0x100)
 
 /* ---- rst_desc 字段偏移 (256B, 全 u64) ---- */
 #define RST_DESC_MAGIC      0x00
@@ -100,6 +102,17 @@
 #define RST_DESC_REPLAY_CUR  0xC8  /* 回放表游标 (stub 运行时维护, 顺序消费) */
 #define RST_DESC_TLS         0xD0  /* aarch64 TPIDR_EL0 (x86_64 保留 0) */
 #define RST_DESC_BM_STYLE    0xD8  /* baremetal 风格: 0=legacy 信号/brk, 1=strict 分支补偿 */
+#define RST_DESC_PROBE_ENABLED 0xE0 /* probe dump 使能 (0=关闭) */
+#define RST_DESC_PROBE_BUF_ABS  0xE8 /* probe 缓冲区绝对地址 (含 16B 头) */
+#define RST_DESC_PROBE_BUF_SIZE 0xF0 /* probe 已用字节数 (stub 运行时维护) */
+#define RST_DESC_PROBE_PATH_ABS 0xF8 /* probe 输出路径字符串绝对地址 */
+
+/* probe 文件头: magic "ELPR" + ver, 随后按记录顺序:
+ *   dirty:  {vaddr u64, data[4096]}
+ *   newseg: {vaddr u64, filesz u64, data[filesz]} */
+#define PROBE_FILE_MAGIC  0x52504C45ULL  /* "ELPR" LE */
+#define PROBE_FILE_VERSION 1
+#define PROBE_HDR_SIZE    16
 
 #define RST_DESC_MAGIC_VAL  0x5253544452455354  /* "RESTDSTR" */
 

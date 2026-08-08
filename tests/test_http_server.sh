@@ -5,12 +5,14 @@
 # 流程:
 #   Run 1: trace --atomic-replay → 校准 (compensation.txt)
 #   Run 2: trace --atomic-replay --atomic-compensate → 原始空间检查点
-#   build: 中间窗口 strict 切片 (原子回放 + 边界 diff + mock 扫描)
+#   build: 中间窗口 strict 切片 (原子回放 + 边界 diff + mock 扫描),
+#          先 probe (整页回放 + 预状态 dump) 再 byte-runs (32B granule
+#          回放表, 只补写切片未自然复现的并发写入)
 # 断言:
 #   1. 切片 rc=0 (不超时/不死锁);
 #   2. 目标阶段 (rt_sigreturn 后) 除 exit_group 外零 syscall;
-#   3. 输出指令数 (多线程边界 diff 回放数据量较大, 不套用 5% 原子
-#      补偿比例; 该比例只对原子跳板膨胀有效)。
+#   3. 输出指令数 (报告; granule 回放已把服务器窗口从 ~2.8M 压到
+#      ~500K; 手机窗口受 Python 等待自旋主导, 只报告不 gate)。
 set -u
 cd "$(dirname "$0")/.."
 source tests/testlib.sh
@@ -100,11 +102,24 @@ NCK=$(wc -l < "$TF_TMP/http_r2/manifest.txt")
 [ "$NCK" -ge 6 ] || { echo "FAIL: Run2 只有 $NCK 检查点"; exit 1; }
 echo "  Run2: $NCK ckpts, $(wc -l < "$TF_TMP/http_r2/syscalls/syscall.map") syscalls"
 
-# 中间窗口切片 (600K..1M)
+# 中间窗口切片 (600K..1M), 两阶段:
+#   1) probe 切片: 整页回放 + 每个 newseg/dirty 应用前 dump 预状态
+#   2) byte-run 切片: 用 probe 预状态压缩成 32B granule 回放表,
+#      主线程自身已复现的写入整体跳过, 回放指令数大幅下降
+tf_build /dev/null "$TF_TMP/http_probe.elf" --mode baremetal --bm-strict \
+    --checkpoints "$TF_TMP/http_r2" --from 3 --to 5 \
+    --stack-reserve 67108864 \
+    --probe-dump "$TF_TMP/http_probe.bin" > "$TF_TMP/http_build.log" 2>&1 \
+    || { echo "FAIL: probe build"; tail -5 "$TF_TMP/http_build.log"; exit 1; }
+timeout 600 "$TF_TMP/http_probe.elf" > /dev/null 2>&1
+PRC=$?
+[ "$PRC" = 0 ] || { echo "FAIL: probe slice rc=$PRC"; exit 1; }
+[ -s "$TF_TMP/http_probe.bin" ] || { echo "FAIL: 无 probe.bin"; exit 1; }
 tf_build /dev/null "$TF_TMP/http_slice.elf" --mode baremetal --bm-strict \
     --checkpoints "$TF_TMP/http_r2" --from 3 --to 5 \
-    --stack-reserve 67108864 > "$TF_TMP/http_build.log" 2>&1 \
-    || { echo "FAIL: build"; tail -5 "$TF_TMP/http_build.log"; exit 1; }
+    --stack-reserve 67108864 \
+    --byte-runs "$TF_TMP/http_probe.bin" > "$TF_TMP/http_build2.log" 2>&1 \
+    || { echo "FAIL: byte-run build"; tail -5 "$TF_TMP/http_build2.log"; exit 1; }
 
 # 目标阶段零 syscall
 timeout 120 strace -o "$TF_TMP/http_slice.strace" \

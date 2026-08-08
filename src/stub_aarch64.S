@@ -968,6 +968,28 @@ memcpy_bytes:
 3:
     ret
 
+/* probe_dump(x20=src_abs, x21=len, x24=blob_base)
+ * 把 src 的预状态追加到 probe 缓冲: {addr, len} + data[len]。
+ * 破坏 x0-x6, x30; x19-x28 保留 (memcpy_bytes 只碰 x0-x4)。 */
+probe_dump:
+    mov  x25, x30                  /* bl memcpy_bytes 会覆盖 x30 */
+    ldr  x0, [x24, #RST_DESC_PROBE_BUF_ABS]
+    ldr  x1, [x24, #RST_DESC_PROBE_BUF_SIZE]
+    add  x0, x0, x1
+    str  x20, [x0]
+    str  x21, [x0, #8]
+    add  x1, x1, #16
+    str  x1, [x24, #RST_DESC_PROBE_BUF_SIZE]
+    add  x0, x0, #16              /* dst = buf + 16 */
+    mov  x1, x20                  /* src */
+    mov  x2, x21
+    bl   memcpy_bytes
+    ldr  x1, [x24, #RST_DESC_PROBE_BUF_SIZE]
+    add  x1, x1, x21
+    str  x1, [x24, #RST_DESC_PROBE_BUF_SIZE]
+    mov  x30, x25
+    ret
+
 /* 解析 /proc/self/maps, 找到 [stack] 行, munmap 之。
  * 破坏: x0-x8, x19-x20 */
 unmap_initial_stack:
@@ -1334,7 +1356,7 @@ comp_scan:
     lsl  x1, x0, #2                 /* *64 */
     add  x0, x0, x1                 /* *80 */
     add  x0, x16, x0
-    add  x0, x0, #8                 /* rec */
+    add  x0, x0, #16                /* n_recs(8) + fmt(8) 之后 */
     ldr  x20, [x0]                  /* rec.pc */
     cmp  x20, x2
     beq  comp_found
@@ -1370,6 +1392,17 @@ comp_found:
     ldr  x27, [x23, #16]
     str  x27, [x26, #24]            /* rax */
 
+    /* blob base = 引擎绝对地址 - 固定偏移 (probe dump 用) */
+    adr  x24, comp_engine
+    movz x25, #(STUB_STRICT_COMP_OFF & 0xffff)
+    movk x25, #(STUB_STRICT_COMP_OFF >> 16), lsl #16
+    sub  x24, x24, x25
+    ldr  x0, [x24, #RST_DESC_PROBE_ENABLED]
+    cbnz x0, comp_probe
+    ldr  x0, [x16, #8]              /* 回放表 fmt: 0=整页, 1=字节 run */
+    cbnz x0, comp_runs
+
+    /* ---- 常规 (无 probe): newseg / dirty 整页回放 ---- */
     /* newseg: 把记录数据写入预映射区 (纯访存) */
     ldr  x18, [x23, #40]            /* n_newseg */
     ldr  x19, [x23, #48]
@@ -1403,6 +1436,129 @@ comp_dirty_loop:
     add  x19, x19, #8
     sub  x18, x18, #1
     b    comp_dirty_loop
+
+    /* ---- probe 模式: 应用前把预状态 dump 进 probe 缓冲 ---- */
+comp_probe:
+    ldr  x18, [x23, #40]            /* n_newseg */
+    ldr  x19, [x23, #48]
+    add  x19, x19, x16
+comp_probe_ns_loop:
+    cbz  x18, comp_probe_dirty
+    ldr  x20, [x19]                 /* vaddr (预映射区, 即预状态) */
+    ldr  x21, [x19, #8]             /* filesz */
+    add  x22, x19, #32              /* src (录制内容) */
+    bl   probe_dump
+    mov  x0, x20
+    mov  x1, x22
+    mov  x2, x21
+    bl   memcpy_bytes
+    add  x19, x19, #32
+    add  x19, x19, x21
+    sub  x18, x18, #1
+    b    comp_probe_ns_loop
+comp_probe_dirty:
+    ldr  x18, [x23, #56]            /* n_dirty */
+    ldr  x19, [x23, #64]
+    add  x19, x19, x16
+comp_probe_d_loop:
+    cbz  x18, comp_done
+    ldr  x20, [x19]                 /* dst (预状态) */
+    mov  x21, #4096
+    bl   probe_dump
+    add  x22, x19, #8               /* src (录制页) */
+    mov  x0, x20
+    mov  x1, x22
+    mov  x2, x21
+    bl   memcpy_bytes
+    add  x19, x19, #4096
+    add  x19, x19, #8
+    sub  x18, x18, #1
+    b    comp_probe_d_loop
+
+    /* ---- 字节 run 回放 (fmt=1): newseg/dirty 均为
+       {vaddr, n_gran, mode, size} + granule 流 ---- */
+comp_runs:
+    mov  x25, x23                   /* rec base */
+    adr  x27, comp_done             /* 应用完跳回 comp_done */
+    b    apply_rec_runs
+
+/* apply_rec_runs: x25=rec base, x16=replay_abs, x27=完成地址。
+ * 应用 newseg + dirty 的 32B granule / 整段回放 (纯访存)。
+ * 每条 entry: {vaddr u64, n_gran u32, mode u32, size u32, pad u32};
+ *   mode=1: {off u32, data[32]} × n_gran
+ *   mode=2: data[size] 整段
+ * 破坏 x18-x22, x24, x26; x23 (rec base) 保留。 */
+apply_rec_runs:
+    ldr  x18, [x25, #40]            /* n_newseg (emitted) */
+    ldr  x19, [x25, #48]
+    add  x19, x19, x16
+arr_ns_loop:
+    cbz  x18, arr_dirty
+    ldr  x20, [x19]                 /* vaddr */
+    ldr  w21, [x19, #8]             /* n_gran */
+    ldr  w22, [x19, #12]            /* mode */
+    ldr  w26, [x19, #16]            /* size */
+    add  x19, x19, #24
+    cmp  w22, #2
+    beq  arr_full_ns
+arr_gran_ns:
+    cbz  w21, arr_ns_adv
+    ldr  w24, [x19]                 /* off */
+    add  x0, x20, x24
+    add  x1, x19, #4
+    ldp  x4, x5, [x1]
+    ldp  x6, x7, [x1, #16]
+    stp  x4, x5, [x0]
+    stp  x6, x7, [x0, #16]
+    add  x19, x19, #36
+    sub  w21, w21, #1
+    b    arr_gran_ns
+arr_full_ns:
+    mov  x0, x20
+    mov  x1, x19
+    mov  x2, x26
+    bl   memcpy_bytes
+    add  x19, x19, x26
+arr_ns_adv:
+    sub  x18, x18, #1
+    cbnz x18, arr_ns_loop
+arr_dirty:
+    ldr  x18, [x25, #56]            /* n_dirty (emitted) */
+    ldr  x19, [x25, #64]
+    add  x19, x19, x16
+arr_d_loop:
+    cbz  x18, arr_done
+    ldr  x20, [x19]                 /* vaddr */
+    ldr  w21, [x19, #8]             /* n_gran */
+    ldr  w22, [x19, #12]            /* mode */
+    ldr  w26, [x19, #16]            /* size */
+    add  x19, x19, #24
+    cmp  w22, #2
+    beq  arr_full_d
+arr_gran_d:
+    cbz  w21, arr_d_adv
+    ldr  w24, [x19]                 /* off */
+    add  x0, x20, x24
+    add  x1, x19, #4
+    ldp  x4, x5, [x1]
+    ldp  x6, x7, [x1, #16]
+    stp  x4, x5, [x0]
+    stp  x6, x7, [x0, #16]
+    add  x19, x19, #36
+    sub  w21, w21, #1
+    b    arr_gran_d
+arr_full_d:
+    mov  x0, x20
+    mov  x1, x19
+    mov  x2, x26
+    bl   memcpy_bytes
+    add  x19, x19, x26
+arr_d_adv:
+    sub  x18, x18, #1
+    cbnz x18, arr_d_loop
+arr_done:
+    br   x27
+
 comp_done:
     ldr  x1, [x23, #16]             /* rec.rax */
     str  x1, [x17, #24]             /* x0 槽 */
@@ -1419,9 +1575,12 @@ comp_exhausted:
 /* ---- mock (无回放表, freeze 快照) ---- */
 comp_mock:
     ldr  x16, [x17, #16]            /* replay_abs (comp_exhausted 已破坏) */
-    ldr  x2, [x17, #(24 + 8*8)]     /* 目标 x8 = syscall 号 */
     adrp x5, debug_ring
     add  x5, x5, :lo12:debug_ring
+    ldr  x0, [x5, #0x1020]
+    add  x0, x0, #1
+    str  x0, [x5, #0x1020]          /* 调试: mock 命中计数 */
+    ldr  x2, [x17, #(24 + 8*8)]     /* 目标 x8 = syscall 号 */
     str  x2, [x5, #0x1010]          /* 调试: 记录最近 mock sysno */
     /* mock 自旋检测: 同一 mock 站点连续命中超过阈值 (中间无真实回放)
        说明切片在 Python 级等待循环里空转 (等待并发线程设置的共享标志,
@@ -1446,7 +1605,13 @@ comp_mock:
     mov  x4, #80
     mul  x4, x3, x4
     add  x4, x4, x16
-    add  x4, x4, #8                 /* x4 = rec base */
+    add  x4, x4, #16                /* x4 = rec base (跳过 n_recs+fmt) */
+    ldr  x0, [x16, #8]              /* fmt: 1 → 字节 run 应用 */
+    cbz  x0, mock_legacy_apply
+    mov  x25, x4
+    adr  x27, mock_applied
+    b    apply_rec_runs
+mock_legacy_apply:
     ldr  x18, [x4, #40]             /* n_newseg */
     ldr  x19, [x4, #48]
     add  x19, x19, x16
@@ -1670,6 +1835,39 @@ count_handler:
  * 唯一路径退出/循环结束跳到这里: 真实 exit_group(0)。 */
 .org STUB_STRICT_EXIT_OFF
 strict_exit_code:
+    /* probe 模式: 把 probe 缓冲写盘 (openat/write/close) 再退出。
+       仅诊断构建启用 (RST_DESC_PROBE_ENABLED=1), 最终切片保持 0,
+       此处只走真实 exit_group。 */
+    adrp x16, strict_exit_code
+    add  x16, x16, :lo12:strict_exit_code
+    movz x17, #(STUB_STRICT_EXIT_OFF & 0xffff)
+    movk x17, #(STUB_STRICT_EXIT_OFF >> 16), lsl #16
+    sub  x16, x16, x17              /* blob base */
+    ldr  x0, [x16, #RST_DESC_PROBE_ENABLED]
+    cbz  x0, se_exit
+    mov  x0, #AT_FDCWD
+    ldr  x1, [x16, #RST_DESC_PROBE_PATH_ABS]
+    mov  x2, #0x241                 /* O_WRONLY|O_CREAT|O_TRUNC */
+    mov  x3, #0644
+    mov  x8, #56                    /* openat */
+    svc  #0
+    tbnz x0, #63, se_exit
+    mov  x19, x0                    /* fd */
+    ldr  x0, [x16, #RST_DESC_PROBE_BUF_ABS]
+    movz x3, #0x4C45                /* "ELPR" LE */
+    movk x3, #0x5250, lsl #16
+    str  x3, [x0]
+    mov  x3, #1                     /* PROBE_FILE_VERSION */
+    str  x3, [x0, #8]
+    mov  x0, x19                    /* fd */
+    ldr  x1, [x16, #RST_DESC_PROBE_BUF_ABS]
+    ldr  x2, [x16, #RST_DESC_PROBE_BUF_SIZE]
+    mov  x8, #64                    /* write */
+    svc  #0
+    mov  x0, x19
+    mov  x8, #57                    /* close */
+    svc  #0
+se_exit:
     mov  x0, #0
     mov  x8, #94
     svc  #0
