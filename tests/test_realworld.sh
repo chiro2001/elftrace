@@ -1,7 +1,7 @@
 #!/bin/bash
 # aarch64 真实场景负载 strict baremetal 测试:
-#   C 负载: CRC32 文件校验 / RLE 压缩 / JSON 数字解析
-#   真实 CLI: sha256sum / gzip
+#   C 负载: CRC32 文件校验 / RLE 压缩 / JSON 数字解析 / SHA-256 文件哈希
+#           / 分配器压力 / AF_UNIX socketpair IPC / 目录遍历+stat
 # 每个负载:
 #   1. ref 完整运行 → rc/输出
 #   2. trace 全程 (syscall 稀疏) → strict 全窗口切片 (从 0 到末尾):
@@ -22,18 +22,26 @@ ELFTRACE="$TF_ELFTRACE"
 DATA="$TF_TMP/rw_data.bin"
 JSON="$TF_TMP/rw_data.json"
 
-# 生成测试数据 (16MB 伪随机 + 4MB JSON)
+# 生成测试数据 (32MB 伪随机 + 4MB JSON + 256 文件目录)
 python3 - <<'EOF'
-import random, json
+import os, random, shutil
 r = random.Random(42)
 with open("tmp/rw_data.bin", "wb") as f:
     f.write(bytes(r.randrange(256) for _ in range(32 << 20)))
 with open("tmp/rw_data.json", "w") as f:
     f.write("{\"items\":[")
     for i in range(800000):
-        if i: f.write(",")
+        if i:
+            f.write(",")
         f.write("{\"id\":%d,\"v\":%d}" % (i, i * 31 % 1000000))
     f.write("]}")
+d = "tmp/rw_dir"
+shutil.rmtree(d, ignore_errors=True)
+os.makedirs(d, exist_ok=True)
+for i in range(64):
+    with open(os.path.join(d, "f%03d" % i), "wb") as f:
+        f.write(bytes(((i * 7 + j * 13) & 0xff)
+                      for j in range(4096)))
 EOF
 
 # 通用 (C 负载): ref → trace → 全窗口 strict 切片 + 中间窗口 strict 切片
@@ -48,13 +56,14 @@ run_load() {
     rm -rf "$TF_TMP/rw_${name}_ckpts"
     "$prog" "$@" > "$TF_TMP/rw_${name}_tr.out" 2>&1 &
     local PID=$!
+    local every="${EVERY:-100000000}"
     for _ in $(seq 1 100); do
         grep -q READY "$TF_TMP/rw_${name}_tr.out" 2>/dev/null && break
         sleep 0.05
     done
     grep -q READY "$TF_TMP/rw_${name}_tr.out" \
         || { echo "  FAIL: READY not seen"; return 1; }
-    timeout 600 "$ELFTRACE" trace "$PID" --every 100000000 \
+    timeout 600 "$ELFTRACE" trace "$PID" --every "$every" \
         --out "$TF_TMP/rw_${name}_ckpts" > /dev/null 2>&1
     wait $PID 2>/dev/null
     local NCK=$(wc -l < "$TF_TMP/rw_${name}_ckpts/manifest.txt")
@@ -95,13 +104,22 @@ run_load() {
 gcc -O0 -g -o "$TF_TMP/prog_crc32" tests/prog_crc32.c || exit 1
 gcc -O0 -g -o "$TF_TMP/prog_lz" tests/prog_lz.c || exit 1
 gcc -O0 -g -o "$TF_TMP/prog_json" tests/prog_json.c || exit 1
+gcc -O0 -g -o "$TF_TMP/prog_sha256" tests/prog_sha256.c || exit 1
+gcc -O0 -g -o "$TF_TMP/prog_alloc" tests/prog_alloc.c || exit 1
+gcc -O0 -g -o "$TF_TMP/prog_sockpair" tests/prog_sockpair.c || exit 1
+gcc -O0 -g -o "$TF_TMP/prog_dir" tests/prog_dir.c || exit 1
 
 R=0
 run_load crc32 "$TF_TMP/prog_crc32" "$DATA" || R=1
 run_load lz "$TF_TMP/prog_lz" "$DATA" "$TF_TMP/rw_out.lz" || R=1
 run_load json "$TF_TMP/prog_json" "$JSON" || R=1
+run_load sha256 "$TF_TMP/prog_sha256" "$DATA" || R=1
+run_load alloc "$TF_TMP/prog_alloc" || R=1
+EVERY=20000000 run_load sock "$TF_TMP/prog_sockpair" || R=1
+EVERY=10000000 run_load dir "$TF_TMP/prog_dir" "$TF_TMP/rw_dir" || R=1
 
-tf_cleanup prog_crc32 prog_lz prog_json
+tf_cleanup prog_crc32 prog_lz prog_json prog_sha256 prog_alloc \
+    prog_sockpair prog_dir
 [ "$R" = 0 ] || { echo "FAIL: realworld 有失败"; exit 1; }
-tf_pass "realworld strict (crc32/lz/json/sha256sum/gzip)"
+tf_pass "realworld strict (crc32/lz/json/sha256/alloc/sockpair/dir)"
 tf_finish

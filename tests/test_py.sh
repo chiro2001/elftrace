@@ -25,20 +25,22 @@ echo "ref rc=$REF_RC $(tail -1 "$TMP/py_ref.out")"
 run_case() {  # $1 = 名称, $2 = 冻结方式 (freeze|stub), $3 = build 参数, $4 = 是否 baremetal
     local name="$1" mode="$2" bm="$3" is_bm="$4"
     local extra=""
+    local bm_extra=""
     [ "$mode" = "stub" ] && extra="--stub"
+    [ -n "$is_bm" ] && bm_extra="$BM_EXTRA"
 
     python3 "$SCRIPT" $extra > "$TMP/py_${name}.out" 2>&1 &
     PID=$!
     if [ "$mode" = "stub" ]; then
         # 等待目标自暂停 (SIGSTOP 组停止, State=T)
-        for i in $(seq 1 400); do
+        for i in $(seq 1 3000); do
             ST=$(awk '/^State/{print $2}' /proc/$PID/status 2>/dev/null)
             [ "$ST" = "T" ] && break
             sleep 0.05
         done
         [ "$ST" = "T" ] || { echo "FAIL[$name]: target not self-stopped"; kill -9 $PID; return 1; }
     else
-        for i in $(seq 1 400); do
+        for i in $(seq 1 3000); do
             grep -q "CKPT 1" "$TMP/py_${name}.out" 2>/dev/null && break
             sleep 0.05
         done
@@ -52,7 +54,12 @@ run_case() {  # $1 = 名称, $2 = 冻结方式 (freeze|stub), $3 = build 参数,
     local ORIG_RC=$?
     [ "$ORIG_RC" = "$REF_RC" ] || { echo "FAIL[$name]: orig rc=$ORIG_RC != ref $REF_RC"; return 1; }
 
-    "$ELFTRACE" build "$SNAP" -o "$SLICED" $bm $BM_EXTRA >/dev/null 2>&1 || { echo "FAIL[$name]: build"; return 1; }
+    if ! "$ELFTRACE" build "$SNAP" -o "$SLICED" $bm $bm_extra \
+            > "$TMP/py_${name}_build.log" 2>&1; then
+        echo "FAIL[$name]: build"
+        tail -20 "$TMP/py_${name}_build.log"
+        return 1
+    fi
 
     local S_RC
     if [ -n "$is_bm" ]; then

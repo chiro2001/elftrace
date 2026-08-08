@@ -29,6 +29,10 @@ tests/run_tests.sh   # 一键运行全部 17 项测试（basic/dbg/fd/ipc/cpp/fd
                      # py/syscall/stack/bigmem/thread/append/bareheap/
                      # interval/bundle/baremetal/imix；imix 在
                      # tests/IMIX/test_imix.sh，run_tests 特判路径）
+                     # 顺序已改为 strict 第一个 (aarch64 重点先验)
+tests/test_strict.sh # aarch64 strict baremetal: freeze mock / 回放 / ioctl
+tests/test_realworld.sh # aarch64 strict 真实负载 (7 个, 见下)
+tests/test_comp_ratio.sh # 补偿指令比例指标 (perf 实测 vs 预期窗口, <=5%)
 ```
 
 测试脚本约定（新增测试必须遵守）：
@@ -173,6 +177,12 @@ exit_group 外零 syscall。
     恢复现场 (x0=rax, 仅 x16/x17 破坏);
   - **rec 指针必须保存在 x23** (memcpy 破坏 x0-x5, 曾致 dirty 循环后
     rax 读错/越界)。
+- 裸 mock 扫描 (freeze 快照, 无回放表):
+  - 回看 128 条指令找 syscall 号装载定式: `movz/movk x8/x16/w8/w16`
+    (musl 共享 trampoline 的 mov x8 距 svc 可达 74 条; vDSO 用 w8);
+  - 段内容若以 ELF64 头开始, 先解析内嵌 PT_LOAD(PF_X) 范围, 只在这些
+    范围内扫 `svc`, 避免同映射里的数据表误伤 (libstdc++ 实测 3 处
+    假 `d4000001` 前 256 条内无 syscall 号装载)。
 - 退出点:
   - 唯一路径: 目标指令 → `b <exit 跳板>` → strict_exit_code
     (STUB_STRICT_EXIT_OFF, exit_group(0));
@@ -182,6 +192,17 @@ exit_group 外零 syscall。
     如 j<n 越界); 改为 patch 目标指令 → count_handler
     (STUB_STRICT_COUNT_OFF), 计数器到 0 → 退出, 否则执行 blob 内
     原指令副本 (仅限非 PC 相对指令) 后跳回 P+4;
+  - 回边识别只认真正的控制流转移 (b/b.cond/cbz/cbnz/tbz/tbnz);
+    **bl/adr/adrp/ldr literal 不能当回边** (bl rotr32 曾被误判为
+    SHA-256 回边导致循环范围与 K 全错);
+  - 计数 K 由窗口指令数/循环体长估算, 与真实 P 命中数误差很大
+    (被调函数、提前退出等), 统一 **除以 8 保守化**: 宁可提前退出
+    (rc=0, 仍在窗口内) 也不能越过窗口跑到自然 exit 漏 syscall。
+  - **补偿指令比例**: 预期 T = manifest[to].count - manifest[from].count,
+    实际 A = `perf stat -e instructions` 切片运行数, 补偿 C = A-T,
+    比例 R = C/A, 要求 R <= 5%。`--bm-exit-count N` 可覆盖循环 K,
+    test_comp_ratio.sh 用 K <- K*T/A 迭代校准 (A 与 K 近似线性),
+    4 轮内收敛到 R≈0%。
   - 站点块/跳板必须 16B 对齐 (内嵌可执行指令; blob 尺寸可能非对齐,
     build 已补)。
 - 采集侧:
@@ -198,9 +219,16 @@ exit_group 外零 syscall。
 
 - tests/test_strict.sh: freeze mock / trace 回放中间窗口 / ioctl 设备
   操作负载 (prog_ioctl.c)。
-- tests/test_realworld.sh: CRC32 文件校验 (prog_crc32.c)、RLE 压缩
-  (prog_lz.c)、JSON 数字解析 (prog_json.c) — 每负载 trace 全程 +
+- tests/test_realworld.sh: 7 个真实负载 — CRC32 (prog_crc32.c)、RLE
+  压缩 (prog_lz.c)、JSON 数字解析 (prog_json.c)、文件 SHA-256
+  (prog_sha256.c)、分配器压力 (prog_alloc.c)、AF_UNIX socketpair
+  (prog_sockpair.c)、目录遍历+stat (prog_dir.c)。每负载 trace 全程 +
   全窗口 strict 切片 (rc == ref) + 中间窗口切片 (rc=0, 零 syscall)。
-  注意: 真机每 syscall 采集约 20-40s (全量内存 diff), 数据量需控制在
-  trace 超时内 (32MB/4MB 块 ≈ 8-16 syscall)。
+  sock/dir 用 `EVERY=20M/10M` 采样 (syscall 密集负载), 其余 100M;
+  dir 在 READY 后 sleep 2s 等 tracer attach。
+- tests/test_py.sh: 真机 postmarketOS 上 CPython 8M×5 循环较慢,
+  等待 CKPT 1 的超时已放宽到 150s。
+- tests/test_comp_ratio.sh: prog_calib (约 600M 指令) trace 中间 40M
+  窗口 → strict 切片 → perf 实测 → 校准 K → 断言补偿比例 <=5% 且
+  目标阶段零 syscall。
 - 其余 baremetal 测试在 aarch64 上自动加 --bm-strict。

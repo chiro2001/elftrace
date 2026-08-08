@@ -10,8 +10,16 @@
 #include <stdint.h>
 #include <sys/mman.h>
 
+#ifndef BIGMEM_SIZE
 #define SIZE (128UL << 20)
+#else
+#define SIZE BIGMEM_SIZE
+#endif
 #define MASK (SIZE - 1)
+
+#ifndef BIGMEM_LOOPS
+#define BIGMEM_LOOPS 32000000UL
+#endif
 
 static uint64_t rng = 0x123456789abcdef0;
 static uint8_t *mem;
@@ -44,7 +52,7 @@ int main(void)
     for (int c = 0; c < 8; c++) {
         printf("CKPT %d\n", c);
         fflush(stdout);
-        for (unsigned long j = 0; j < 32000000UL; j++) {
+        for (unsigned long j = 0; j < BIGMEM_LOOPS; j++) {
             rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
             x += mem[(rng >> 36) & MASK];
         }

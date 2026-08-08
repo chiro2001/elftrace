@@ -507,8 +507,11 @@ int trace_main(int argc, char **argv)
             int r = poll(&pfd, 1, 100);
             if (r > 0 && (pfd.revents & POLLIN)) {
                 uint64_t ip;
-                while ((ip = perf_next_sample(&tc)) != 0)
+                while ((ip = perf_next_sample(&tc)) != 0) {
+                    if (kill(pid, 0) < 0 && errno == ESRCH)
+                        goto main_done;
                     ckpt_take(&tc, 0);
+                }
                 if (kill(pid, 0) == 0)
                     ptrace(PTRACE_SYSCALL, pid, 0, 0);
             }
@@ -521,7 +524,10 @@ int trace_main(int argc, char **argv)
                 if (read(tc.perf_fd, &val, sizeof(val)) == sizeof(val) &&
                     val >= tc.count + tc.every) {
                     uint64_t ip;
-                    while ((ip = perf_next_sample(&tc)) != 0) {}
+                    while ((ip = perf_next_sample(&tc)) != 0) {
+                        if (kill(pid, 0) < 0 && errno == ESRCH)
+                            goto main_done;
+                    }
                     ckpt_take(&tc, 0);
                     if (kill(pid, 0) == 0)
                         ptrace(PTRACE_SYSCALL, pid, 0, 0);

@@ -60,6 +60,13 @@ uint64_t a64_branch_target(uint32_t w, uint64_t pc)
 
 int a64_backward_branch_target(uint32_t w, uint64_t pc, uint64_t *target)
 {
+    /* 只有真正的控制流转移才算回边: bl 是函数调用, adr/adrp/ldr
+     * literal 只是取地址/取数据, 虽然也是 PC 相对且可能指向低地址,
+     * 但不应被当成循环回边 (曾导致 SHA-256 里 bl rotr32 被误判为
+     * 回边, 循环范围/计数 K 全错)。 */
+    if (a64_is_bl(w) || a64_is_adr(w) || a64_is_adrp(w) ||
+        a64_is_ldr_literal(w))
+        return 0;
     uint64_t t = a64_branch_target(w, pc);
     if (!t || t >= pc)
         return 0;

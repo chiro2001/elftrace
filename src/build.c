@@ -204,25 +204,89 @@ static uint64_t find_gap_near(const elftrace_seg *segs, size_t nsegs,
     return 0;
 }
 
-/* aarch64: svc 前 4 条指令内是否出现 movz x8, #imm (真 syscall 的
- * 定式)。可执行段里的 0xd4000001 可能是数据表/跳转表内容 (libstdc++
- * 大量出现), 只 patch 有 syscall 号装载定式的站点, 避免误伤。 */
+/* aarch64: svc 前 128 条指令内是否出现 syscall 号装载定式
+ * (movz/movk x8/x16/w8/w16, #imm)。真实 syscall 的装载点可能离 svc
+ * 很远: musl 的共享 trampoline 可达 74 条 (先装号再 b 到公共路径,
+ * 公共路径里还有 EINTR 重试直通 svc); vDSO 使用 w8 变体。可执行段里的
+ * 0xd4000001 可能是数据表/跳转表内容 (libstdc++ 大量出现), 数据表中
+ * 前后没有 syscall 号装载, 因此该检查可避免误伤。 */
 static int a64_mov_x8_before(const uint8_t *code, uint64_t filesz,
                              uint64_t off)
 {
-    for (int k = 1; k <= 4; k++) {
+    for (int k = 1; k <= 128; k++) {
         if (off < (uint64_t)k * 4)
             break;
         uint32_t w = a64_insn(code + off - (uint64_t)k * 4);
-        if ((w & 0xFFE0001FU) == 0xD2800008U)
+        switch (w & 0xFFE0001FU) {
+        case 0xD2800008U:   /* movz x8, #imm */
+        case 0xF2800008U:   /* movk x8, #imm */
+        case 0x52800008U:   /* movz w8, #imm */
+        case 0x72800008U:   /* movk w8, #imm */
+        case 0xD2800010U:   /* movz x16, #imm */
+        case 0xF2800010U:   /* movk x16, #imm */
+        case 0x52800010U:   /* movz w16, #imm */
+        case 0x72800010U:   /* movk w16, #imm */
             return 1;
+        }
     }
+    return 0;
+}
+
+/* 若段内容以 ELF64 头开始 (file-backed 映射), 提取其中 PF_X 的
+ * PT_LOAD 文件范围, 供 mock 扫描只扫真正的可执行代码。返回范围数;
+ * 非 ELF/无法解析返回 0 (调用方回退全段扫描)。 */
+static int a64_seg_exec_ranges(const uint8_t *p, uint64_t filesz,
+                               uint64_t ranges[][2], int max)
+{
+    if (filesz < 64 || memcmp(p, "\177ELF", 4) != 0)
+        return 0;
+    uint16_t machine, phentsize, phnum;
+    uint64_t phoff;
+    memcpy(&machine, p + 18, 2);
+    memcpy(&phoff, p + 32, 8);
+    memcpy(&phentsize, p + 54, 2);
+    memcpy(&phnum, p + 56, 2);
+    if (machine != 183 /* EM_AARCH64 */ || phentsize < 56 || !phnum)
+        return 0;
+    if (phoff + (uint64_t)phnum * phentsize > filesz)
+        return 0;
+    int n = 0;
+    for (uint16_t i = 0; i < phnum && n < max; i++) {
+        const uint8_t *ph = p + phoff + (uint64_t)i * phentsize;
+        uint32_t type, flags;
+        uint64_t offset, p_filesz;
+        memcpy(&type, ph, 4);
+        memcpy(&flags, ph + 4, 4);
+        memcpy(&offset, ph + 8, 8);
+        memcpy(&p_filesz, ph + 32, 8);
+        if (type != 1 /* PT_LOAD */ || !(flags & 1) /* PF_X */ ||
+            !p_filesz)
+            continue;
+        uint64_t a = offset;
+        uint64_t b = offset + p_filesz;
+        if (b > filesz)
+            b = filesz;
+        if (a < b) {
+            ranges[n][0] = a;
+            ranges[n][1] = b;
+            n++;
+        }
+    }
+    return n;
+}
+
+static int a64_in_exec_ranges(const uint64_t ranges[][2], int nr,
+                              uint64_t off)
+{
+    for (int i = 0; i < nr; i++)
+        if (off >= ranges[i][0] && off < ranges[i][1])
+            return 1;
     return 0;
 }
 
 /* strict 模式构建: 收集站点 → 生成跳板/站点块 → patch 指令 →
  * 计算额外 PT_LOAD (跳板页/未来 newseg/栈预留)。
- * 返回 0 成功; 写 *pl_out/*npl_out。 */
+ * 返回 0 成功; 写 *pl_out / *npl_out。 */
 static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                                 uint64_t base, uint64_t blob_total,
                                 uint64_t payload_off,
@@ -232,6 +296,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                                 uint64_t exit_override,
                                 const uint64_t *ckpt_pcs, size_t nckpt_pcs,
                                 uint64_t count_from, uint64_t count_to,
+                                uint64_t exit_count_override,
                                 uint64_t stack_reserve,
                                 uint64_t replay_off,
                                 uint64_t heap_end,
@@ -322,9 +387,14 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 continue;
             const uint8_t *basep = blob->data + payload_off +
                                    segs[i].payload_off;
+            uint64_t exec_ranges[8][2];
+            int nr = a64_seg_exec_ranges(basep, segs[i].filesz,
+                                         exec_ranges, 8);
             for (uint64_t j = 0; j + 4 <= segs[i].filesz; j += 4) {
                 if (!a64_is_svc0(a64_insn(basep + j)))
                     continue;
+                if (nr && !a64_in_exec_ranges(exec_ranges, nr, j))
+                    continue;   /* 段内非可执行部分 (如 ELF 头/RW 数据) */
                 if (!a64_mov_x8_before(basep, segs[i].filesz, j))
                     continue;   /* 数据表误报, 跳过 */
                 if (nsites == sites_cap) {
@@ -360,7 +430,17 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
         uint64_t head = 0, backedge = 0;
         const uint8_t *code = blob->data + payload_off +
                               segs[seg_idx].payload_off;
-        int in_loop = a64_find_loop_backedge(code, segs[seg_idx].vaddr,
+        /* vDSO/vvar 是内核映射的共享代码, 内部有大量低地址相对引用,
+           a64_find_loop_backedge 会把无关的向后 b/bl 误判成巨型循环
+           (ioctl 检查点落在 clock_gettime 时曾把 libc 到 vdso 的
+           范围当成循环体, 计数退出永不触发)。vDSO 内不套用循环分析,
+           直接在目标指令埋唯一路径 exit。 */
+        const char *seg_name = sn_str(s, segs[seg_idx].name_off);
+        int in_vdso = strstr(seg_name, "vdso") != NULL ||
+                      strstr(seg_name, "vvar") != NULL;
+        int in_loop = 0;
+        if (!in_vdso)
+            in_loop = a64_find_loop_backedge(code, segs[seg_idx].vaddr,
                                              segs[seg_idx].filesz,
                                              exit_override, &head,
                                              &backedge);
@@ -399,6 +479,16 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             uint64_t iters = total * frac / 100 / (body_len ? body_len : 1);
             if (iters < 1)
                 iters = 1;
+            /* 保守八等分: perf 指令计数与静态 body_len 的换算并不精确
+               (body 内 bl 调用的被调函数、条件分支提前退出等都会让
+               实际 P 命中数远小于估算), 宁可提前退出 (仍在窗口内,
+               rc=0) 也不能让 counter 越过目标窗口跑到自然 exit, 否则
+               窗口外的 syscall 会真实泄漏。 */
+            iters /= 8;
+            if (iters < 1)
+                iters = 1;
+            if (exit_count_override)
+                iters = exit_count_override;
             st->rec_id = (int)iters;    /* 复用字段存迭代数 */
             /* 回边无条件 (do-while): patch 回边 → 跳板 counter;
                回边条件 (while): 必须保留循环自身退出语义, 改为在
@@ -895,6 +985,7 @@ int build_main(int argc, char **argv)
     uint64_t replay_off = 0;    /* baremetal syscall 回放表 (blob 相对) */
     uint64_t replay_size = 0;
     uint64_t stack_vaddr = 0;   /* [stack] 段 vaddr (MAP_GROWSDOWN) */
+    uint64_t exit_count_override = 0; /* --bm-exit-count: 覆盖循环 K */
     /* strict 循环判定用: 窗口内检查点 PC 与计数 */
     uint64_t *ckpt_pcs = NULL;
     size_t nckpt_pcs = 0;
@@ -919,6 +1010,9 @@ int build_main(int argc, char **argv)
                 die("--mode must be real or baremetal");
         } else if (strcmp(argv[i], "--bm-strict") == 0) {
             bm_strict = 1;
+        } else if (strcmp(argv[i], "--bm-exit-count") == 0 &&
+                   i + 1 < argc) {
+            exit_count_override = strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--stack-reserve") == 0 &&
                    i + 1 < argc) {
             stack_reserve = strtoull(argv[++i], NULL, 0);
@@ -942,14 +1036,14 @@ int build_main(int argc, char **argv)
             die("usage: elftrace build <file.elftrace> [-o out.elf] "
                 "[--mode real|baremetal] [--ipc N] [--checkpoints DIR] "
                 "[--from K] [--to M] [--breakpoint ADDR] "
-                "[--bm-strict] [--stack-reserve N]");
+                "[--bm-strict] [--bm-exit-count N] [--stack-reserve N]");
         }
     }
     if (!in)
         die("usage: elftrace build <file.elftrace> [-o out.elf] "
             "[--mode real|baremetal] [--ipc N] [--checkpoints DIR] "
             "[--from K] [--to M] [--breakpoint ADDR] "
-            "[--bm-strict] [--stack-reserve N]");
+            "[--bm-strict] [--bm-exit-count N] [--stack-reserve N]");
 #if !defined(__aarch64__)
     if (bm_strict)
         die("--bm-strict is only supported on aarch64 builds");
@@ -1492,8 +1586,15 @@ int build_main(int argc, char **argv)
                     }
                 }
 #else
+                uint64_t exec_ranges[8][2];
+                int nr = a64_seg_exec_ranges(blob.data + base,
+                                             segs[i].filesz,
+                                             exec_ranges, 8);
                 for (uint64_t j = 0; j + 4 <= segs[i].filesz; j += 4) {
                     if (arch_is_syscall(blob.data + base + j, 4)) {
+                        if (nr &&
+                            !a64_in_exec_ranges(exec_ranges, nr, j))
+                            continue;
                         if (!a64_mov_x8_before(blob.data + base,
                                                segs[i].filesz, j))
                             continue;   /* 数据表误报 */
@@ -1600,6 +1701,7 @@ int build_main(int argc, char **argv)
                                  recs, nrecs, have_map, exit_override,
                                  ckpt_pcs, nckpt_pcs,
                                  ckpt_count0, ckpt_count_to,
+                                 exit_count_override,
                                  stack_reserve, replay_off,
                                  heap_end,
                                  &sploads, &n_sploads,

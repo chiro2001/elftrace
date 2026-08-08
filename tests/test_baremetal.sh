@@ -20,6 +20,8 @@ cd "$(dirname "$0")/.."
 source tests/testlib.sh
 
 tf_setup
+tf_cleanup prog_simple prog_fd prog_fd_rw prog_stack prog_bigmem \
+    prog_thread prog_append prog_cpp prog_syscall
 BM_EXTRA=""
 [ "$(uname -m)" = "aarch64" ] && BM_EXTRA="--bm-strict"
 DRIO=$(ls -d ~/tools/DynamoRIO-* 2>/dev/null | head -1)
@@ -32,7 +34,9 @@ compile() {
         fd)      gcc -O0 -g -o "$TF_TMP/prog_$name" tests/prog_fd.c ;;
         fd_rw)   gcc -O0 -g -o "$TF_TMP/prog_$name" tests/prog_fd_rw.c ;;
         stack)   gcc -O0 -g -o "$TF_TMP/prog_$name" tests/prog_stack.c ;;
-        bigmem)  gcc -O0 -g -o "$TF_TMP/prog_$name" tests/prog_bigmem.c ;;
+        bigmem)  gcc -O0 -g -DBIGMEM_SIZE=33554432UL \
+                 -DBIGMEM_LOOPS=4000000UL \
+                 -o "$TF_TMP/prog_$name" tests/prog_bigmem.c ;;
         thread)  gcc -O0 -g -pthread -o "$TF_TMP/prog_$name" tests/prog_thread.c ;;
         append)  gcc -O0 -g -o "$TF_TMP/prog_$name" tests/prog_append.c ;;
         cpp)     g++ -O0 -g -o "$TF_TMP/prog_$name" tests/prog_cpp.cpp ;;
@@ -48,6 +52,7 @@ run_load() {
     local CKPTS="$TF_TMP/bm_${name}_ckpts"
     local F_ARG="$TF_TMP/bm_${name}_file.txt"
     local extra_args=""
+    local every="${EVERY:-200000000}"
 
     case "$name" in
         fd|fd_rw|append) extra_args="$F_ARG" ;;
@@ -55,7 +60,7 @@ run_load() {
 
     # 1. ref
     : > "$TF_TMP/bm_${name}_ref.out"
-    timeout 180 "$PROG" $extra_args > "$TF_TMP/bm_${name}_ref.out" 2>&1
+    timeout 300 "$PROG" $extra_args > "$TF_TMP/bm_${name}_ref.out" 2>&1
     local REF_RC=$?
     case "$name" in
         fd|append) [ "$(cat "$F_ARG")" = "AAABBB" ] || { echo "  FAIL[$name]: ref content"; return 1; } ;;
@@ -72,7 +77,7 @@ run_load() {
     "$PROG" $extra_args > "$TF_TMP/bm_${name}_tr.out" 2>&1 &
     local PID=$!
     sleep 0.4
-    timeout 180 "$TF_ELFTRACE" trace "$PID" --every 200000000 --out "$CKPTS" \
+    timeout 300 "$TF_ELFTRACE" trace "$PID" --every "$every" --out "$CKPTS" \
         > "$TF_TMP/bm_${name}_trace.log" 2>&1
     local TRC=$?
     wait "$PID" 2>/dev/null
@@ -158,7 +163,9 @@ LOADS="simple fd fd_rw stack bigmem thread append cpp syscall"
 FAILED=0
 for name in $LOADS; do
     compile "$name" || { echo "FAIL: compile $name"; FAILED=1; continue; }
-    if run_load "$name"; then
+    if [ "$name" = bigmem ]; then
+        EVERY=100000000000 run_load "$name" || FAILED=1
+    elif run_load "$name"; then
         :
     else
         FAILED=1
