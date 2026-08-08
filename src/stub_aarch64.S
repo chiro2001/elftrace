@@ -1418,6 +1418,7 @@ comp_exhausted:
 
 /* ---- mock (无回放表, freeze 快照) ---- */
 comp_mock:
+    ldr  x16, [x17, #16]            /* replay_abs (comp_exhausted 已破坏) */
     ldr  x2, [x17, #(24 + 8*8)]     /* 目标 x8 = syscall 号 */
     adrp x5, debug_ring
     add  x5, x5, :lo12:debug_ring
