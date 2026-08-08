@@ -244,12 +244,56 @@ int a64_is_ldar_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
     return 1;
 }
 
+/* 通用 load 检测: ldar 族 (kind=0), ldaxr 族 (kind=1, 需排他监视器),
+ * 普通 ldr w/x 立即数偏移 (kind=2, 多线程自旋标志位场景)。
+ * 普通 ldr 只在这里做候选判定, 是否真是自旋站点由扫描器的
+ * "load 值直接决定回边" 模式确认 (见 atomic_scan)。 */
+int a64_is_load_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
+                    int *kind)
+{
+    int ex = 0;
+    uint32_t base = w & 0xBFDFFC00U;
+    if (base == 0x08DFFC00U || base == 0x88DFFC00U) {
+        /* ldar 族 */
+    } else if (base == 0x085FFC00U || base == 0x885FFC00U) {
+        ex = 1;                 /* ldaxr 族 */
+    } else {
+        uint32_t lbase = w & 0xFFC00000U;
+        if (lbase == 0xB9400000U || lbase == 0xF9400000U) {
+            /* 普通 ldr w/x, [xN, #imm] (自旋候选) */
+            if (kind)
+                *kind = 2;
+            *size = lbase == 0xF9400000U ? 8 : 4;
+            *rt = w & 0x1FU;
+            *rn = (w >> 5) & 0x1FU;
+            return 1;
+        }
+        return 0;
+    }
+    if (kind)
+        *kind = ex;
+    if (base == 0x08DFFC00U || base == 0x085FFC00U)
+        *size = (w & 0x40000000U) ? 2 : 1;      /* h / b */
+    else
+        *size = (w & 0x40000000U) ? 8 : 4;      /* x / w */
+    *rt = w & 0x1FU;
+    *rn = (w >> 5) & 0x1FU;
+    return 1;
+}
+
 /* 按加载宽度生成 ldar/ldarb/ldarh 指令 (回放屏障用) */
 static uint32_t a64_ldar_insn(int size, unsigned rn, unsigned rt)
 {
     uint32_t base = size == 1 ? 0x08DFFC00U :
                     size == 2 ? 0x48DFFC00U :
                     size == 4 ? 0x88DFFC00U : 0xC8DFFC00U;
+    return base | (rn << 5) | rt;
+}
+
+/* 按加载宽度生成普通 ldr 指令 (自旋回放屏障用, 无排他监视器) */
+static uint32_t a64_ldr_insn(int size, unsigned rn, unsigned rt)
+{
+    uint32_t base = size == 4 ? 0xB9400000U : 0xF9400000U;
     return base | (rn << 5) | rt;
 }
 
@@ -283,8 +327,8 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
     uint8_t *p = out;
     unsigned rt, rn;
     int size;
-    int exclusive;
-    if (!a64_is_ldar_any(orig_insn, &size, &rt, &rn, &exclusive))
+    int kind;
+    if (!a64_is_load_any(orig_insn, &size, &rt, &rn, &kind))
         return 0;
     if (rt == 31)
         return 0;               /* 写入 xzr: 罕见, 跳过 */
@@ -436,7 +480,7 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                int size, unsigned rt, unsigned rn,
                                uint64_t ret_addr,
                                uint64_t load_limit, uint64_t exit_abs,
-                               int exclusive)
+                               int kind)
 {
     uint8_t *p = out;
     unsigned base_rep[] = {16, 17, 18, 19, 20, 21, 22, 23,
@@ -518,11 +562,12 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     uint8_t *ne_b = p;
     put32(&p, bcond(0, 1));     /* b.ne use_real (占位) */
     put32(&p, ldr_x_imm(24, 23, 16));   /* run.value */
-    /* 真实 acquire 屏障: 对原地址执行 ldar/ldaxr (值丢弃), 保证排序
-       语义; ldaxr 额外设置排他监视器, 使后续真实 stlxr/stxr 成功
-       (否则切片里的锁获取自旋永远失败) */
-    put32(&p, exclusive ? a64_ldaxr_insn(size, 27, 29)
-                        : a64_ldar_insn(size, 27, 29));
+    /* 真实屏障: 对原地址执行 ldar/ldaxr/ldr (值丢弃), 保证排序语义;
+       ldaxr 额外设置排他监视器, 使后续真实 stlxr/stxr 成功 (锁获取);
+       普通 ldr 自旋站点用普通 ldr 即可 */
+    put32(&p, kind == 1 ? a64_ldaxr_insn(size, 27, 29)
+                        : kind == 2 ? a64_ldr_insn(size, 27, 29)
+                                    : a64_ldar_insn(size, 27, 29));
     uint8_t *set_jmp = p;
     put32(&p, 0x14000000U);     /* b set (占位, 无条件) */
     uint8_t *use_real = p;
@@ -531,8 +576,9 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     else
         put32(&p, ldr_x_imm(31, 27, (unsigned)pl.off[rn]));
     /* 真实值: 用保存集内的 x29 做加载 (x13 不在最小保存集, 不能破坏) */
-    put32(&p, exclusive ? a64_ldaxr_insn(size, 27, 29)
-                        : a64_ldar_insn(size, 27, 29));
+    put32(&p, kind == 1 ? a64_ldaxr_insn(size, 27, 29)
+                        : kind == 2 ? a64_ldr_insn(size, 27, 29)
+                                    : a64_ldar_insn(size, 27, 29));
     put32(&p, mov_x(23, 29));           /* 真实值 → x23 (set 统一写槽) */
     uint8_t *set = p;
     /* 把最终值写入 Rt 的保存槽 (恢复时弹出) */

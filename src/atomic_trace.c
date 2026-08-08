@@ -167,7 +167,71 @@ static uint64_t atomic_find_gap(pid_t pid, uint64_t near, uint64_t size)
     return found;
 }
 
-/* 扫描目标可执行段中的 ldar 站点 */
+/* 普通 ldr 自旋站点判定: 纯自旋循环 —
+   load 后 1-3 条指令内, 加载值直接决定一个回跳 (cbz/cbnz/tbz/tbnz,
+   或 cmp wRt,#0 + 条件分支); 回跳目标必须是 load 本身或前 1 条指令
+   (该指令须为 dmb/dsb/nop 屏障); load 与分支之间只允许屏障。
+   排除字符串/哈希等普通循环 (曾扫出 5000+ 误报拖垮目标)。 */
+static int is_spin_ldr(const uint8_t *buf, size_t got, uint64_t off,
+                       unsigned rt, uint64_t ldr_pc)
+{
+    /* 屏障类指令 (dmb/dsb/nop) */
+    #define SPIN_BARRIER(w) \
+        ((w) == 0xD503201FU || (w) == 0xD5033BBFU || \
+         (w) == 0xD50339BFU || (w) == 0xD5033ABFU || \
+         (w) == 0xD5033B9FU)
+    uint64_t t = 0;
+    for (int step = 1; step <= 3; step++) {
+        uint64_t o = off + step * 4;
+        if (o + 4 > got)
+            return 0;
+        uint32_t w;
+        memcpy(&w, buf + o, 4);
+        if (SPIN_BARRIER(w))
+            continue;
+        uint64_t pc = ldr_pc + step * 4;
+        if ((a64_is_cbz(w) || a64_is_cbnz(w)) && (w & 0x1FU) == rt) {
+            t = a64_branch_target(w, pc);
+            break;
+        }
+        if ((a64_is_tbz(w) || a64_is_tbnz(w)) && (w & 0x1FU) == rt) {
+            t = a64_branch_target(w, pc);
+            break;
+        }
+        /* cmp wRt, #0; 下一指令条件分支回跳 */
+        if ((w & 0xFF000000U) == 0x71000000U &&
+            (w & 0x1FU) == 0x1FU &&
+            (w & 0x003FFC00U) == 0 &&
+            ((w >> 5) & 0x1FU) == rt) {
+            uint64_t o2 = o + 4;
+            if (o2 + 4 > got)
+                return 0;
+            uint32_t w2;
+            memcpy(&w2, buf + o2, 4);
+            if (a64_is_bcond(w2)) {
+                t = a64_branch_target(w2, pc + 4);
+                break;
+            }
+            return 0;
+        }
+        return 0;               /* 其他指令: 非自旋模式 */
+    }
+    if (!t || t > ldr_pc || t < ldr_pc - 4)
+        return 0;               /* 回跳目标必须是 load 本身或前 1 条 */
+    if (t == ldr_pc - 4) {
+        /* 循环头前一条必须是屏障, 保证循环体只有 load */
+        if (off < 4)
+            return 0;
+        uint32_t hw;
+        memcpy(&hw, buf + off - 4, 4);
+        if (!SPIN_BARRIER(hw))
+            return 0;
+    }
+    return 1;
+    #undef SPIN_BARRIER
+}
+
+/* 扫描目标可执行段中的原子/自旋 load 站点 */
 static int atomic_scan(pid_t pid, struct asite **out, size_t *n_out,
                        struct seginfo **segs_out, size_t *nsegs_out)
 {
@@ -207,11 +271,14 @@ static int atomic_scan(pid_t pid, struct asite **out, size_t *n_out,
             memcpy(&w, buf + off, 4);
             int size;
             unsigned rt, rn;
-            int exclusive;
-            if (!a64_is_ldar_any(w, &size, &rt, &rn, &exclusive))
+            int kind;
+            if (!a64_is_load_any(w, &size, &rt, &rn, &kind))
                 continue;
             if (rt == 31)
                 continue;       /* 目标 xzr: 罕见, 跳过 */
+            if (kind == 2 &&
+                !is_spin_ldr(buf, (size_t)got, off, rt, sg->start + off))
+                continue;       /* 普通 ldr 但非自旋模式: 跳过 */
             if (n == cap) {
                 cap = cap ? cap * 2 : 64;
                 sites = xrealloc(sites, cap * sizeof(*sites));

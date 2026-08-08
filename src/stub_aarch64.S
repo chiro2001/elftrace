@@ -1276,6 +1276,10 @@ str_tvv_enter:
     .asciz "TVVIN\n"
 fake_clock:
     .quad 0
+mock_spin_cnt:
+    .quad 0
+next_pending:
+    .quad 0
 
 rlimit_stack:
     .quad 0, 0
@@ -1339,6 +1343,13 @@ comp_scan:
 comp_found:
     add  x19, x19, #1
     str  x19, [x17, #288]           /* 游标前进 (顺序消费) */
+    /* 全局下一待回放索引 + 自旋计数复位 (顺序消费假设) */
+    adrp x5, next_pending
+    add  x5, x5, :lo12:next_pending
+    str  x19, [x5]
+    adrp x5, mock_spin_cnt
+    add  x5, x5, :lo12:mock_spin_cnt
+    str  xzr, [x5]
     mov  x23, x0                    /* rec 基址 (memcpy 会破坏 x0-x5) */
 
     /* 调试环: {站点 pc, rec_idx, sysno, rax} × 128 */
@@ -1408,6 +1419,75 @@ comp_exhausted:
 /* ---- mock (无回放表, freeze 快照) ---- */
 comp_mock:
     ldr  x2, [x17, #(24 + 8*8)]     /* 目标 x8 = syscall 号 */
+    adrp x5, debug_ring
+    add  x5, x5, :lo12:debug_ring
+    str  x2, [x5, #0x1010]          /* 调试: 记录最近 mock sysno */
+    /* mock 自旋检测: 同一 mock 站点连续命中超过阈值 (中间无真实回放)
+       说明切片在 Python 级等待循环里空转 (等待并发线程设置的共享标志,
+       普通字段读取无法按站点 patch)。此时按顺序提前应用下一条待回放
+       记录的边界 diff, 把并发线程的写入补进内存, 让等待循环看到
+       标志变化; 记录耗尽则直接严格退出 (rc=0)。 */
+    adrp x5, mock_spin_cnt
+    add  x5, x5, :lo12:mock_spin_cnt
+    ldr  x3, [x5]
+    add  x3, x3, #1
+    str  x3, [x5]
+    cmp  x3, #256
+    b.lt mock_dispatch
+    str  xzr, [x5]
+    adrp x6, next_pending
+    add  x6, x6, :lo12:next_pending
+    ldr  x3, [x6]
+    ldr  x4, [x16]                  /* n_recs */
+    cmp  x3, x4
+    b.hs mock_exhausted_exit
+    /* 应用记录 x3 的边界 diff (newseg + dirty, 纯访存) */
+    mov  x4, #80
+    mul  x4, x3, x4
+    add  x4, x4, x16
+    add  x4, x4, #8                 /* x4 = rec base */
+    ldr  x18, [x4, #40]             /* n_newseg */
+    ldr  x19, [x4, #48]
+    add  x19, x19, x16
+mock_ns_loop:
+    cbz  x18, mock_dirty
+    ldr  x20, [x19]                 /* vaddr */
+    ldr  x21, [x19, #8]             /* filesz */
+    add  x22, x19, #32              /* src */
+    mov  x0, x20
+    mov  x1, x22
+    mov  x2, x21
+    bl   memcpy_bytes
+    add  x19, x19, #32
+    add  x19, x19, x21
+    sub  x18, x18, #1
+    b    mock_ns_loop
+mock_dirty:
+    ldr  x18, [x4, #56]             /* n_dirty */
+    ldr  x19, [x4, #64]
+    add  x19, x19, x16
+mock_dirty_loop:
+    cbz  x18, mock_applied
+    ldr  x20, [x19]                 /* dst */
+    add  x21, x19, #8               /* src */
+    mov  x0, x20
+    mov  x1, x21
+    mov  x2, #4096
+    bl   memcpy_bytes
+    add  x19, x19, #4096
+    add  x19, x19, #8
+    sub  x18, x18, #1
+    b    mock_dirty_loop
+mock_applied:
+    adrp x7, debug_ring
+    add  x7, x7, :lo12:debug_ring
+    ldr  x5, [x7, #0x1018]
+    add  x5, x5, #1
+    str  x5, [x7, #0x1018]          /* 调试: 自旋应用次数 */
+    add  x3, x3, #1
+    str  x3, [x6]                   /* next_pending 前进 (顺序应用) */
+    ldr  x2, [x17, #(24 + 8*8)]     /* 重新装载 sysno */
+mock_dispatch:
     cmp  x2, #94
     beq  comp_mock_exit
     cmp  x2, #93
@@ -1476,6 +1556,17 @@ comp_mock_exit:
     mov  x8, #94
     svc  #0
     b    .
+mock_exhausted_exit:
+    /* 回放记录已全部应用而切片仍在 mock 自旋: 窗口内容已耗尽,
+       直接严格退出 (rc=0) */
+    adrp x5, _start
+    add  x5, x5, :lo12:_start
+    movz x6, #(STUB_ENTRY_OFF & 0xffff)
+    movk x6, #(STUB_ENTRY_OFF >> 16), lsl #16
+    sub  x5, x5, x6
+    movz x6, #(STUB_STRICT_EXIT_OFF & 0xffff)
+    add  x5, x5, x6
+    br   x5
 comp_mock_write:
     ldr  x1, [x17, #(24 + 2*8)]     /* 目标 x2 = len */
     b    comp_mock_set
@@ -1501,20 +1592,20 @@ comp_mock_brk:
     mov  x1, x2
 1:
 comp_mock_clock:
-    /* clock_gettime(id, ts): 返回伪单调时钟 (tv_sec=0,
-       tv_nsec = 每调用 +100us 的计数器), 避免 vDSO 回退真实 syscall
-       泄漏; Python 只用于相对超时计算 */
+    /* clock_gettime(id, ts): 伪单调时钟 = 0x40000000 + 调用计数 (秒)。
+       恢复内存里的 deadline 是录制时的真实时间 (~30871s), 大基数让
+       绝对 deadline 立即过期; 相对超时循环 (start+0.5) 因每次调用
+       +1s 也在 1-2 次内退出。 */
     ldr  x1, [x17, #(24 + 1*8)]     /* 目标 x1 = ts 缓冲区 */
     adrp x2, fake_clock
     add  x2, x2, :lo12:fake_clock
     ldr  x3, [x2]
-    movz x5, #0x86A0
-    movk x5, #0x1, lsl #16          /* 0x186A0 = 100000 */
-    add  x3, x3, x5
+    add  x3, x3, #1
     str  x3, [x2]
-    mov  x4, #0
-    str  x4, [x1]                   /* tv_sec = 0 */
-    str  x3, [x1, #8]               /* tv_nsec = counter */
+    movz x4, #0x4000, lsl #16       /* 0x40000000 */
+    add  x3, x3, x4
+    str  x3, [x1]                   /* tv_sec = 基数 + 计数 */
+    str  xzr, [x1, #8]              /* tv_nsec = 0 */
     mov  x1, #0                     /* 返回值 0 */
     b    comp_mock_set
 comp_mock_set:

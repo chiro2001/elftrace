@@ -70,10 +70,15 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                int is64, unsigned rt, unsigned rn,
                                uint64_t ret_addr,
                                uint64_t load_limit, uint64_t exit_abs,
-                               int exclusive);
+                               int kind);
+
+/* 通用 load 检测: ldar 族 (kind=0), ldaxr 族 (kind=1),
+ * 普通 ldr w/x (kind=2, 自旋候选) */
+int a64_is_load_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
+                    int *kind);
 
 /* 检测 ldar/ldarb/ldarh 与 ldaxr/ldaxrb/ldaxrh; *exclusive 输出
- * ldaxr 族标记 */
+ * ldaxr 族标记 (兼容旧调用) */
 int a64_is_ldar_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
                     int *exclusive);
 

@@ -1241,9 +1241,9 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 uint64_t runs_abs = base + st->ab_run_off;
                 int size;
                 unsigned rt, rn;
-                int exclusive;
-                if (!a64_is_ldar_any(ab->sites[st->ab_id].orig_insn,
-                                     &size, &rt, &rn, &exclusive))
+                int kind;
+                if (!a64_is_load_any(ab->sites[st->ab_id].orig_insn,
+                                     &size, &rt, &rn, &kind))
                     die("atomic: bad orig insn at %#llx",
                         (unsigned long long)st->pc);
                 size_t bl = a64_atomic_replay_block(
@@ -1251,7 +1251,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                     ab->run_cnt[st->ab_id] + 1, size, rt, rn, st->pc + 4,
                     ab->sites[st->ab_id].to_ord -
                         ab->sites[st->ab_id].from_ord,
-                    base + STUB_STRICT_EXIT_OFF, exclusive);
+                    base + STUB_STRICT_EXIT_OFF, kind);
                 if (!bl)
                     die("atomic: cannot generate replay block at %#llx",
                         (unsigned long long)st->pc);
