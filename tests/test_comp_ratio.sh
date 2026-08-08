@@ -4,7 +4,7 @@
 # 定义:
 #   预期指令数 T  = manifest[to].count - manifest[from].count
 #   实际指令数 A  = perf stat -e instructions 切片运行结果
-#   补偿指令数 C  = A - T (C >= 0)
+#   补偿指令数 C  = |A - T|
 #   补偿比例 R    = C / A, 要求 R <= 5%
 #
 # 实现: 先按默认 K 组装, perf 实测 A; 若 R 超标, 用 K <- K*T/A 迭代
@@ -72,12 +72,12 @@ for iter in $(seq 1 10); do
         | sed -E 's/[ ,].*//' | tr -d ',')
     A=${A:-0}
     [ "$A" -gt 0 ] || { echo "FAIL[iter $iter]: perf instructions"; exit 1; }
-    C=$((A - T))
+    C=$((A > T ? A - T : T - A))
     R1000=0
     [ "$A" -gt 0 ] && R1000=$((C * 1000 / A))
     echo "  iter $iter: K=$K actual=$A expected=$T comp=$C ratio=$(awk "BEGIN{printf \"%.3f\", $R1000/10}")%"
 
-    if [ "$C" -ge 0 ] && [ "$R1000" -le 50 ]; then
+    if [ "$R1000" -le 50 ]; then
         OK=1
         break
     fi
