@@ -207,7 +207,8 @@ static int atomic_scan(pid_t pid, struct asite **out, size_t *n_out,
             memcpy(&w, buf + off, 4);
             int size;
             unsigned rt, rn;
-            if (!a64_is_ldar(w, &size, &rt, &rn))
+            int exclusive;
+            if (!a64_is_ldar_any(w, &size, &rt, &rn, &exclusive))
                 continue;
             if (rt == 31)
                 continue;       /* 目标 xzr: 罕见, 跳过 */

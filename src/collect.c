@@ -72,6 +72,23 @@ static int collect_excluded(uint64_t vaddr, uint64_t size)
     return 0;
 }
 
+/* 发射一个采集段 (供 collect_segments 分割排除区时复用) */
+static void seg_emit(struct collect_snapshot *sn, int *cap,
+                     uint64_t vaddr, uint64_t memsz, uint64_t flags,
+                     const char *name)
+{
+    if (sn->nsegs == (size_t)*cap) {
+        *cap *= 2;
+        sn->segs = xrealloc(sn->segs, *cap * sizeof(struct cseg));
+    }
+    struct cseg s = {0};
+    s.vaddr = vaddr;
+    s.memsz = memsz;
+    s.flags = flags;
+    s.name = name ? xstrdup(name) : NULL;
+    sn->segs[sn->nsegs++] = s;
+}
+
 int collect_excluded_range(uint64_t vaddr, uint64_t size)
 {
     return collect_excluded(vaddr, size);
@@ -292,24 +309,29 @@ void collect_segments(struct collect_snapshot *sn)
         /* 跳过无权限区域 */
         if (perms[0] == '-' && perms[1] == '-' && perms[2] == '-')
             continue;
-        /* 跳过采集排除区 (原子记录注入页) */
-        if (collect_excluded(start, end - start))
-            continue;
-
-        struct cseg s = {0};
-        s.vaddr = start;
-        s.memsz = end - start;
-        s.flags = 0;
-        if (perms[0] == 'r') s.flags |= PF_R;
-        if (perms[1] == 'w') s.flags |= PF_W;
-        if (perms[2] == 'x') s.flags |= PF_X;
-        s.name = (n && name[0]) ? xstrdup(name) : NULL;
-
-        if (sn->nsegs == (size_t)cap) {
-            cap *= 2;
-            sn->segs = xrealloc(sn->segs, cap * sizeof(struct cseg));
+        /* 采集排除区 (原子记录注入页): 完全落入排除区的整段跳过;
+           部分重叠的按排除区分割, 只保留非排除子段。内核可能把注入
+           缓冲与目标段合并成一个 VMA (如 [heap] 66MB = 线程栈/arena
+           + 64MB 环形缓冲), 不分割会把环形缓冲整段录进 diff。 */
+        uint64_t seg_flags = 0;
+        if (perms[0] == 'r') seg_flags |= PF_R;
+        if (perms[1] == 'w') seg_flags |= PF_W;
+        if (perms[2] == 'x') seg_flags |= PF_X;
+        const char *sname = (n && name[0]) ? name : NULL;
+        uint64_t seg_start = start, seg_end = end;
+        for (size_t ei = 0; ei < g_n_excl && seg_start < seg_end; ei++) {
+            uint64_t xs = g_excl[ei].vaddr;
+            uint64_t xe = xs + g_excl[ei].size;
+            if (xe <= seg_start || xs >= seg_end)
+                continue;
+            if (xs > seg_start)
+                seg_emit(sn, &cap, seg_start, xs - seg_start, seg_flags,
+                         sname);
+            seg_start = xe;
         }
-        sn->segs[sn->nsegs++] = s;
+        if (seg_start < seg_end)
+            seg_emit(sn, &cap, seg_start, seg_end - seg_start, seg_flags,
+                     sname);
     }
     fclose(f);
 }
@@ -1200,6 +1222,7 @@ void collect_snapshot_free_light(struct collect_snapshot *sn)
     }
     free(sn->aux);
     free(sn->xstate);
+    free(sn->payload.data);
     memset(sn, 0, sizeof(*sn));
 }
 

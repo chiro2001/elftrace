@@ -217,12 +217,48 @@ int a64_is_ldar(uint32_t w, int *size, unsigned *rt, unsigned *rn)
     return 1;
 }
 
+/* 检测 ldar/ldarb/ldarh 或 ldaxr/ldaxrb/ldaxrh (读-获取/排他读)。
+ * ldaxr 需与后续真实 stlxr/stxr 配对: 回放跳板必须执行真实 ldaxr
+ * 设置排他监视器, 否则切片里的 stlxr 永远失败 → 自旋死循环。
+ * *exclusive 输出 1 表示 ldaxr 族。 */
+int a64_is_ldar_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
+                    int *exclusive)
+{
+    uint32_t base = w & 0xBFDFFC00U;
+    int ex = 0;
+    if (base == 0x08DFFC00U || base == 0x88DFFC00U) {
+        /* ldar 族 */
+    } else if (base == 0x085FFC00U || base == 0x885FFC00U) {
+        ex = 1;                 /* ldaxr 族 */
+    } else {
+        return 0;
+    }
+    if (exclusive)
+        *exclusive = ex;
+    if (base == 0x08DFFC00U || base == 0x085FFC00U)
+        *size = (w & 0x40000000U) ? 2 : 1;      /* h / b */
+    else
+        *size = (w & 0x40000000U) ? 8 : 4;      /* x / w */
+    *rt = w & 0x1FU;
+    *rn = (w >> 5) & 0x1FU;
+    return 1;
+}
+
 /* 按加载宽度生成 ldar/ldarb/ldarh 指令 (回放屏障用) */
 static uint32_t a64_ldar_insn(int size, unsigned rn, unsigned rt)
 {
     uint32_t base = size == 1 ? 0x08DFFC00U :
                     size == 2 ? 0x48DFFC00U :
                     size == 4 ? 0x88DFFC00U : 0xC8DFFC00U;
+    return base | (rn << 5) | rt;
+}
+
+/* 按加载宽度生成 ldaxr/ldaxrb/ldaxrh (回放屏障 + 排他监视器) */
+static uint32_t a64_ldaxr_insn(int size, unsigned rn, unsigned rt)
+{
+    uint32_t base = size == 1 ? 0x085FFC00U :
+                    size == 2 ? 0x485FFC00U :
+                    size == 4 ? 0x885FFC00U : 0xC85FFC00U;
     return base | (rn << 5) | rt;
 }
 
@@ -247,7 +283,8 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
     uint8_t *p = out;
     unsigned rt, rn;
     int size;
-    if (!a64_is_ldar(orig_insn, &size, &rt, &rn))
+    int exclusive;
+    if (!a64_is_ldar_any(orig_insn, &size, &rt, &rn, &exclusive))
         return 0;
     if (rt == 31)
         return 0;               /* 写入 xzr: 罕见, 跳过 */
@@ -398,7 +435,8 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                uint64_t runs_abs, uint64_t n_runs,
                                int size, unsigned rt, unsigned rn,
                                uint64_t ret_addr,
-                               uint64_t load_limit, uint64_t exit_abs)
+                               uint64_t load_limit, uint64_t exit_abs,
+                               int exclusive)
 {
     uint8_t *p = out;
     unsigned base_rep[] = {16, 17, 18, 19, 20, 21, 22, 23,
@@ -480,8 +518,11 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     uint8_t *ne_b = p;
     put32(&p, bcond(0, 1));     /* b.ne use_real (占位) */
     put32(&p, ldr_x_imm(24, 23, 16));   /* run.value */
-    /* 真实 acquire 屏障: 对原地址执行 ldar (值丢弃), 保证排序语义 */
-    put32(&p, a64_ldar_insn(size, 27, 29));
+    /* 真实 acquire 屏障: 对原地址执行 ldar/ldaxr (值丢弃), 保证排序
+       语义; ldaxr 额外设置排他监视器, 使后续真实 stlxr/stxr 成功
+       (否则切片里的锁获取自旋永远失败) */
+    put32(&p, exclusive ? a64_ldaxr_insn(size, 27, 29)
+                        : a64_ldar_insn(size, 27, 29));
     uint8_t *set_jmp = p;
     put32(&p, 0x14000000U);     /* b set (占位, 无条件) */
     uint8_t *use_real = p;
@@ -490,7 +531,8 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     else
         put32(&p, ldr_x_imm(31, 27, (unsigned)pl.off[rn]));
     /* 真实值: 用保存集内的 x29 做加载 (x13 不在最小保存集, 不能破坏) */
-    put32(&p, a64_ldar_insn(size, 27, 29));
+    put32(&p, exclusive ? a64_ldaxr_insn(size, 27, 29)
+                        : a64_ldar_insn(size, 27, 29));
     put32(&p, mov_x(23, 29));           /* 真实值 → x23 (set 统一写槽) */
     uint8_t *set = p;
     /* 把最终值写入 Rt 的保存槽 (恢复时弹出) */

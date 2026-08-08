@@ -100,6 +100,7 @@ static const char *sn_str(const struct snap *s, uint64_t off)
 struct rec_tmp {
     uint64_t pc, sysno, rax;
     uint64_t n_unmap, n_newseg, n_dirty;
+    uint64_t orig_count;        /* 捕获时 perf 计数 (原始空间) */
     struct buf unmap, newseg, dirty;
 };
 
@@ -674,6 +675,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                                 const uint64_t *ckpt_pcs, size_t nckpt_pcs,
                                 uint64_t count_from, uint64_t count_to,
                                 uint64_t exit_count_override,
+                                int syscall_dense,
                                 uint64_t stack_reserve,
                                 uint64_t replay_off,
                                 uint64_t heap_end,
@@ -841,7 +843,17 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
         }
         struct strict_site *st = &sites[nsites++];
         memset(st, 0, sizeof(*st));
-        if (in_loop && repeated) {
+        if (syscall_dense) {
+            /* syscall 密集窗口: 不埋任何退出站点 (循环检测可能漏判,
+               first-hit 会在窗口开头提前退出; 静态循环估算也会严重
+               少跑窗口), 回放表耗尽时由 stub 在窗口外第一个 syscall
+               处优雅退出 (overrun ≈ 窗口终点到下一个 syscall 的间隔) */
+            nsites--;
+            fprintf(stderr, "strict: syscall-anchored window end "
+                    "(last rec %llu, end %llu); loop counter skipped\n",
+                    (unsigned long long)recs[nrecs - 1].orig_count,
+                    (unsigned long long)count_to);
+        } else if (in_loop && repeated) {
             st->head = head;
             /* K ≈ 窗口内该循环执行的迭代次数 */
             uint64_t body_len = (backedge + 4 - head) / 4;
@@ -1046,6 +1058,8 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             v = s->h.task_tid;          memcpy(b + 280, &v, 8);
             v = (uint64_t)(st->rec_id >= 0 ? st->rec_id : 0);
             memcpy(b + 288, &v, 8);     /* 游标初始 = 首个记录索引 */
+            v = base + STUB_STRICT_EXIT_OFF;
+            memcpy(b + 296, &v, 8);     /* 回放表耗尽 → strict 退出 */
         } else if (st->kind == 2) {
             uint8_t *b = blob->data + (st->block_addr - base);
             uint64_t v;
@@ -1211,8 +1225,9 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 uint64_t runs_abs = base + st->ab_run_off;
                 int size;
                 unsigned rt, rn;
-                if (!a64_is_ldar(ab->sites[st->ab_id].orig_insn,
-                                 &size, &rt, &rn))
+                int exclusive;
+                if (!a64_is_ldar_any(ab->sites[st->ab_id].orig_insn,
+                                     &size, &rt, &rn, &exclusive))
                     die("atomic: bad orig insn at %#llx",
                         (unsigned long long)st->pc);
                 size_t bl = a64_atomic_replay_block(
@@ -1220,7 +1235,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                     ab->run_cnt[st->ab_id] + 1, size, rt, rn, st->pc + 4,
                     ab->sites[st->ab_id].to_ord -
                         ab->sites[st->ab_id].from_ord,
-                    base + STUB_STRICT_EXIT_OFF);
+                    base + STUB_STRICT_EXIT_OFF, exclusive);
                 if (!bl)
                     die("atomic: cannot generate replay block at %#llx",
                         (unsigned long long)st->pc);
@@ -1948,6 +1963,7 @@ int build_main(int argc, char **argv)
                         rec_count = strtoull(f4, NULL, 10);
                     }
                 }
+                uint64_t orig_rc = UINT64_MAX;
                 /* 只保留切片区间内的记录:
                    - 新格式 (map 第 5 字段 = 捕获时 perf 计数): 按
                      [count_from, count_to) 过滤 — manifest 的 nsys 字段
@@ -1963,6 +1979,7 @@ int build_main(int argc, char **argv)
                     if (ab.have && ab.r_num && ab.r_den)
                         rc = atomic_orig_at(&ab, rc);
 #endif
+                    orig_rc = rc;
                     if (rc < ckpt_count0 ||
                         rc >= ckpt_count_to) {
                         map_idx++;
@@ -2026,6 +2043,7 @@ int build_main(int argc, char **argv)
                 buf_init(&r->dirty);
                 r->pc = pc;
                 r->sysno = sysno;
+                r->orig_count = orig_rc;
                 if (h.state_size >= 0x60)
                     memcpy(&r->rax, f + sizeof(h) + ARCH_REGS_RET_OFF, 8);
                 r->n_unmap = h.n_unmap;
@@ -2058,6 +2076,22 @@ int build_main(int argc, char **argv)
                         "[%llu,%llu)\n",
                         nrecs, (unsigned long long)syscall_start,
                         (unsigned long long)syscall_end);
+        }
+    }
+
+    /* syscall 密集窗口判定: 窗口内最后一个 syscall 距窗口终点很近
+       (<= 20% 窗口长度) 时, 用"回放表耗尽 → 窗口外第一个 syscall 处
+       优雅退出"作锚点, 比静态循环体长度估算 (保守八等分) 精确得多,
+       避免 HTTP 这类 syscall 密集负载的切片只跑一个循环迭代就退出。 */
+    int syscall_dense = 0;
+    if (nrecs && ckpt_count_to != UINT64_MAX &&
+        ckpt_count_to > ckpt_count0) {
+        uint64_t win = ckpt_count_to - ckpt_count0;
+        uint64_t last = recs[nrecs - 1].orig_count;
+        if (last != UINT64_MAX && last < ckpt_count_to) {
+            uint64_t tail = ckpt_count_to - last;
+            if (tail <= win / 5)
+                syscall_dense = 1;
         }
     }
 
@@ -2281,6 +2315,7 @@ int build_main(int argc, char **argv)
                                  ckpt_pcs, nckpt_pcs,
                                  ckpt_count0, ckpt_count_to,
                                  exit_count_override,
+                                 syscall_dense,
                                  stack_reserve, replay_off,
                                  heap_end,
                                  &sploads, &n_sploads,
@@ -2404,10 +2439,6 @@ int build_main(int argc, char **argv)
        [之后]   shstrtab 数据
        [e_shoff] 节头表
     */
-    uint64_t blob_file_off = 0x1000;
-    uint64_t data_off = (blob_file_off + blob_total + 0xfff) & ~0xfffULL;
-    uint64_t aux_data_off = data_off;
-
     /* strict: 排序后的附加 PT_LOAD (初始段 + strict ploads) */
     struct strict_emit {
         uint64_t vaddr, filesz, memsz;
@@ -2449,6 +2480,14 @@ int build_main(int argc, char **argv)
         }
     }
     size_t nload = 2 + (strict_elf ? n_sem : 0);
+    /* blob 文件偏移必须位于 ehdr + 全部 phdr 之后 (strict 模式下
+       n_sem 可达 100+, phdr 表会超过 0x1000; 写死 0x1000 会导致
+       buf_zero 下溢成 2^64 而 OOM) */
+    uint64_t blob_file_off =
+        (sizeof(Elf64_Ehdr) + nload * sizeof(Elf64_Phdr) + 0xfff) &
+        ~0xfffULL;
+    uint64_t data_off = (blob_file_off + blob_total + 0xfff) & ~0xfffULL;
+    uint64_t aux_data_off = data_off;
     ph = xcalloc(nload, sizeof(*ph));
     size_t nload_used = 0;
     ph[nload_used++] = (Elf64_Phdr){
@@ -2557,7 +2596,12 @@ int build_main(int argc, char **argv)
     for (size_t i = 0; i < n_sem; i++) {
         if (!sem[i].filesz)
             continue;
-        buf_zero(&file, ph[1 + i].p_offset - file.size);
+        uint64_t gap = ph[1 + i].p_offset - file.size;
+        if (ph[1 + i].p_offset < file.size)
+            die("internal: segment file offset underflow (sem %zu, "
+                "p_off %llu < file size %zu)", i,
+                (unsigned long long)ph[1 + i].p_offset, file.size);
+        buf_zero(&file, gap);
         buf_append(&file, sem[i].data, sem[i].filesz);
     }
     /* aux 数据 */

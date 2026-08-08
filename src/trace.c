@@ -75,14 +75,12 @@ struct trace_ctx {
         uint64_t sysno;
         uint64_t count;             /* 捕获时的 perf 指令计数 (窗口过滤用) */
         int interrupted;            /* INTERRUPT 打断的在途 syscall (A=近似) */
-        struct collect_snapshot light_a;  /* 入口状态 + 内存基线 */
-        struct collect_snapshot light_b;  /* 返回状态 + 内存 */
     } *syscalls;
     size_t n_syscalls;
-    struct collect_snapshot pend_light;  /* 待定 syscall 入口状态 */
-    pid_t pend_agent;
     uint64_t pend_pc, pend_sysno;
     int have_pending;
+    struct collect_snapshot prev_b; /* 上一 syscall 边界完整镜像 (diff 基线) */
+    int have_prev_b;
 #if defined(__aarch64__)
     int atomic_enabled;         /* --atomic-replay */
     uint64_t atomic_buf_size;   /* 事件缓冲 (默认 64MB) */
@@ -170,9 +168,34 @@ static uint64_t perf_next_sample(struct trace_ctx *tc)
     return 0;
 }
 
+/* 在线流式写 syscall diff (B_k - B_{k-1}) 并立即释放当前镜像。
+ *
+ * diff 基线是"上一 syscall 边界" (首记录为上一检查点), 而不是 syscall
+ * 入口 A: 多线程进程里两个 syscall 之间由并发线程写入的内存不会出现在
+ * 任何 B-A 差异里, 切片单线程重放时会丢失这些写入 (HTTP server 每请求
+ * clone 线程, 曾导致切片跑到陈旧状态崩溃)。B_k - B_{k-1} 把窗口内每个
+ * syscall 边界的内存精确对齐到录制时刻, 并发写入随 diff 一并应用。
+ * 文件按记录序号命名, syscall.map 最后按数组顺序统一写出。 */
+static void syscall_stream_rec(struct trace_ctx *tc, struct syscall_rec *r,
+                               size_t idx, struct collect_snapshot *base,
+                               struct collect_snapshot *b)
+{
+    char sdir[PATH_MAX], path[PATH_MAX];
+    snprintf(sdir, sizeof(sdir), "%s/syscalls", tc->out);
+    if (mkdir(sdir, 0755) < 0 && errno != EEXIST)
+        die("mkdir %s", sdir);
+    snprintf(path, sizeof(path), "%s/sys_%06zu.elftrace", sdir, idx);
+    collect_write_diff(base, b, path);
+    /* B 成为新的 diff 基线 */
+    collect_snapshot_free_last(&tc->prev_b);
+    collect_snapshot_copy_last(&tc->prev_b, b);
+    tc->have_prev_b = 1;
+}
+
 /* syscall 入口/返回停止处理 (PTRACE_SYSCALL 模式)
- * entry: 记录待定 + 注入入口代理 A (临时 diff 基线)
- * exit:  注入返回代理 B, 完成记录 {pc, A, B}
+ * entry: 只记录待定 pc/sysno (内存快照不再需要: diff 基线是上一
+ *         syscall 边界, 见 syscall_stream_rec)
+ * exit:  读返回状态 B, 完成记录 {pc, B_k - B_{k-1}}
  * 注入专用页内的 syscall (mmap/fork) 直接放行 */
 static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
                                 int sysno, uint64_t rip)
@@ -190,24 +213,15 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
             ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);
             return;
         }
-        struct collect_snapshot sn = {.pid = tc->pid};
-        collect_state_light(tc->pid, &sn);
-        /* 入口基线: 目标在 syscall-stop (本来就停), 直接读内存 */
-        collect_memory(tc->pid, &sn);
         tc->pend_pc = rip;
         tc->pend_sysno = sysno;
-        collect_snapshot_copy_light(&tc->pend_light, &sn);
-        cbuf_append(&tc->pend_light.payload, sn.payload.data,
-                    sn.payload.size);
         tc->have_pending = 1;
-        collect_free(&sn);
     } else {
         if (!tc->have_pending) {
             /* INTERRUPT 打断进行中的 syscall: entry-stop 在捕获窗口前
                (trace 开始前已在 syscall 中 / 被 INTERRUPT 打断)。
-               补记: A = 上检查点快照 (近似: 打断时刻状态不可得),
-               B = 当前 (syscall 已完成, buffer 被写/rax=返回值)。
-               切片从检查点恢复后重做该 syscall (int3) 时命中。 */
+               B = 当前 (syscall 已完成, buffer 被写/rax=返回值);
+               diff 基线 = 上一 syscall 边界。 */
             struct collect_snapshot b = {.pid = tc->pid};
             collect_state_light(tc->pid, &b);
             collect_memory(tc->pid, &b);
@@ -219,23 +233,18 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
             r->sysno = 0;       /* EXIT-stop 无 syscall 号 */
             r->count = perf_count_now(tc);
             r->interrupted = 1;
-            if (tc->have_last) {
-                collect_snapshot_copy_light(&r->light_a, &tc->last);
-                cbuf_append(&r->light_a.payload, tc->last.payload.data,
-                            tc->last.payload.size);
-            }
-            collect_snapshot_copy_light(&r->light_b, &b);
-            cbuf_append(&r->light_b.payload, b.payload.data, b.payload.size);
-            collect_free(&b);
             fprintf(stderr, "trace: interrupted syscall @ %#llx "
-                    "(A=last ckpt, rec %zu)\n",
+                    "(B - prev boundary, rec %zu)\n",
                     (unsigned long long)r->pc, tc->n_syscalls - 1);
+            struct collect_snapshot *base =
+                tc->have_prev_b ? &tc->prev_b : &tc->last;
+            syscall_stream_rec(tc, r, tc->n_syscalls - 1, base, &b);
+            collect_free(&b);
             ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);
             return;
         }
         struct collect_snapshot sn = {.pid = tc->pid};
         collect_state_light(tc->pid, &sn);
-        /* 返回状态: 同样直接读目标内存 (无代理, 无 dumpable/注入交互) */
         collect_memory(tc->pid, &sn);
         tc->syscalls = xrealloc(tc->syscalls,
                                 (tc->n_syscalls + 1) *
@@ -244,16 +253,14 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
         r->pc = tc->pend_pc;
         r->sysno = tc->pend_sysno;
         r->count = perf_count_now(tc);
-        collect_snapshot_copy_light(&r->light_b, &sn);
-        cbuf_append(&r->light_b.payload, sn.payload.data, sn.payload.size);
-        /* A 基线 (入口状态+内存) 移入记录 */
-        r->light_a = tc->pend_light;
-        memset(&tc->pend_light, 0, sizeof(tc->pend_light));
         tc->have_pending = 0;
-        collect_free(&sn);
         fprintf(stderr, "trace: syscall %llu @ %#llx (rec %zu)\n",
                 (unsigned long long)r->sysno,
                 (unsigned long long)r->pc, tc->n_syscalls - 1);
+        struct collect_snapshot *base =
+            tc->have_prev_b ? &tc->prev_b : &tc->last;
+        syscall_stream_rec(tc, r, tc->n_syscalls - 1, base, &sn);
+        collect_free(&sn);
     }
     ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);
 }
@@ -287,9 +294,8 @@ static int collect_interrupt_sc(struct trace_ctx *tc)
                        !tc->have_pending) {
                 /* INTERRUPT 打断进行中的 syscall: 恢复后先产生
                    EXIT-stop (无对应 entry)。补记该记录 —
-                   A = 上检查点快照 (近似: 打断时刻状态不可得),
-                   B = 当前 (syscall 已完成, buffer 被写/rax=返回值)。
-                   切片从检查点恢复后重做该 syscall (int3) 时命中。 */
+                   diff 基线 = 上一 syscall 边界, B = 当前 (syscall
+                   已完成, buffer 被写/rax=返回值)。 */
                 struct collect_snapshot b = {.pid = pid};
                 collect_state_light(pid, &b);
                 collect_memory(pid, &b);
@@ -301,19 +307,13 @@ static int collect_interrupt_sc(struct trace_ctx *tc)
                 r->sysno = 0;   /* EXIT-stop 无 syscall 号 */
                 r->count = perf_count_now(tc);
                 r->interrupted = 1;
-                if (tc->have_last) {
-                    collect_snapshot_copy_light(&r->light_a, &tc->last);
-                    cbuf_append(&r->light_a.payload,
-                                tc->last.payload.data,
-                                tc->last.payload.size);
-                }
-                collect_snapshot_copy_light(&r->light_b, &b);
-                cbuf_append(&r->light_b.payload, b.payload.data,
-                            b.payload.size);
-                collect_free(&b);
                 fprintf(stderr, "trace: interrupted syscall @ %#llx "
-                        "(A=last ckpt)\n",
+                        "(B - prev boundary)\n",
                         (unsigned long long)r->pc);
+                struct collect_snapshot *base =
+                    tc->have_prev_b ? &tc->prev_b : &tc->last;
+                syscall_stream_rec(tc, r, tc->n_syscalls - 1, base, &b);
+                collect_free(&b);
             } else {
                 handle_syscall_stop(tc, 0, 0, psi.instruction_pointer);
             }
@@ -381,16 +381,6 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
 
     /* 冻结期间直接读全量内存并即时写检查点 (diff 链) */
     collect_memory(tc->pid, &sn);
-    /* 无上一检查点时的在途记录: A 基线 = 当前检查点状态 (内存未生效,
-       与 B 的 diff 即 syscall 的内存变化) */
-    if (tc->n_syscalls > 0) {
-        struct syscall_rec *lastr = &tc->syscalls[tc->n_syscalls - 1];
-        if (lastr->interrupted && lastr->light_a.payload.size == 0) {
-            collect_snapshot_copy_light(&lastr->light_a, &sn);
-            cbuf_append(&lastr->light_a.payload, sn.payload.data,
-                        sn.payload.size);
-        }
-    }
     snprintf(path, sizeof(path), "%s/ckpt_%06zu.elftrace", tc->out,
              tc->ckpt_no);
     if (tc->ckpt_no == 0) {
@@ -402,6 +392,10 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
         collect_snapshot_free_last(&tc->last);
         collect_snapshot_copy_last(&tc->last, &sn);
     }
+    /* 新检查点成为后续 syscall diff 的基线 */
+    collect_snapshot_free_last(&tc->prev_b);
+    collect_snapshot_copy_last(&tc->prev_b, &sn);
+    tc->have_prev_b = 1;
     ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);   /* 保持 syscall 捕获模式 */
 
     snprintf(manifest, sizeof(manifest), "%s/manifest.txt", tc->out);
@@ -480,6 +474,8 @@ int trace_main(int argc, char **argv)
     if (pid == 0)
         die("usage: elftrace trace <pid> [--every N] [--out DIR]");
     tc.pid = pid;
+    /* --every 解析后同步到实际触发周期; --atomic-compensate 之后覆盖 */
+    tc.every_eff = tc.every;
 
 #if defined(__aarch64__)
     /* Run 2 补偿: 读 Run 1 的 compensation.txt, 放大检查点触发间隔
@@ -690,9 +686,11 @@ main_done:
     }
     if (tc.have_last)
         collect_snapshot_free_last(&tc.last);
+    if (tc.have_prev_b)
+        collect_snapshot_free_last(&tc.prev_b);
 
-    /* 离线 syscall 检查点: 对比入口/返回代理 → B-A diff
-       (syscalls/ 子目录, 仅记录差异, 不参与切片起点/终点选择) */
+    /* 离线 syscall 元数据: diff 已在 EXIT-stop 在线流式写出
+       (B_k - B_{k-1}), 这里只按记录顺序写 syscall.map */
     if (tc.n_syscalls) {
         char sdir[PATH_MAX];
         snprintf(sdir, sizeof(sdir), "%s/syscalls", tc.out);
@@ -704,16 +702,11 @@ main_done:
             die("cannot create %s", mp);
         for (size_t k = 0; k < tc.n_syscalls; k++) {
             struct syscall_rec *r = &tc.syscalls[k];
-            char path[PATH_MAX];
-            snprintf(path, sizeof(path), "%s/sys_%06zu.elftrace", sdir, k);
-            collect_write_diff(&r->light_a, &r->light_b, path);
             fprintf(mf, "%#llx %llu sys_%06zu.elftrace%s %llu\n",
                     (unsigned long long)r->pc,
                     (unsigned long long)r->sysno, k,
                     r->interrupted ? " I" : "",
                     (unsigned long long)r->count);
-            collect_snapshot_free_light(&r->light_a);
-            collect_snapshot_free_light(&r->light_b);
         }
         fclose(mf);
     }

@@ -61,14 +61,21 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
  * 入口: stp x16,x17; nop; ldr x16,[pc,#8]; br x16; .quad block_abs。
  * 数据区 @0x200: ordinal, cursor, runs_abs, n_runs。
  * 回放: 序号递增 → 游标推进 (O(1) 均摊) → 命中运行段且地址一致 →
- * 执行真实 acquire 屏障 (ldar 到原地址) 后返回录制值; 否则返回真实
- * 内存值。rt/rn 与 ret_addr 直接编码进指令。
+ * 执行真实 acquire 屏障 (ldar/ldaxr 到原地址, ldaxr 设置排他监视器
+ * 使后续真实 stlxr 成功) 后返回录制值; 否则返回真实内存值。
+ * rt/rn 与 ret_addr 直接编码进指令。
  */
 size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                uint64_t runs_abs, uint64_t n_runs,
                                int is64, unsigned rt, unsigned rn,
                                uint64_t ret_addr,
-                               uint64_t load_limit, uint64_t exit_abs);
+                               uint64_t load_limit, uint64_t exit_abs,
+                               int exclusive);
+
+/* 检测 ldar/ldarb/ldarh 与 ldaxr/ldaxrb/ldaxrh; *exclusive 输出
+ * ldaxr 族标记 */
+int a64_is_ldar_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
+                    int *exclusive);
 
 /* ---- 缓冲区头 (注入到目标地址空间, tracer 与跳板共享) ---- */
 #define A64_ATB_MAGIC    0x41544F4DULL   /* "ATOM" */

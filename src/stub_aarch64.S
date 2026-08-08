@@ -167,6 +167,9 @@ ipc_sigact:
 stub_stack:
     .space STUB_STACK_SIZE
 stub_stack_top:
+/* strict 回放期 stub 栈空闲, 复用为 syscall 回放调试环 (崩溃后可从
+   core 读取最近回放的记录序列; 生产可移除) */
+debug_ring = stub_stack
 
 /* ===================== 信号帧 ===================== */
 .org STUB_FRAME_OFF
@@ -254,6 +257,18 @@ seg_next:
 
 seg_done:
 seg_restore_skip:
+    /* strict: 移植当前进程 [vvar] 内容到恢复的 [vvar] 段。
+       内核拒绝 ptrace 读取 vvar (快照为 0 字节), 切片里 vDSO 读到
+       空 vvar 会回退到真实 clock_gettime syscall — strict 泄漏。
+       同一内核的 vvar 内容通用, 从自身映射拷贝即可。 */
+    ldr  x0, [x9, #RST_DESC_MODE]
+    ldr  x10, [x9, #RST_DESC_BM_STYLE]
+    cmp  x0, #1
+    bne  vvar_done
+    cbz  x10, vvar_done
+    bl   transplant_vvar
+vvar_done:
+
     /* ======== 2. munmap loader 初始栈 (暂禁) ======== */
 
     /* ======== 3. 恢复 fd ======== */
@@ -710,7 +725,10 @@ bm_rp_done:
     b    bm_clear_ss_nopc
 
 bm_replay_miss:
-    /* 无回放记录: 报错退出 (与 x86 一致) */
+    /* 无回放记录: 回放表耗尽说明已到窗口外第一个 syscall,
+       优雅退出 (窗口终点); 表未耗尽才是内部错误。 */
+    cmp  x26, x25
+    b.hs bm_goto_exit
     b    bm_unsupported
 
 bm_real_exit:
@@ -1063,6 +1081,118 @@ uis_end2:
 uis_done:
     ret
 
+/* 移植 vvar: 找 segs 表 [vvar] 段 → 读 /proc/self/maps 找当前进程
+ * [vvar] → memcpy 到恢复地址。strict 模式调用。
+ * 破坏 x0-x8, x14-x20 (经 find_substr 还会破坏 x21-x27)。 */
+transplant_vvar:
+    stp  x19, x30, [sp, #-16]!      /* 保存调用者 x30 (bl 会覆盖) */
+    /* strings_off = fds_off + n_fds * 40 (blob 内字符串池起点;
+       seg.name_off 是快照字符串池偏移, 需叠加) */
+    ldr  x16, [x9, #RST_DESC_N_FDS]
+    ldr  x17, [x9, #RST_DESC_FDS_OFF]
+    add  x17, x17, x16, lsl #5
+    add  x17, x17, x16, lsl #3
+    mov  x16, x17
+    ldr  x14, [x9, #RST_DESC_N_SEGS]
+    ldr  x15, [x9, #RST_DESC_SEGS_OFF]
+    add  x15, x15, x9
+tvv_seg_loop:
+    cbz  x14, tvv_done
+    ldr  x0, [x15, #40]             /* name_off (payload_off@32, name@40) */
+    add  x0, x0, x16
+    add  x0, x0, x9                 /* name */
+    adrp x2, str_vvar
+    add  x2, x2, :lo12:str_vvar
+    mov  x1, #16
+    mov  x3, #6
+    bl   find_substr
+    cbz  x0, tvv_next
+    ldr  x19, [x15]                 /* seg vaddr */
+    ldr  x20, [x15, #16]            /* memsz */
+    b    tvv_read_maps
+tvv_next:
+    add  x15, x15, #48
+    sub  x14, x14, #1
+    b    tvv_seg_loop
+tvv_read_maps:
+    stp  x19, x20, [sp, #-16]!      /* 暂存 vaddr/memsz */
+    adrp x1, str_maps
+    add  x1, x1, :lo12:str_maps
+    mov  x0, #AT_FDCWD
+    mov  x2, #0
+    mov  x8, #SYS_openat
+    svc  #0
+    tbnz x0, #63, tvv_pop_done
+    mov  x19, x0                    /* fd */
+    mov  x0, x19
+    adrp x1, maps_buf
+    add  x1, x1, :lo12:maps_buf
+    mov  x2, #STUB_MAPS_SIZE
+    mov  x8, #SYS_read
+    svc  #0
+    mov  x20, x0                    /* bytes */
+    mov  x0, x19
+    mov  x8, #SYS_close
+    svc  #0
+    tbnz x20, #63, tvv_pop_done
+    adrp x0, maps_buf
+    add  x0, x0, :lo12:maps_buf
+    mov  x1, x20
+    adrp x2, str_vvar
+    add  x2, x2, :lo12:str_vvar
+    mov  x3, #6
+    bl   find_substr
+    cbz  x0, tvv_pop_done
+    /* 回退到该行行首 */
+    mov  x1, x0
+tvv_line:
+    cmp  x1, #0
+    beq  tvv_parse
+    ldrb w3, [x1, #-1]
+    cmp  w3, #'\n'
+    beq  tvv_parse
+    sub  x1, x1, #1
+    b    tvv_line
+tvv_parse:
+    mov  x3, x1
+    mov  x4, #0
+tvv_num:
+    ldrb w5, [x3]
+    cmp  w5, #'0'
+    blo  tvv_parse_done
+    cmp  w5, #'9'
+    bls  tvv_digit
+    cmp  w5, #'a'
+    blo  tvv_parse_done
+    cmp  w5, #'f'
+    bhi  tvv_parse_done
+    sub  w5, w5, #('a' - 10)
+    b    tvv_shift
+tvv_digit:
+    sub  w5, w5, #'0'
+tvv_shift:
+    lsl  x4, x4, #4
+    orr  x4, x4, x5
+    add  x3, x3, #1
+    b    tvv_num
+tvv_parse_done:
+    /* 恢复 vaddr/memsz; len = min(memsz, 0x4000) */
+    ldp  x19, x20, [sp], #16
+    mov  x0, x19
+    mov  x1, x4                     /* src = 当前进程 vvar */
+    mov  x2, x20
+    cmp  x2, #0x4000
+    bls  1f
+    mov  x2, #0x4000
+1:
+    bl   memcpy_bytes
+    b    tvv_done
+tvv_pop_done:
+    ldp  x19, x20, [sp], #16       /* 弹出第二层 (vaddr/memsz) */
+tvv_done:
+    ldp  x19, x30, [sp], #16
+    ret
+
 /* find_substr(haystack=x0, haylen=x1, needle=x2, needlelen=x3) → x0
  * 返回 needle 在 haystack 中的地址, 未找到返回 0。
  * 破坏 x0-x4, x21-x27 (needle/长度先存到 x21-x27, 防内层循环覆盖)。 */
@@ -1102,6 +1232,8 @@ str_maps:
     .asciz "/proc/self/maps"
 str_stack:
     .asciz "[stack]"
+str_vvar:
+    .asciz "[vvar]"
 
 rlimit_stack:
     .quad 0, 0
@@ -1151,7 +1283,7 @@ comp_engine:
     ldr  x2, [x17, #0]              /* 站点 pc */
 comp_scan:
     cmp  x19, x18
-    b.hs comp_mock                  /* 游标越界: 无记录 → mock */
+    b.hs comp_exhausted             /* 游标越界: 无记录 → 耗尽处理 */
     lsl  x0, x19, #4                /* *16 */
     lsl  x1, x0, #2                 /* *64 */
     add  x0, x0, x1                 /* *80 */
@@ -1166,6 +1298,24 @@ comp_found:
     add  x19, x19, #1
     str  x19, [x17, #288]           /* 游标前进 (顺序消费) */
     mov  x23, x0                    /* rec 基址 (memcpy 会破坏 x0-x5) */
+
+    /* 调试环: {站点 pc, rec_idx, sysno, rax} × 128 */
+    adrp x24, debug_ring
+    add  x24, x24, :lo12:debug_ring
+    ldr  x25, [x24]                 /* head */
+    add  x26, x25, #1
+    str  x26, [x24]
+    and  x26, x25, #127             /* slot = head & 127 */
+    lsl  x26, x26, #5
+    add  x26, x26, x24
+    add  x26, x26, #8
+    str  x2, [x26]                  /* 站点 pc */
+    sub  x27, x19, #1
+    str  x27, [x26, #8]             /* rec_idx */
+    ldr  x27, [x23, #8]
+    str  x27, [x26, #16]            /* sysno */
+    ldr  x27, [x23, #16]
+    str  x27, [x26, #24]            /* rax */
 
     /* newseg: 把记录数据写入预映射区 (纯访存) */
     ldr  x18, [x23, #40]            /* n_newseg */
@@ -1204,6 +1354,14 @@ comp_done:
     ldr  x1, [x23, #16]             /* rec.rax */
     str  x1, [x17, #24]             /* x0 槽 */
     b    comp_restore
+
+comp_exhausted:
+    /* 回放表耗尽: strict 模式 (站点块 [296] 由 build 写入 exit_abs)
+       表示已到窗口外第一个 syscall → 优雅退出 (rc=0);
+       非 strict 保持 0 → 旧 mock 路径 */
+    ldr  x16, [x17, #296]
+    cbz  x16, comp_mock
+    br   x16
 
 /* ---- mock (无回放表, freeze 快照) ---- */
 comp_mock:
