@@ -22,16 +22,19 @@
 #include <linux/ptrace.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <stddef.h>
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <limits.h>
+#include <elf.h>
 
 #include "elftrace.h"
 #include "collect.h"
 #include "util.h"
 #include "arch.h"
+#include "atomic_trace.h"
 
 int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child,
                 uint64_t *inj_page);
@@ -78,6 +81,11 @@ struct trace_ctx {
     pid_t pend_agent;
     uint64_t pend_pc, pend_sysno;
     int have_pending;
+#if defined(__aarch64__)
+    int atomic_enabled;         /* --atomic-replay */
+    uint64_t atomic_buf_size;   /* 事件缓冲 (默认 64MB) */
+    struct atomic_trace_ctx *atomic;
+#endif
 };
 
 /* 读 perf 累计计数 (syscall 记录定位用; ring sample 可能滞后) */
@@ -330,6 +338,17 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
         return;                 /* tracee 已退出 */
 
 #if defined(__aarch64__)
+    /* 原子记录跳板中被打断: 单步到跳板结束 (检查点状态才有效) */
+    if (tc->atomic && atomic_trace_step_out(tc->atomic) < 0) {
+        warn("trace: checkpoint interrupted inside atomic trampoline, "
+             "skipped");
+        ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);
+        collect_free(&sn);
+        return;
+    }
+#endif
+
+#if defined(__aarch64__)
     /* TPIDR_EL0: NT_ARM_TLS 可能陈旧, 用 jit 读 HW 值 (首次) */
     collect_tls_jit(tc->pid);
 #endif
@@ -402,6 +421,11 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
     fprintf(stderr, "trace: ckpt %zu @ count %llu pc %#llx\n", tc->ckpt_no,
             (unsigned long long)tc->count, (unsigned long long)REG_PC(sn.regs));
 
+#if defined(__aarch64__)
+    if (tc->atomic)
+        atomic_trace_ckpt(tc->atomic, tc->ckpt_no);
+#endif
+
     collect_free(&sn);
     if (tc->ckpt_no > 0 && tc->ckpt_no % 5 == 0)
         fprintf(stderr, "trace: %zu checkpoints (cow ok %zu, fail %zu)\n",
@@ -417,16 +441,30 @@ int trace_main(int argc, char **argv)
 
     tc.every = TRACE_DEFAULT_EVERY;
     tc.out = "./ckpts";
+#if defined(__aarch64__)
+    tc.atomic_buf_size = 64UL << 20;
+#endif
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--every") == 0 && i + 1 < argc) {
             tc.every = strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
             tc.out = argv[++i];
+#if defined(__aarch64__)
+        } else if (strcmp(argv[i], "--atomic-replay") == 0) {
+            tc.atomic_enabled = 1;
+        } else if (strcmp(argv[i], "--atomic-buf-size") == 0 &&
+                   i + 1 < argc) {
+            tc.atomic_buf_size = strtoull(argv[++i], NULL, 0);
+#endif
         } else if (argv[i][0] >= '0' && argv[i][0] <= '9') {
             pid = atoi(argv[i]);
         } else {
-            die("usage: elftrace trace <pid> [--every N] [--out DIR]");
+            die("usage: elftrace trace <pid> [--every N] [--out DIR]"
+#if defined(__aarch64__)
+                " [--atomic-replay] [--atomic-buf-size N]"
+#endif
+                );
         }
     }
     if (pid == 0)
@@ -457,6 +495,24 @@ int trace_main(int argc, char **argv)
 
     /* 初始检查点 (count 0, 已处于初始停止) */
     ckpt_take(&tc, 1);
+
+#if defined(__aarch64__)
+    /* 武装原子记录: 再 INTERRUPT 停止目标 → 注入/扫描/patch →
+       恢复 PTRACE_SYSCALL 运行 */
+    if (tc.atomic_enabled) {
+        if (collect_interrupt_sc(&tc) == 0) {
+            struct user_regs_struct rr;
+            struct iovec io = {.iov_base = &rr, .iov_len = sizeof(rr)};
+            if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
+                       &io) == 0) {
+                if (atomic_trace_arm(&tc.atomic, pid, &rr, tc.out,
+                                     tc.atomic_buf_size) < 0)
+                    warn("trace: atomic replay unavailable, continuing "
+                         "without it");
+            }
+        }
+    }
+#endif
 
     /* 目标恢复运行, 用 PTRACE_SYSCALL 模式 (每次 syscall 入口/返回停止) */
     ptrace(PTRACE_SYSCALL, pid, 0, 0);
@@ -543,6 +599,10 @@ int trace_main(int argc, char **argv)
     }
 main_done:
 
+#if defined(__aarch64__)
+    if (tc.atomic)
+        atomic_trace_finish(tc.atomic);
+#endif
     if (kill(pid, 0) == 0)
         collect_detach_run(pid);   /* 目标已退出则无需 detach */
     close(tc.perf_fd);

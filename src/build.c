@@ -26,6 +26,7 @@
 #include "disasm.h"
 #include "arch.h"
 #include "a64.h"
+#include "atomic_a64.h"
 
 /* ---- 生成的 stub blob (按目标架构选择) ---- */
 extern const unsigned char stub_blob_x86_64[];
@@ -129,12 +130,293 @@ struct strict_pload {
 
 struct strict_site {
     uint64_t pc;                /* 被 patch 的指令地址 */
-    int kind;                   /* 0=syscall 1=exit 2=loop */
+    int kind;                   /* 0=syscall 1=exit 2=loop 3=count 4=atomic */
     uint64_t head;              /* loop: 循环头 */
     uint64_t tramp_addr;        /* 跳板入口 */
     uint64_t block_addr;        /* 站点块/循环描述块 (blob 绝对地址) */
     int rec_id;                 /* syscall: 回放记录号 (-1=mock) */
+    size_t ab_id;               /* atomic: 原子站点索引 */
+    uint64_t ab_run_off;        /* atomic: 运行表在 blob 内的偏移 */
 };
+
+/* ---- trace --atomic-replay 侧车 (atomics/) ---- */
+struct ab_site {
+    uint64_t pc;
+    uint32_t orig_insn;
+    uint64_t from_ord, to_ord;  /* 窗口内序号边界 */
+};
+struct ab_run {
+    uint64_t start;             /* 窗口内起始序号 (1-based) */
+    uint64_t addr, value;
+};
+struct atomic_build {
+    int have;
+    struct ab_site *sites;
+    size_t n_sites;
+    struct ab_run *runs;
+    size_t n_runs;
+    size_t *run_off;            /* 站点 i 的 runs 起始索引 */
+    size_t *run_cnt;
+};
+
+static uint64_t rd_u64(const uint8_t **p)
+{
+    uint64_t v;
+    memcpy(*p, &v, 8);
+    *p += 8;
+    return v;
+}
+
+/* 读取 <dir>/atomics/ 侧车; 成功置 ab->have=1。窗口 = [from,to]。 */
+static void atomic_load(const char *dir, long from, long to,
+                        struct atomic_build *ab)
+{
+    char path[PATH_MAX];
+    uint8_t *buf = NULL;
+    size_t sz = 0;
+    uint64_t n_sites = 0;
+
+    memset(ab, 0, sizeof(*ab));
+    snprintf(path, sizeof(path), "%s/atomics/sites.bin", dir);
+    {
+        FILE *f = fopen(path, "rb");
+        if (!f)
+            return;
+        fseek(f, 0, SEEK_END);
+        sz = (size_t)ftell(f);
+        fseek(f, 0, SEEK_SET);
+        buf = xmalloc(sz ? sz : 1);
+        if (fread(buf, 1, sz, f) != sz) {
+            fclose(f);
+            free(buf);
+            return;
+        }
+        fclose(f);
+    }
+    const uint8_t *p = buf;
+    const uint8_t *end = buf + sz;
+    if (end - p < 40 || rd_u64(&p) != A64_AT_SITES_MAGIC)
+        goto bad;
+    if (rd_u64(&p) != 1)
+        goto bad;
+    n_sites = rd_u64(&p);
+    uint64_t buf_addr = rd_u64(&p);
+    uint64_t buf_size = rd_u64(&p);
+    uint64_t n_pages = rd_u64(&p);
+    (void)buf_addr; (void)buf_size;
+    if (n_sites > 100000 || n_pages > 100000)
+        goto bad;
+    if (end - p < n_pages * 8 + n_sites * 16)
+        goto bad;
+    p += n_pages * 8;
+    ab->sites = xcalloc(n_sites, sizeof(*ab->sites));
+    ab->n_sites = n_sites;
+    for (size_t i = 0; i < n_sites; i++) {
+        ab->sites[i].pc = rd_u64(&p);
+        memcpy(&ab->sites[i].orig_insn, p, 4);
+        p += 4;
+    }
+    free(buf);
+
+    /* 窗口边界: 从 ckpt 快照读每站点 ordinal */
+    {
+        char ck[PATH_MAX];
+        snprintf(ck, sizeof(ck), "%s/atomics/ckpt_%06ld.bin", dir, from);
+        FILE *f = fopen(ck, "rb");
+        if (!f) {
+            warn("atomic: missing %s", ck);
+            goto bad2;
+        }
+        uint8_t hdr[24];
+        if (fread(hdr, 1, 24, f) != 24) {
+            fclose(f);
+            goto bad2;
+        }
+        const uint8_t *hp = hdr;
+        if (rd_u64(&hp) != A64_AT_CKPT_MAGIC || rd_u64(&hp) != 1) {
+            fclose(f);
+            goto bad2;
+        }
+        uint64_t ns = rd_u64(&hp);
+        if (ns != n_sites) {
+            fclose(f);
+            goto bad2;
+        }
+        uint8_t *st = xmalloc(n_sites * 24);
+        if (fread(st, 1, n_sites * 24, f) != n_sites * 24) {
+            fclose(f);
+            free(st);
+            goto bad2;
+        }
+        fclose(f);
+        for (size_t i = 0; i < n_sites; i++) {
+            const uint8_t *q = st + i * 24;
+            ab->sites[i].from_ord = rd_u64(&q);
+        }
+        free(st);
+
+        snprintf(ck, sizeof(ck), "%s/atomics/ckpt_%06ld.bin", dir, to);
+        f = fopen(ck, "rb");
+        if (!f) {
+            warn("atomic: missing %s", ck);
+            goto bad2;
+        }
+        if (fread(hdr, 1, 24, f) != 24) {
+            fclose(f);
+            goto bad2;
+        }
+        hp = hdr;
+        if (rd_u64(&hp) != A64_AT_CKPT_MAGIC || rd_u64(&hp) != 1 ||
+            rd_u64(&hp) != n_sites) {
+            fclose(f);
+            goto bad2;
+        }
+        st = xmalloc(n_sites * 24);
+        if (fread(st, 1, n_sites * 24, f) != n_sites * 24) {
+            fclose(f);
+            free(st);
+            goto bad2;
+        }
+        fclose(f);
+        for (size_t i = 0; i < n_sites; i++) {
+            const uint8_t *q = st + i * 24;
+            ab->sites[i].to_ord = rd_u64(&q);
+        }
+        free(st);
+    }
+
+    /* 事件 → 每站点运行段 (窗口内) */
+    snprintf(path, sizeof(path), "%s/atomics/events.bin", dir);
+    {
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long esz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            uint8_t *eb = xmalloc(esz > 0 ? (size_t)esz : 1);
+            if (fread(eb, 1, (size_t)esz, f) == (size_t)esz) {
+                const uint8_t *ep = eb;
+                const uint8_t *ee = eb + esz;
+                if (ee - ep >= 24 && rd_u64(&ep) == A64_AT_EVENTS_MAGIC &&
+                    rd_u64(&ep) == 1) {
+                    uint64_t n_ev = rd_u64(&ep);
+                    if (ee - ep >= (long)(n_ev * 32)) {
+                        ab->runs = xmalloc((n_ev ? n_ev : 1) *
+                                           sizeof(*ab->runs));
+                        size_t nr = 0;
+                        for (uint64_t k = 0; k < n_ev; k++) {
+                            uint64_t site_id = rd_u64(&ep);
+                            uint64_t ord = rd_u64(&ep);
+                            uint64_t addr = rd_u64(&ep);
+                            uint64_t value = rd_u64(&ep);
+                            if (site_id >= n_sites)
+                                continue;
+                            if (ord <= ab->sites[site_id].from_ord ||
+                                ord > ab->sites[site_id].to_ord)
+                                continue;
+                            ab->runs[nr].start = ord -
+                                                 ab->sites[site_id].from_ord;
+                            ab->runs[nr].addr = addr;
+                            ab->runs[nr].value = value;
+                            nr++;
+                        }
+                        ab->n_runs = nr;
+                    }
+                }
+            }
+            free(eb);
+            fclose(f);
+        }
+    }
+    /* 事件 → 每站点运行段 (窗口内, 全局有序 → 每站点单调) */
+    {
+        ab->run_off = xcalloc(n_sites ? n_sites : 1, sizeof(size_t));
+        ab->run_cnt = xcalloc(n_sites ? n_sites : 1, sizeof(size_t));
+        /* 先统计每站点窗口事件数 (事件全局有序, 站点内单调) */
+        snprintf(path, sizeof(path), "%s/atomics/events.bin", dir);
+        FILE *f = fopen(path, "rb");
+        if (!f)
+            goto no_runs;
+        {
+            fseek(f, 0, SEEK_END);
+            long esz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            uint8_t *eb = xmalloc(esz > 0 ? (size_t)esz : 1);
+            if (fread(eb, 1, (size_t)esz, f) == (size_t)esz) {
+                const uint8_t *ep = eb;
+                const uint8_t *ee = eb + esz;
+                if (ee - ep >= 24 && rd_u64(&ep) == A64_AT_EVENTS_MAGIC &&
+                    rd_u64(&ep) == 1) {
+                    uint64_t n_ev = rd_u64(&ep);
+                    size_t total = 0;
+                    for (uint64_t k = 0; k < n_ev && ee - ep >= 32; k++) {
+                        uint64_t site_id = rd_u64(&ep);
+                        uint64_t ord = rd_u64(&ep);
+                        rd_u64(&ep);            /* addr */
+                        rd_u64(&ep);            /* value */
+                        if (site_id >= n_sites)
+                            continue;
+                        if (ord <= ab->sites[site_id].from_ord ||
+                            ord > ab->sites[site_id].to_ord)
+                            continue;
+                        ab->run_cnt[site_id]++;
+                        total++;
+                    }
+                    size_t acc = 0;
+                    for (size_t i = 0; i < n_sites; i++) {
+                        ab->run_off[i] = acc;
+                        acc += ab->run_cnt[i];
+                    }
+                    ab->runs = xmalloc((total ? total : 1) *
+                                       sizeof(*ab->runs));
+                    ab->n_runs = total;
+                    /* 第二遍填内容 (位置由 run_off + 已计数偏移) */
+                    size_t *filled = xcalloc(n_sites ? n_sites : 1,
+                                             sizeof(size_t));
+                    ep = eb + 24;
+                    for (uint64_t k = 0; k < n_ev && ee - ep >= 32; k++) {
+                        uint64_t site_id = rd_u64(&ep);
+                        uint64_t ord = rd_u64(&ep);
+                        uint64_t addr = rd_u64(&ep);
+                        uint64_t value = rd_u64(&ep);
+                        if (site_id >= n_sites)
+                            continue;
+                        if (ord <= ab->sites[site_id].from_ord ||
+                            ord > ab->sites[site_id].to_ord)
+                            continue;
+                        size_t o = ab->run_off[site_id] + filled[site_id]++;
+                        ab->runs[o].start = ord -
+                                            ab->sites[site_id].from_ord;
+                        ab->runs[o].addr = addr;
+                        ab->runs[o].value = value;
+                    }
+                    free(filled);
+                }
+            }
+            free(eb);
+        }
+        fclose(f);
+    }
+
+    if (ab->n_runs == 0)
+        fprintf(stderr, "atomic: %zu sites, no window events "
+                "(replay not applied)\n", (size_t)n_sites);
+    else
+        fprintf(stderr, "atomic: %zu sites, %zu window run segments\n",
+                (size_t)n_sites, ab->n_runs);
+    ab->have = 1;
+    return;
+no_runs:
+    if (ab->n_runs == 0)
+        fprintf(stderr, "atomic: no events.bin, replay not applied\n");
+    ab->have = 1;
+    return;
+bad:
+    free(buf);
+bad2:
+    free(ab->sites);
+    memset(ab, 0, sizeof(*ab));
+}
 
 static void spload_add(struct strict_pload **pl, size_t *n, size_t *cap,
                        uint64_t vaddr, uint64_t memsz, uint64_t flags)
@@ -293,6 +575,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                                 const elftrace_seg *segs,
                                 struct rec_tmp *recs, size_t nrecs,
                                 int have_map,
+                                const struct atomic_build *ab,
                                 uint64_t exit_override,
                                 const uint64_t *ckpt_pcs, size_t nckpt_pcs,
                                 uint64_t count_from, uint64_t count_to,
@@ -534,6 +817,46 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
         }
     }
 
+    /* 2.6 原子回放站点 (trace --atomic-replay):
+       - 所有 ldar 站点恢复原始指令 (快照里是记录跳板分支);
+       - 窗口内有事件的站点建回放跳板 (kind 4), 无事件的不 patch
+         (原指令真实执行, 内存值与录制一致)。 */
+    if (ab && ab->have && ab->n_sites) {
+        for (size_t i = 0; i < ab->n_sites; i++) {
+            uint8_t *q = NULL;
+            for (size_t k = 0; k < nsegs; k++) {
+                if (ab->sites[i].pc >= segs[k].vaddr &&
+                    ab->sites[i].pc < segs[k].vaddr + segs[k].filesz) {
+                    q = blob->data + payload_off + segs[k].payload_off +
+                        (ab->sites[i].pc - segs[k].vaddr);
+                    break;
+                }
+            }
+            if (!q) {
+                warn("atomic: site %#llx not in payload, skipped",
+                     (unsigned long long)ab->sites[i].pc);
+                continue;
+            }
+            /* 还原原始 ldar (记录跳板分支 → 原指令) */
+            memcpy(q, &ab->sites[i].orig_insn, 4);
+            if (!ab->run_cnt[i])
+                continue;
+            if (exit_override == ab->sites[i].pc)
+                die("atomic: exit point %#llx coincides with atomic "
+                    "replay site; choose a different --to checkpoint",
+                    (unsigned long long)ab->sites[i].pc);
+            if (nsites == sites_cap) {
+                sites_cap = sites_cap ? sites_cap * 2 : 32;
+                sites = xrealloc(sites, sites_cap * sizeof(*sites));
+            }
+            struct strict_site *st = &sites[nsites++];
+            memset(st, 0, sizeof(*st));
+            st->pc = ab->sites[i].pc;
+            st->kind = 4;
+            st->ab_id = i;
+        }
+    }
+
     if (!nsites) {
         *pl_out = NULL;
         *npl_out = 0;
@@ -609,6 +932,9 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
         } else if (st->kind == 3) {
             st->block_addr = base + blob->size;
             buf_zero(blob, 40);
+        } else if (st->kind == 4) {
+            /* 原子回放块在跳板页内生成 (见 6.5), blob 不占 */
+            continue;
         }
         if (blob->size & 15)      /* 每块 16B 对齐 (内嵌指令) */
             buf_zero(blob, 16 - (blob->size & 15));
@@ -657,6 +983,28 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             memcpy(b + 28, &w, 4);
             v = st->pc + 4;     /* ret_addr */
             memcpy(b + 32, &v, 8);
+        } else if (st->kind == 4) {
+            continue;
+        }
+    }
+
+    /* 5.5 原子回放运行表 (每站点连续 24B 段) */
+    if (ab && ab->have) {
+        for (size_t i = 0; i < nsites; i++) {
+            struct strict_site *st = &sites[i];
+            if (st->kind != 4)
+                continue;
+            if (blob->size & 7)
+                buf_zero(blob, 8 - (blob->size & 7));
+            st->ab_run_off = blob->size;
+            size_t o = ab->run_off[st->ab_id];
+            size_t cnt = ab->run_cnt[st->ab_id];
+            for (size_t k = 0; k < cnt; k++) {
+                struct ab_run *r = &ab->runs[o + k];
+                buf_append(blob, &r->start, 8);
+                buf_append(blob, &r->addr, 8);
+                buf_append(blob, &r->value, 8);
+            }
         }
     }
 
@@ -664,7 +1012,8 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
     for (size_t gi = 0; gi < nsegs; gi++) {
         size_t cnt = 0;
         for (size_t i = 0; i < nsites; i++) {
-            if (sites[i].pc >= segs[gi].vaddr &&
+            if (sites[i].kind != 4 &&
+                sites[i].pc >= segs[gi].vaddr &&
                 sites[i].pc < segs[gi].vaddr + segs[gi].filesz)
                 cnt++;
         }
@@ -688,7 +1037,8 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
         size_t o = 0;
         for (size_t i = 0; i < nsites; i++) {
             struct strict_site *st = &sites[i];
-            if (st->pc < segs[gi].vaddr ||
+            if (st->kind == 4 ||
+                st->pc < segs[gi].vaddr ||
                 st->pc >= segs[gi].vaddr + segs[gi].filesz)
                 continue;
             st->tramp_addr = taddr + o;
@@ -723,6 +1073,68 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 pl[i].filesz = need;
                 pl[i].data = page;
                 break;
+            }
+        }
+    }
+
+    /* 6.5 原子回放跳板页: 每段就近一组页, 每站点 0x220B 块 */
+    if (ab && ab->have) {
+        for (size_t gi = 0; gi < nsegs; gi++) {
+            size_t cnt = 0;
+            for (size_t i = 0; i < nsites; i++) {
+                if (sites[i].kind == 4 &&
+                    sites[i].pc >= segs[gi].vaddr &&
+                    sites[i].pc < segs[gi].vaddr + segs[gi].filesz)
+                    cnt++;
+            }
+            if (!cnt)
+                continue;
+            uint64_t need = ((cnt * A64_ATOM_BLOCK_SIZE + 0xfff) &
+                             ~0xfffULL);
+            uint64_t taddr = find_gap_near(segs, nsegs, pl, npl,
+                                           segs[gi].vaddr + segs[gi].filesz,
+                                           need);
+            if (!taddr)
+                taddr = find_gap_near(segs, nsegs, pl, npl,
+                                      segs[gi].vaddr > need
+                                          ? segs[gi].vaddr - need : 0,
+                                      need);
+            if (!taddr)
+                die("strict: cannot place atomic trampoline page near "
+                    "%#llx", (unsigned long long)segs[gi].vaddr);
+            spload_add(&pl, &npl, &pl_cap, taddr, need,
+                       PF_R | PF_W | PF_X);
+            uint8_t *page = xcalloc(1, need);
+            size_t o = 0;
+            for (size_t i = 0; i < nsites; i++) {
+                struct strict_site *st = &sites[i];
+                if (st->kind != 4 ||
+                    st->pc < segs[gi].vaddr ||
+                    st->pc >= segs[gi].vaddr + segs[gi].filesz)
+                    continue;
+                st->tramp_addr = taddr + o;
+                st->block_addr = taddr + o;
+                uint64_t runs_abs = base + st->ab_run_off;
+                int is64;
+                unsigned rt, rn;
+                if (!a64_is_ldar(ab->sites[st->ab_id].orig_insn,
+                                 &is64, &rt, &rn))
+                    die("atomic: bad orig insn at %#llx",
+                        (unsigned long long)st->pc);
+                size_t bl = a64_atomic_replay_block(
+                    page + o, taddr + o, runs_abs,
+                    ab->run_cnt[st->ab_id], is64, rt, rn, st->pc + 4);
+                if (!bl)
+                    die("atomic: cannot generate replay block at %#llx",
+                        (unsigned long long)st->pc);
+                o += A64_ATOM_BLOCK_SIZE;
+            }
+            for (size_t i = 0; i < npl; i++) {
+                if (pl[i].vaddr == taddr) {
+                    pl[i].filesz = need;
+                    pl[i].data = page;
+                    break;
+                }
             }
         }
     }
@@ -993,6 +1405,10 @@ int build_main(int argc, char **argv)
     struct strict_pload *sploads = NULL;
     size_t n_sploads = 0;
     uint64_t strict_replay_abs = 0;
+#if defined(__aarch64__)
+    struct atomic_build ab;
+    memset(&ab, 0, sizeof(ab));
+#endif
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -1696,9 +2112,11 @@ int build_main(int argc, char **argv)
     /* 3.7 strict baremetal (aarch64): ELF loader 全内存 + 分支补偿 */
 #if defined(__aarch64__)
     if (mode_baremetal && bm_strict) {
+        if (ckpts && to_ckpt >= 0)
+            atomic_load(ckpts, from_ckpt, to_ckpt, &ab);
         if (build_strict_aarch64(&s, &blob, base, blob_total, payload_off,
                                  segs,
-                                 recs, nrecs, have_map, exit_override,
+                                 recs, nrecs, have_map, &ab, exit_override,
                                  ckpt_pcs, nckpt_pcs,
                                  ckpt_count0, ckpt_count_to,
                                  exit_count_override,
@@ -1711,6 +2129,12 @@ int build_main(int argc, char **argv)
         fprintf(stderr, "build: strict baremetal: %zu extra PT_LOADs\n",
                 n_sploads);
     }
+#endif
+#if defined(__aarch64__)
+    free(ab.sites);
+    free(ab.runs);
+    free(ab.run_off);
+    free(ab.run_cnt);
 #endif
     for (size_t i = 0; i < nrecs; i++) {
         free(recs[i].unmap.data);

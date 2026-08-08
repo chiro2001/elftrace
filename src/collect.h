@@ -80,6 +80,13 @@ int collect_freeze(pid_t pid);
 int collect_interrupt(pid_t pid);
 /* 解除跟踪 (detach, tracee 恢复运行) */
 void collect_detach_run(pid_t pid);
+/* 采集排除区 (trace 原子记录注入的缓冲/跳板页不进快照)。
+ * collect_exclude_clear 清空; add 成功返回 0。段枚举时完全落在排除
+ * 区内的映射被跳过。 */
+void collect_exclude_clear(void);
+int collect_exclude_add(uint64_t vaddr, uint64_t size);
+/* 区间是否完全落在任一排除区内 (供注入页选择等使用) */
+int collect_excluded_range(uint64_t vaddr, uint64_t size);
 /* 采集全部状态 (要求 tracee 已冻结) */
 void collect_state(pid_t pid, struct collect_snapshot *sn);
 void collect_snapshot_copy_last(struct collect_snapshot *dst,
@@ -106,6 +113,8 @@ void collect_resume(pid_t pid);
 /* 用 jit (mrs tpidr_el0; brk) 读目标 HW TPIDR_EL0 (NT_ARM_TLS 可能
  * 陈旧); 要求目标处于 ptrace-stop。结果供后续采集使用。 */
 void collect_tls_jit(pid_t pid);
+/* 返回 jit/regset 缓存的目标 TPIDR_EL0 (0 = 未知) */
+uint64_t collect_get_tls(void);
 #endif
 /* 释放 */
 void collect_free(struct collect_snapshot *sn);

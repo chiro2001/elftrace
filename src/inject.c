@@ -24,9 +24,13 @@
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/user.h>
+#include <sys/uio.h>
 #include <signal.h>
+#include <elf.h>
 
 #include "util.h"
+#include "arch.h"
+#include "collect.h"
 
 #define STAGE2_SIZE 1024       /* stage2 代码 + 数据 */
 #define STAGE1_SIZE 128
@@ -393,3 +397,126 @@ fail:
     return -1;
 #endif
 }
+
+/* ===================== aarch64 轻量代码段执行 =====================
+ * 与 collect_tls_jit 同机制: 把一小段代码写入目标"冷"可执行页,
+ * 设置 pc 后 PTRACE_CONT, 等 brk 的 SIGTRAP-stop, 读回结果, 恢复
+ * 页字节与全部寄存器。目标必须处于 ptrace-stop。
+ *
+ * 用途: 在目标进程内执行 syscall (mmap 注入缓冲/跳板页、结束清理
+ * munmap), 不需要 fork。 */
+#if defined(__aarch64__)
+
+/* 找注入页: 最低的 r-x 匿名/文件页 (exe 冷页), 避开当前 pc 所在页 */
+static unsigned long find_stage1_page_a64(pid_t pid, unsigned long pc)
+{
+    char path[64];
+    char line[512];
+    FILE *f;
+    unsigned long best = 0;
+
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    f = fopen(path, "r");
+    if (!f)
+        return 0;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long s, e;
+        char perms[8];
+        char name[256] = "";
+        if (sscanf(line, "%llx-%llx %7s %*s %*s %*s %255[^\n]", &s, &e,
+                   perms, name) < 3)
+            continue;
+        if (perms[0] != 'r' || perms[2] != 'x')
+            continue;
+        if (name[0] == ' ') {
+            memmove(name, name + 1, strlen(name));
+            if (strstr(name, "vdso") || strstr(name, "vsyscall") ||
+                strstr(name, "vvar"))
+                continue;
+        }
+        if (pc >= s && pc < e)
+            continue;           /* 与 pc 同映射: 可能正在执行 */
+        /* 跳过采集排除区 (原子记录注入页, 可能被其他线程执行) */
+        if (collect_excluded_range(s, e - s))
+            continue;
+        if (!best || s < best)
+            best = (unsigned long)s;
+    }
+    fclose(f);
+    return best;
+}
+
+/* 执行 ninsn 条指令的片段 (写入冷页, 要求 brk #0 结束)。
+ * ret0: 结束时 x0。成功返回 0, 失败 -1 (页字节/寄存器已恢复)。 */
+int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
+                       const uint32_t *code, size_t ninsn, uint64_t *ret0)
+{
+    unsigned long page = find_stage1_page_a64(pid, REG_PC(*regs));
+    int st;
+    if (!page || ninsn == 0 || ninsn * 4 > 4096)
+        return -1;
+
+    unsigned long backup[2];
+    for (size_t i = 0; i < ninsn; i += 2) {
+        unsigned long w = 0;
+        size_t n = ninsn - i;
+        memcpy(&w, code + i, n >= 2 ? 8 : 4);
+        if (i / 2 == 0)
+            backup[0] = ptrace(PTRACE_PEEKDATA, pid, page, 0);
+        if (ninsn > 2 && i == 2)
+            backup[1] = ptrace(PTRACE_PEEKDATA, pid, page + 8, 0);
+        if (ptrace(PTRACE_POKEDATA, pid, page + i, w) < 0)
+            return -1;
+    }
+
+    struct user_regs_struct r = *regs, saved = *regs;
+    struct iovec io = {.iov_base = &r, .iov_len = sizeof(r)};
+    int ok = -1;
+    r.pc = page;
+    if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io) == 0 &&
+        ptrace(PTRACE_CONT, pid, 0, 0) == 0) {
+        if (waitpid(pid, &st, 0) > 0 && WIFSTOPPED(st)) {
+            if (WSTOPSIG(st) == SIGSTOP) {
+                /* 组停 (SIGSTOP): CONT 后先停在组停, SIGCONT 放行 */
+                ptrace(PTRACE_CONT, pid, 0, SIGCONT);
+                waitpid(pid, &st, 0);
+            }
+            if (WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP) {
+                struct user_regs_struct r2;
+                struct iovec io2 = {.iov_base = &r2, .iov_len = sizeof(r2)};
+                if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
+                           &io2) == 0) {
+                    if (ret0)
+                        *ret0 = r2.regs[0];
+                    ok = 0;
+                }
+            }
+        }
+    }
+    io.iov_base = &saved;
+    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io);
+    ptrace(PTRACE_POKEDATA, pid, page, backup[0]);
+    if (ninsn > 2)
+        ptrace(PTRACE_POKEDATA, pid, page + 8, backup[1]);
+    return ok;
+}
+
+/* 在目标内执行一个 syscall (svc #0; brk #0)。
+ * 参数经寄存器传递 (x8=号, x0-x5=参数), 结束后恢复全部寄存器。
+ * ret: syscall 返回值 (负 errno)。 */
+int inject_syscall(pid_t pid, const struct user_regs_struct *regs,
+                   uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
+                   uint64_t a3, uint64_t a4, uint64_t a5, uint64_t *ret)
+{
+    struct user_regs_struct r = *regs;
+    uint32_t code[2] = {0xd4000001U, 0xd4200000U};   /* svc #0; brk #0 */
+    r.regs[8] = nr;
+    r.regs[0] = a0;
+    r.regs[1] = a1;
+    r.regs[2] = a2;
+    r.regs[3] = a3;
+    r.regs[4] = a4;
+    r.regs[5] = a5;
+    return inject_run_snippet(pid, &r, code, 2, ret);
+}
+#endif /* __aarch64__ */

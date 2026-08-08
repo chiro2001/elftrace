@@ -39,6 +39,44 @@
 /* aarch64: collect_freeze 用 jit 读到的 TPIDR_EL0 (NT_ARM_TLS 可能陈旧) */
 static unsigned long g_tls;
 
+/* ---- 采集排除区 (trace 原子记录注入页) ---- */
+#define EXCL_MAX 64
+static struct {
+    uint64_t vaddr, size;
+} g_excl[EXCL_MAX];
+static size_t g_n_excl;
+
+void collect_exclude_clear(void)
+{
+    g_n_excl = 0;
+}
+
+int collect_exclude_add(uint64_t vaddr, uint64_t size)
+{
+    if (g_n_excl >= EXCL_MAX || !size)
+        return -1;
+    g_excl[g_n_excl].vaddr = vaddr;
+    g_excl[g_n_excl].size = size;
+    g_n_excl++;
+    return 0;
+}
+
+static int collect_excluded(uint64_t vaddr, uint64_t size)
+{
+    uint64_t end = vaddr + size;
+    for (size_t i = 0; i < g_n_excl; i++) {
+        if (vaddr >= g_excl[i].vaddr &&
+            end <= g_excl[i].vaddr + g_excl[i].size)
+            return 1;
+    }
+    return 0;
+}
+
+int collect_excluded_range(uint64_t vaddr, uint64_t size)
+{
+    return collect_excluded(vaddr, size);
+}
+
 #if defined(__aarch64__)
 /* 让目标自己执行 `mrs x0, tpidr_el0; brk #0x1234` 读 HW TPIDR_EL0
  * (内核 NT_ARM_TLS regset 读 thread.uw.tp_value, 只在上下文切换时
@@ -59,10 +97,11 @@ void collect_tls_jit(pid_t pid)
     if (mf) {
         char line[256];
         while (fgets(line, sizeof line, mf)) {
-            unsigned long long s;
+            unsigned long long s, e;
             char perms[8];
-            if (sscanf(line, "%llx-%*llx %7s", &s, perms) == 2 &&
-                perms[0] == 'r' && perms[2] == 'x') {
+            if (sscanf(line, "%llx-%llx %7s", &s, &e, perms) == 3 &&
+                perms[0] == 'r' && perms[2] == 'x' &&
+                !collect_excluded(s, e - s)) {
                 scratch = (unsigned long)s;
                 break;
             }
@@ -100,6 +139,11 @@ void collect_tls_jit(pid_t pid)
         }
     }
     ptrace(PTRACE_POKEDATA, pid, scratch, backup);
+}
+
+uint64_t collect_get_tls(void)
+{
+    return g_tls;
 }
 #endif
 
@@ -247,6 +291,9 @@ void collect_segments(struct collect_snapshot *sn)
             continue;
         /* 跳过无权限区域 */
         if (perms[0] == '-' && perms[1] == '-' && perms[2] == '-')
+            continue;
+        /* 跳过采集排除区 (原子记录注入页) */
+        if (collect_excluded(start, end - start))
             continue;
 
         struct cseg s = {0};
