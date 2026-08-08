@@ -105,6 +105,7 @@ struct rec_tmp {
     /* --byte-runs: 按 probe 预状态压缩后的回放格式 */
     uint64_t n_newseg_run, n_dirty_run;
     struct buf newseg_run, dirty_run;
+    uint64_t map_idx;           /* syscall.map 行号 (分歧探针对齐用) */
 };
 
 /* strict 模式下的额外 PT_LOAD (由 ELF 组装段发射) */
@@ -2185,6 +2186,7 @@ int build_main(int argc, char **argv)
                     off += 4096;
                 }
                 free(f);
+                recs[nrecs].map_idx = map_idx;
                 nrecs++;
             }
             fclose(mf);
@@ -2245,10 +2247,10 @@ int build_main(int argc, char **argv)
                     apps = xrealloc(apps, app_cap * sizeof(*apps));
                 }
                 apps[napps].rec_idx = len;
-                apps[napps].off = pos + 16;
-                apps[napps].end = pos + 16;
+                apps[napps].off = pos + 32;   /* 标记后才是数据 */
+                apps[napps].end = pos + 32;
                 napps++;
-                pos += 16;
+                pos += 32;              /* 标记 32B: {~0,rec,x0,x1} */
             } else {
                 if (napps == 0)
                     die("--byte-runs: data entry before marker");
@@ -2357,6 +2359,18 @@ int build_main(int argc, char **argv)
         }
         if (n_applied == 0)
             die("--byte-runs: probe applied no records");
+        /* 分歧探针: 表索引 → syscall.map 行号 映射 (离线对齐用) */
+        {
+            char rmp[PATH_MAX];
+            snprintf(rmp, sizeof rmp, "%s.recmap", byte_runs_path);
+            FILE *rmf = fopen(rmp, "w");
+            if (rmf) {
+                for (size_t i = 0; i < nrecs; i++)
+                    fprintf(rmf, "%zu %llu\n", i,
+                            (unsigned long long)recs[i].map_idx);
+                fclose(rmf);
+            }
+        }
         free(apps);
         free(pf);
         replay_fmt = 1;
@@ -2634,6 +2648,7 @@ int build_main(int argc, char **argv)
             die("--probe-dump requires syscall replay records in window");
         uint64_t n_dirty_total = 0, n_newseg_total = 0;
         uint64_t probe_bytes = PROBE_HDR_SIZE;
+        probe_bytes += 32 * (nrecs + 8);   /* 应用标记 (含 mock 兜底) */
         for (size_t i = 0; i < nrecs; i++) {
             n_dirty_total += recs[i].n_dirty;
             probe_bytes += recs[i].n_dirty * (16 + 4096);

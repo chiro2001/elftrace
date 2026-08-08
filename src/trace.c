@@ -75,9 +75,11 @@ struct trace_ctx {
         uint64_t sysno;
         uint64_t count;             /* 捕获时的 perf 指令计数 (窗口过滤用) */
         int interrupted;            /* INTERRUPT 打断的在途 syscall (A=近似) */
+        uint64_t entry_x0, entry_x1;/* ENTRY-stop 的目标 x0/x1 (分歧探针) */
     } *syscalls;
     size_t n_syscalls;
     uint64_t pend_pc, pend_sysno;
+    uint64_t pend_x0, pend_x1;      /* ENTRY-stop 的目标 x0/x1 */
     int have_pending;
     struct collect_snapshot prev_b; /* 上一 syscall 边界完整镜像 (diff 基线) */
     int have_prev_b;
@@ -186,6 +188,18 @@ static void syscall_stream_rec(struct trace_ctx *tc, struct syscall_rec *r,
         die("mkdir %s", sdir);
     snprintf(path, sizeof(path), "%s/sys_%06zu.elftrace", sdir, idx);
     collect_write_diff(base, b, path);
+    /* 分歧探针尾部: {magic, len, entry_x0, entry_x1} —
+       供离线对比切片在边界处的目标 x0/x1 与录制入口 x0/x1 */
+    {
+        uint32_t hdr[2] = {0x54524E45, 24};
+        int fd = open(path, O_WRONLY | O_APPEND);
+        if (fd >= 0) {
+            write(fd, hdr, sizeof(hdr));
+            write(fd, &r->entry_x0, 8);
+            write(fd, &r->entry_x1, 8);
+            close(fd);
+        }
+    }
     /* B 成为新的 diff 基线 */
     collect_snapshot_free_last(&tc->prev_b);
     collect_snapshot_copy_last(&tc->prev_b, b);
@@ -215,6 +229,19 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
         }
         tc->pend_pc = rip;
         tc->pend_sysno = sysno;
+        tc->pend_x0 = 0;
+        tc->pend_x1 = 0;
+#if defined(__aarch64__)
+        {
+            struct user_regs_struct er;
+            struct iovec io = {.iov_base = &er, .iov_len = sizeof(er)};
+            if (ptrace(PTRACE_GETREGSET, tc->pid, (void *)NT_PRSTATUS,
+                       &io) == 0 && io.iov_len >= 2 * 8) {
+                tc->pend_x0 = er.regs[0];
+                tc->pend_x1 = er.regs[1];
+            }
+        }
+#endif
         tc->have_pending = 1;
     } else {
         if (!tc->have_pending) {
@@ -252,6 +279,8 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
         struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
         r->pc = tc->pend_pc;
         r->sysno = tc->pend_sysno;
+        r->entry_x0 = tc->pend_x0;
+        r->entry_x1 = tc->pend_x1;
         r->count = perf_count_now(tc);
         tc->have_pending = 0;
         fprintf(stderr, "trace: syscall %llu @ %#llx (rec %zu)\n",

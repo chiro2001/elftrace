@@ -990,10 +990,10 @@ probe_dump:
     mov  x30, x25
     ret
 
-/* probe_marker(x0=rec_idx, x24=blob_base): 在数据流里写应用标记
- * {0xffff...ffff, rec_idx}, 让 build 知道每条记录的实际应用顺序
- * (目标分歧时记录可能被游标跳过, 顺序不再等于记录序)。
- * 破坏 x0-x3。 */
+/* probe_marker(x0=rec_idx, x24=blob_base, x17=site_block): 在数据流里
+ * 写应用标记 {0xffff...ffff, rec_idx, 目标x0, 目标x1} — 目标 x0/x1
+ * 是切片到达该边界时的寄存器, 离线与录制 ENTRY-stop 的 x0/x1 对比,
+ * 用于定位分歧边界。破坏 x0-x3。 */
 probe_marker:
     ldr  x1, [x24, #RST_DESC_PROBE_BUF_ABS]
     ldr  x2, [x24, #RST_DESC_PROBE_BUF_SIZE]
@@ -1001,7 +1001,11 @@ probe_marker:
     mov  x3, #-1
     str  x3, [x1]
     str  x0, [x1, #8]
-    add  x2, x2, #16
+    ldr  x3, [x17, #24]             /* 目标 x0 (站点块保存槽) */
+    str  x3, [x1, #16]
+    ldr  x3, [x17, #32]             /* 目标 x1 */
+    str  x3, [x1, #24]
+    add  x2, x2, #32
     str  x2, [x24, #RST_DESC_PROBE_BUF_SIZE]
     ret
 
