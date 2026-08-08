@@ -366,7 +366,10 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     put32(&p, ldr_x_imm(24, 25, 0));    /* run.start */
     put32(&p, cmp_x(25, 19));
     uint8_t *lo_b = p;
-    put32(&p, bcond(0, 3));     /* b.lo use_real (占位) */
+    put32(&p, bcond(0, 8));     /* b.hi use_real: run.start > ordinal
+                                   才回退真实读; 游标已定位的运行段
+                                   值持续到下一个事件 (曾用 b.lo,
+                                   序号越过运行段起点后误回退真实值) */
     /* 地址校验: 实际地址 == 运行段地址? */
     if (rn == 31)
         put32(&p, add_x(27, 31, A64_ATOM_SAVE_SIZE));
@@ -407,7 +410,7 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
         uint32_t w;
         w = bcond(d1, 2);   memcpy(hs_b, &w, 4);
         w = bcond(d2, 8);   memcpy(hi_b, &w, 4);
-        w = bcond(d3, 3);   memcpy(lo_b, &w, 4);
+        w = bcond(d3, 8);   memcpy(lo_b, &w, 4);
         w = bcond(d4, 1);   memcpy(ne_b, &w, 4);
         memcpy(set_jmp, &w5, 4);
     }
