@@ -104,7 +104,7 @@ cnt = [int(l.split()[0]) for l in man]
 pcs = [int(l.split()[1], 16) for l in man]
 total = cnt[-1]
 ev = open(d + "/atomics/events.bin", "rb").read()
-n_ev = struct.unpack_from("<Q", ev, 24)[0]
+n_ev = struct.unpack_from("<Q", ev, 16)[0]
 events = []
 for i in range(n_ev):
     sid, ordv, addr, val = struct.unpack_from("<QQQQ", ev, 32 + i * 32)
@@ -198,7 +198,7 @@ grep -q "exit_group" "$TF_TMP/spsc_slice.strace" \
 NEV=$(python3 - "$TF_TMP/spsc_r2" <<'EOF'
 import struct, sys
 b = open(sys.argv[1] + "/atomics/events.bin", "rb").read()
-print(struct.unpack_from("<Q", b, 24)[0])
+print(struct.unpack_from("<Q", b, 16)[0])
 EOF
 )
 [ "$NEV" -gt 0 ] || { echo "FAIL: no recorded atomic events"; exit 1; }
