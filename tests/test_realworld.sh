@@ -108,6 +108,8 @@ gcc -O0 -g -o "$TF_TMP/prog_sha256" tests/prog_sha256.c || exit 1
 gcc -O0 -g -o "$TF_TMP/prog_alloc" tests/prog_alloc.c || exit 1
 gcc -O0 -g -o "$TF_TMP/prog_sockpair" tests/prog_sockpair.c || exit 1
 gcc -O0 -g -o "$TF_TMP/prog_dir" tests/prog_dir.c || exit 1
+gcc -O0 -g -o "$TF_TMP/prog_qsort" tests/prog_qsort.c || exit 1
+gcc -O0 -g -o "$TF_TMP/prog_base64" tests/prog_base64.c || exit 1
 
 R=0
 run_load crc32 "$TF_TMP/prog_crc32" "$DATA" || R=1
@@ -117,9 +119,11 @@ run_load sha256 "$TF_TMP/prog_sha256" "$DATA" || R=1
 run_load alloc "$TF_TMP/prog_alloc" || R=1
 EVERY=20000000 run_load sock "$TF_TMP/prog_sockpair" || R=1
 EVERY=10000000 run_load dir "$TF_TMP/prog_dir" "$TF_TMP/rw_dir" || R=1
+run_load qsort "$TF_TMP/prog_qsort" || R=1
+run_load base64 "$TF_TMP/prog_base64" || R=1
 
 tf_cleanup prog_crc32 prog_lz prog_json prog_sha256 prog_alloc \
-    prog_sockpair prog_dir
+    prog_sockpair prog_dir prog_qsort prog_base64
 [ "$R" = 0 ] || { echo "FAIL: realworld 有失败"; exit 1; }
-tf_pass "realworld strict (crc32/lz/json/sha256/alloc/sockpair/dir)"
+tf_pass "realworld strict (crc32/lz/json/sha256/alloc/sockpair/dir/qsort/base64)"
 tf_finish

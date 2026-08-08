@@ -153,6 +153,9 @@ struct ab_run {
 struct atomic_build {
     int have;
     uint64_t r_num, r_den;      /* 采集补偿系数 r = measured/orig */
+    uint64_t *ck_measured;      /* 逐检查点 measured (Run 2 精确账本) */
+    uint64_t *ck_orig;          /* 逐检查点原始指令数 */
+    size_t n_ck;
     struct ab_site *sites;
     size_t n_sites;
     struct ab_run *runs;
@@ -160,6 +163,70 @@ struct atomic_build {
     size_t *run_off;            /* 站点 i 的 runs 起始索引 */
     size_t *run_cnt;
 };
+
+/* 解析 compensation.txt: r_num/r_den + 逐检查点 {idx measured overhead orig} */
+static void atomic_comp_load(const char *dir, struct atomic_build *ab)
+{
+    char cp[PATH_MAX];
+    snprintf(cp, sizeof(cp), "%s/atomics/compensation.txt", dir);
+    FILE *cf = fopen(cp, "r");
+    if (!cf)
+        return;
+    char cl[256];
+    while (fgets(cl, sizeof(cl), cf)) {
+        uint64_t idx, m, ov, o;
+        if (sscanf(cl, "r_num %llu", (unsigned long long *)&ab->r_num) == 1)
+            continue;
+        if (sscanf(cl, "r_den %llu", (unsigned long long *)&ab->r_den) == 1)
+            continue;
+        if (sscanf(cl, "%llu %llu %llu %llu",
+                   (unsigned long long *)&idx, (unsigned long long *)&m,
+                   (unsigned long long *)&ov, (unsigned long long *)&o) == 4) {
+            ab->ck_measured = xrealloc(ab->ck_measured,
+                                       (ab->n_ck + 1) * sizeof(uint64_t));
+            ab->ck_orig = xrealloc(ab->ck_orig,
+                                   (ab->n_ck + 1) * sizeof(uint64_t));
+            ab->ck_measured[ab->n_ck] = m;
+            ab->ck_orig[ab->n_ck] = o;
+            ab->n_ck++;
+        }
+    }
+    fclose(cf);
+}
+
+/* measured 计数 → 原始计数: 逐检查点线性插值; 无账本时退化为单 r */
+static uint64_t atomic_orig_at(const struct atomic_build *ab,
+                               uint64_t measured)
+{
+    if (!ab->n_ck) {
+        if (ab->r_num && ab->r_den)
+            return (uint64_t)(((__uint128_t)measured * ab->r_den) /
+                              ab->r_num);
+        return measured;
+    }
+    for (size_t i = 0; i + 1 < ab->n_ck; i++) {
+        if (measured <= ab->ck_measured[i + 1]) {
+            uint64_t m0 = ab->ck_measured[i];
+            uint64_t m1 = ab->ck_measured[i + 1];
+            uint64_t o0 = ab->ck_orig[i];
+            uint64_t o1 = ab->ck_orig[i + 1];
+            if (m1 == m0)
+                return o1;
+            return o0 + (uint64_t)(((__uint128_t)(measured - m0) *
+                                    (o1 - o0)) / (m1 - m0));
+        }
+    }
+    if (ab->n_ck >= 2) {
+        uint64_t m0 = ab->ck_measured[ab->n_ck - 2];
+        uint64_t m1 = ab->ck_measured[ab->n_ck - 1];
+        uint64_t o0 = ab->ck_orig[ab->n_ck - 2];
+        uint64_t o1 = ab->ck_orig[ab->n_ck - 1];
+        if (m1 > m0 && measured > m1)
+            return o1 + (uint64_t)(((__uint128_t)(measured - m1) *
+                                    (o1 - o0)) / (m1 - m0));
+    }
+    return ab->ck_orig[ab->n_ck - 1];
+}
 
 static uint64_t rd_u64(const uint8_t **p)
 {
@@ -429,24 +496,8 @@ static void atomic_load(const char *dir, long from, long to,
         fprintf(stderr, "atomic: %zu sites, %zu window run segments\n",
                 (size_t)n_sites, ab->n_runs);
 
-    /* 补偿系数 (Run 1 或 Run 2 的 compensation.txt) */
-    {
-        char cp[PATH_MAX];
-        snprintf(cp, sizeof(cp), "%s/atomics/compensation.txt", dir);
-        FILE *cf = fopen(cp, "r");
-        if (cf) {
-            char cl[256];
-            while (fgets(cl, sizeof(cl), cf)) {
-                if (sscanf(cl, "r_num %llu",
-                           (unsigned long long *)&ab->r_num) == 1)
-                    continue;
-                if (sscanf(cl, "r_den %llu",
-                           (unsigned long long *)&ab->r_den) == 1)
-                    continue;
-            }
-            fclose(cf);
-        }
-    }
+    /* 补偿系数与逐检查点账本 (Run 1 或 Run 2 的 compensation.txt) */
+    atomic_comp_load(dir, ab);
     ab->have = 1;
     return;
 no_runs:
@@ -1158,15 +1209,15 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 st->tramp_addr = taddr + o;
                 st->block_addr = taddr + o;
                 uint64_t runs_abs = base + st->ab_run_off;
-                int is64;
+                int size;
                 unsigned rt, rn;
                 if (!a64_is_ldar(ab->sites[st->ab_id].orig_insn,
-                                 &is64, &rt, &rn))
+                                 &size, &rt, &rn))
                     die("atomic: bad orig insn at %#llx",
                         (unsigned long long)st->pc);
                 size_t bl = a64_atomic_replay_block(
                     page + o, taddr + o, runs_abs,
-                    ab->run_cnt[st->ab_id] + 1, is64, rt, rn, st->pc + 4,
+                    ab->run_cnt[st->ab_id] + 1, size, rt, rn, st->pc + 4,
                     ab->sites[st->ab_id].to_ord -
                         ab->sites[st->ab_id].from_ord,
                     base + STUB_STRICT_EXIT_OFF);
@@ -1456,6 +1507,8 @@ int build_main(int argc, char **argv)
 #if defined(__aarch64__)
     struct atomic_build ab;
     memset(&ab, 0, sizeof(ab));
+    if (ckpts)
+        atomic_comp_load(ckpts, &ab);   /* 提前解析账本, 供选窗使用 */
 #endif
 
     for (int i = 1; i < argc; i++) {
@@ -1555,9 +1608,15 @@ int build_main(int argc, char **argv)
                 uint64_t c2 = 0;
                 if (sscanf(l2, "%llu", &c2) != 1)
                     continue;
-                if (have_from_count && f_idx < 0 && c2 >= from_count)
+                uint64_t ck_val = c2;
+#if defined(__aarch64__)
+                /* Run 2 精确账本: 用逐检查点 orig 替代 manifest 名义计数 */
+                if (ab.n_ck && idx2 < (long)ab.n_ck)
+                    ck_val = ab.ck_orig[idx2];
+#endif
+                if (have_from_count && f_idx < 0 && ck_val >= from_count)
                     f_idx = idx2;
-                if (have_to_count && t_idx < 0 && c2 >= to_count)
+                if (have_to_count && t_idx < 0 && ck_val >= to_count)
                     t_idx = idx2;
                 idx2++;
             }
@@ -1899,10 +1958,10 @@ int build_main(int argc, char **argv)
                     uint64_t rc = rec_count;
 #if defined(__aarch64__)
                     /* map 计数是 measured 空间; manifest 计数 (补偿后)
-                       是原始空间, 按 r 转换 */
+                       是原始空间。优先用逐检查点精确账本插值, 无账本
+                       时退化为单 r 转换 */
                     if (ab.have && ab.r_num && ab.r_den)
-                        rc = (uint64_t)(((__uint128_t)rc * ab.r_den) /
-                                        ab.r_num);
+                        rc = atomic_orig_at(&ab, rc);
 #endif
                     if (rc < ckpt_count0 ||
                         rc >= ckpt_count_to) {
@@ -2237,6 +2296,8 @@ int build_main(int argc, char **argv)
     free(ab.runs);
     free(ab.run_off);
     free(ab.run_cnt);
+    free(ab.ck_measured);
+    free(ab.ck_orig);
 #endif
     for (size_t i = 0; i < nrecs; i++) {
         free(recs[i].unmap.data);

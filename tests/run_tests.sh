@@ -25,12 +25,12 @@ ROOT=$(pwd)
 LOG="$ROOT/tmp/test_run.log"
 mkdir -p "$ROOT/tmp"
 
-TESTS="strict atomic_spin atomic_tramp basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle baremetal imix bm_edge realworld comp_ratio"
+TESTS="strict atomic_spin atomic_tramp atomic_boundary basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle baremetal imix bm_edge realworld comp_ratio"
 PASS=0
 FAIL=0
 
 # 清理残留测试进程 (避免干扰)
-for p in prog_simple prog_fd prog_fd_rw prog_cpp python3 prog_syscall prog_stack prog_bigmem prog_thread prog_append prog_bareheap prog_bm_imm prog_bm_loopread prog_crc32 prog_lz prog_json prog_sha256 prog_alloc prog_sockpair prog_dir prog_ioctl prog_calib prog_spsc_spin; do
+for p in prog_simple prog_fd prog_fd_rw prog_cpp python3 prog_syscall prog_stack prog_bigmem prog_thread prog_append prog_bareheap prog_bm_imm prog_bm_loopread prog_crc32 prog_lz prog_json prog_sha256 prog_alloc prog_sockpair prog_dir prog_ioctl prog_calib prog_spsc_spin prog_atomic_boundary; do
     pgrep -x "$p" | xargs -r kill -9 2>/dev/null
 done
 sleep 0.3

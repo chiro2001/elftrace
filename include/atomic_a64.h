@@ -21,8 +21,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* ---- ldar 识别 ---- */
-int a64_is_ldar(uint32_t w, int *is64, unsigned *rt, unsigned *rn);
+/* ---- ldar/ldarb/ldarh 识别 ----
+ * size 输出为加载宽度 (1/2/4/8 字节); rt/rn 为寄存器号 (31=sp)。 */
+int a64_is_ldar(uint32_t w, int *size, unsigned *rt, unsigned *rn);
 
 /* ---- 块/页布局 ---- */
 #define A64_ATOM_BLOCK_SIZE  0x240   /* 每站点块 (代码 + 数据区@0x200..0x238) */

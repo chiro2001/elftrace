@@ -124,15 +124,28 @@ static void emit_restore(uint8_t **p)
     put32(p, 0xA8C147F0U);      /* ldp x16,x17,[sp],#16 (入口保存) */
 }
 
-int a64_is_ldar(uint32_t w, int *is64, unsigned *rt, unsigned *rn)
+int a64_is_ldar(uint32_t w, int *size, unsigned *rt, unsigned *rn)
 {
     /* 保留除 size(bit30)/Rn/Rt 外的全部定式位 */
-    if ((w & 0xBFDFFC00U) != 0x88DFFC00U)
-        return 0;               /* 覆盖 ldar x/w 两种, 排除其他 */
-    *is64 = (w & 0x80000000U) != 0;
+    uint32_t base = w & 0xBFDFFC00U;
+    if (base != 0x08DFFC00U && base != 0x88DFFC00U)
+        return 0;               /* 仅 ldar/ldarb/ldarh (w/x 两种) */
+    if (base == 0x08DFFC00U)
+        *size = (w & 0x40000000U) ? 2 : 1;      /* ldarh / ldarb */
+    else
+        *size = (w & 0x40000000U) ? 8 : 4;      /* ldar x / ldar w */
     *rt = w & 0x1FU;
     *rn = (w >> 5) & 0x1FU;
     return 1;
+}
+
+/* 按加载宽度生成 ldar/ldarb/ldarh 指令 (回放屏障用) */
+static uint32_t a64_ldar_insn(int size, unsigned rn, unsigned rt)
+{
+    uint32_t base = size == 1 ? 0x08DFFC00U :
+                    size == 2 ? 0x48DFFC00U :
+                    size == 4 ? 0x88DFFC00U : 0xC8DFFC00U;
+    return base | (rn << 5) | rt;
 }
 
 int a64_atom_reg_save_off(unsigned reg)
@@ -170,8 +183,8 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
 {
     uint8_t *p = out;
     unsigned rt, rn;
-    int is64;
-    if (!a64_is_ldar(orig_insn, &is64, &rt, &rn))
+    int size;
+    if (!a64_is_ldar(orig_insn, &size, &rt, &rn))
         return 0;
     if (rt == 31)
         return 0;               /* 写入 xzr: 罕见, 跳过 */
@@ -323,7 +336,7 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
 
 size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                uint64_t runs_abs, uint64_t n_runs,
-                               int is64, unsigned rt, unsigned rn,
+                               int size, unsigned rt, unsigned rn,
                                uint64_t ret_addr,
                                uint64_t load_limit, uint64_t exit_abs)
 {
@@ -406,7 +419,7 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     put32(&p, bcond(0, 1));     /* b.ne use_real (占位) */
     put32(&p, ldr_x_imm(24, 23, 16));   /* run.value */
     /* 真实 acquire 屏障: 对原地址执行 ldar (值丢弃), 保证排序语义 */
-    put32(&p, is64 ? INSN_LDAR_X29_X27 : INSN_LDAR_W29_X27);
+    put32(&p, a64_ldar_insn(size, 27, 29));
     uint8_t *set_jmp = p;
     put32(&p, 0x14000000U);     /* b set (占位, 无条件) */
     uint8_t *use_real = p;
@@ -414,8 +427,7 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
         put32(&p, add_x(27, 31, A64_ATOM_SAVE_SIZE));
     else
         put32(&p, ldr_x_imm(31, 27, (unsigned)rn_off));
-    put32(&p, is64 ? (0xC8DFFC00U | (27U << 5) | 13U) :
-                     (0x88DFFC00U | (27U << 5) | 13U));
+    put32(&p, a64_ldar_insn(size, 27, 13));
     put32(&p, mov_x(23, 13));           /* 真实值 → x23 (set 统一写槽) */
     uint8_t *set = p;
     /* 把最终值写入 Rt 的保存槽 (恢复时弹出) */

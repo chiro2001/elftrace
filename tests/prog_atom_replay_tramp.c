@@ -25,6 +25,24 @@ __asm__(".global spin_site_label\n"
         "    b.lo spin_site\n"
         "    ret\n");
 
+extern void spin8_label(uint64_t, uint64_t, uint64_t);
+__asm__(".global spin8_label\n"
+        ".type spin8_label, %function\n"
+        "spin8_label:\n"
+        "spin8_site:\n"
+        "    ldar x18, [x2]\n"
+        "    cbz x18, spin8_site\n"
+        "    ret\n");
+
+extern void spin1_label(uint64_t);
+__asm__(".global spin1_label\n"
+        ".type spin1_label, %function\n"
+        "spin1_label:\n"
+        "spin1_site:\n"
+        "    ldarb w16, [x0]\n"
+        "    cbz w16, spin1_site\n"
+        "    ret\n");
+
 static volatile uint64_t flag;   /* 永远为 0: 回放必须覆盖真实内存值 */
 static volatile uint64_t dbg_ord, dbg_cur, dbg_run2v;
 static void on_alarm(int s)
@@ -89,8 +107,22 @@ static uint64_t text_start(void)
     return best;
 }
 
+static void patch_site(uint64_t site, uint64_t target)
+{
+    long pg = sysconf(_SC_PAGESIZE);
+    uintptr_t b = site & ~(uintptr_t)(pg - 1);
+    mprotect((void *)b, pg, PROT_READ | PROT_WRITE | PROT_EXEC);
+    uint32_t br = 0x14000000U |
+                  (((uint32_t)((target - site) >> 2) & 0x03FFFFFFU));
+    memcpy((void *)(uintptr_t)site, &br, 4);
+    __builtin___clear_cache((char *)site, (char *)site + 4);
+    mprotect((void *)b, pg, PROT_READ | PROT_EXEC);
+}
+
 int main(void)
 {
+    static volatile uint64_t flag8 = 0;
+    static volatile uint8_t flag1 = 0;
     uint64_t ts = text_start();
     uint64_t page = find_gap_near(ts, 0x1000);
     if (!page) { fprintf(stderr, "no gap\n"); return 1; }
@@ -126,18 +158,9 @@ int main(void)
 
     /* patch 站点 → b page */
     uint64_t site = (uint64_t)(uintptr_t)spin_site_label;
-    long pg = sysconf(_SC_PAGESIZE);
-    uintptr_t base = site & ~(uintptr_t)(pg - 1);
-    if (mprotect((void *)base, pg, PROT_READ | PROT_WRITE | PROT_EXEC) < 0) {
-        perror("mprotect"); return 1;
-    }
-    uint32_t br = 0x14000000U |
-                  (((uint32_t)((page - site) >> 2) & 0x03FFFFFFU));
-    fprintf(stderr, "site=%#llx page=%#llx br=%#x\n",
-            (unsigned long long)site, (unsigned long long)page, br);
-    memcpy((void *)(uintptr_t)site, &br, 4);
-    __builtin___clear_cache((char *)site, (char *)site + 4);
-    mprotect((void *)base, pg, PROT_READ | PROT_EXEC);
+    fprintf(stderr, "site=%#llx page=%#llx\n",
+            (unsigned long long)site, (unsigned long long)page);
+    patch_site(site, page);
 
     signal(SIGALRM, on_alarm);
     alarm(5);
@@ -153,6 +176,58 @@ int main(void)
         obs[2] != 1 || obs[3] != 1 || obs[4] != 2) {
         fprintf(stderr, "REPLAY TRAMP FAIL\n");
         return 1;
+    }
+
+    /* 位宽/寄存器角落: 64 位 ldar x18,[x2] (rt=18, rn=2) */
+    {
+        struct { uint64_t start, addr, value; } runs8[2] = {
+            {1, (uint64_t)(uintptr_t)&flag8, 0},
+            {2, (uint64_t)(uintptr_t)&flag8, 1},
+        };
+        uint8_t *blk8 = (uint8_t *)(uintptr_t)page + 0x240;
+        if (!a64_atomic_replay_block(blk8, page + 0x240,
+                                     (uint64_t)(uintptr_t)&runs8[0], 2,
+                                     8, 18, 2,
+                                     (uint64_t)(uintptr_t)spin8_label + 4,
+                                     0, 0)) {
+            fprintf(stderr, "gen8 failed\n");
+            return 1;
+        }
+        __builtin___clear_cache((char *)blk8, (char *)blk8 + 0x240);
+        patch_site((uint64_t)(uintptr_t)spin8_label, page + 0x240);
+        spin8_label(0, 0, (uint64_t)(uintptr_t)&flag8);
+        uint64_t ord8 = *(volatile uint64_t *)(uintptr_t)(page + 0x440);
+        printf("ord8=%llu\n", (unsigned long long)ord8);
+        if (ord8 != 2) {
+            fprintf(stderr, "REPLAY 64BIT FAIL\n");
+            return 1;
+        }
+    }
+
+    /* 位宽/寄存器角落: 8 位 ldarb w16,[x0] (rt=16, rn=0) */
+    {
+        struct { uint64_t start, addr, value; } runs1[2] = {
+            {1, (uint64_t)(uintptr_t)&flag1, 0},
+            {2, (uint64_t)(uintptr_t)&flag1, 1},
+        };
+        uint8_t *blk1 = (uint8_t *)(uintptr_t)page + 0x480;
+        if (!a64_atomic_replay_block(blk1, page + 0x480,
+                                     (uint64_t)(uintptr_t)&runs1[0], 2,
+                                     1, 16, 0,
+                                     (uint64_t)(uintptr_t)spin1_label + 4,
+                                     0, 0)) {
+            fprintf(stderr, "gen1 failed\n");
+            return 1;
+        }
+        __builtin___clear_cache((char *)blk1, (char *)blk1 + 0x240);
+        patch_site((uint64_t)(uintptr_t)spin1_label, page + 0x480);
+        spin1_label((uint64_t)(uintptr_t)&flag1);
+        uint64_t ord1 = *(volatile uint64_t *)(uintptr_t)(page + 0x680);
+        printf("ord1=%llu\n", (unsigned long long)ord1);
+        if (ord1 != 2) {
+            fprintf(stderr, "REPLAY 8BIT FAIL\n");
+            return 1;
+        }
     }
     printf("REPLAY TRAMP OK\n");
     return 0;

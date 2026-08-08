@@ -24,14 +24,37 @@ __asm__(".global spin_site_label\n"
         "    cbz w1, spin_site\n"
         "    ret\n");
 
+extern void spin2_label(uint64_t);
+__asm__(".global spin2_label\n"
+        ".type spin2_label, %function\n"
+        "spin2_label:\n"
+        "spin2_site:\n"
+        "    ldarh w17, [x0]\n"
+        "    cbz w17, spin2_site\n"
+        "    ret\n");
+
 static volatile uint64_t flag;
+static volatile uint16_t flag2;
 static inline uint64_t get_tpidr(void) { uint64_t v; asm volatile("mrs %0, tpidr_el0" : "=r"(v)); return v; }
 static void *setter(void *arg)
 {
     (void)arg;
     usleep(200000);
     __atomic_store_n(&flag, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&flag2, 1, __ATOMIC_RELEASE);
     return NULL;
+}
+
+static void patch_site(uint64_t site, uint64_t target)
+{
+    long pg = sysconf(_SC_PAGESIZE);
+    uintptr_t b = site & ~(uintptr_t)(pg - 1);
+    mprotect((void *)b, pg, PROT_READ | PROT_WRITE | PROT_EXEC);
+    uint32_t br = 0x14000000U |
+                  (((uint32_t)((target - site) >> 2) & 0x03FFFFFFU));
+    memcpy((void *)(uintptr_t)site, &br, 4);
+    __builtin___clear_cache((char *)site, (char *)site + 4);
+    mprotect((void *)b, pg, PROT_READ | PROT_EXEC);
 }
 
 static uint64_t find_gap_near(uint64_t near, uint64_t size)
@@ -137,20 +160,31 @@ int main(void)
     fprintf(stderr, "gen ok bl=%zu\n", bl);
     fprintf(stderr, "tls=%#llx blk_tls=%#llx\n", (unsigned long long)get_tpidr(), (unsigned long long)*(uint64_t *)(blk + 0x200));
     memcpy((void *)(uintptr_t)page, blk, sizeof(blk));
+    __builtin___clear_cache((char *)(uintptr_t)page,
+                            (char *)(uintptr_t)page + sizeof(blk));
+
+    /* 位宽/寄存器角落: ldarh w17,[x0] (rt=17, size=2), 独立站点/事件槽 */
+    {
+        uint8_t blk2[A64_ATOM_BLOCK_SIZE];
+        size_t bl2 = a64_atomic_record_block(
+            blk2, page + 0x240, 0x48DFFC00U, get_tpidr(), 1,
+            buf + A64_ATB_HDR_SIZE + A64_ATB_STATE_SIZE,
+            buf + A64_ATB_OFF_EVENT_PTR,
+            buf + A64_ATB_OFF_EVENTS_END,
+            buf + A64_ATB_OFF_OVERFLOW,
+            (uint64_t)(uintptr_t)spin2_label + 4, NULL);
+        if (!bl2) { fprintf(stderr, "gen2 failed\n"); return 1; }
+        memcpy((void *)(uintptr_t)(page + 0x240), blk2, sizeof(blk2));
+        __builtin___clear_cache((char *)(uintptr_t)(page + 0x240),
+                                (char *)(uintptr_t)(page + 0x240) +
+                                sizeof(blk2));
+        patch_site((uint64_t)(uintptr_t)spin2_label, page + 0x240);
+    }
 
     /* patch 站点 → b page (self-modify) */
     uint64_t site = (uint64_t)(uintptr_t)spin_site_label;
-    long pg = sysconf(_SC_PAGESIZE);
-    uintptr_t base = site & ~(uintptr_t)(pg - 1);
-    if (mprotect((void *)base, pg, PROT_READ | PROT_WRITE | PROT_EXEC) < 0) {
-        perror("mprotect"); return 1;
-    }
-    uint32_t br = 0x14000000U |
-                  (((uint32_t)((page - site) >> 2) & 0x03FFFFFFU));
     fprintf(stderr, "patching site=%#llx\n", (unsigned long long)site);
-    memcpy((void *)(uintptr_t)site, &br, 4);
-    __builtin___clear_cache((char *)site, (char *)site + 4);
-    mprotect((void *)base, pg, PROT_READ | PROT_EXEC);
+    patch_site(site, page);
 
     /* 运行: 主线程自旋, 辅助线程置 flag */
     pthread_t t;
@@ -160,6 +194,8 @@ int main(void)
     fprintf(stderr, "path insns base=%u append=%u skip=%u\n",
             ac.base, ac.append, ac.skip);
     fprintf(stderr, "spin returned\n");
+    spin2_label((uint64_t)(uintptr_t)&flag2);
+    fprintf(stderr, "spin2 returned\n");
     pthread_join(t, NULL);
     fprintf(stderr, "joined\n");
 
@@ -168,12 +204,23 @@ int main(void)
     uint64_t last = *(volatile uint64_t *)(uintptr_t)(buf + A64_ATB_HDR_SIZE + 8);
     uint64_t eptr = *(volatile uint64_t *)(uintptr_t)(buf + A64_ATB_OFF_EVENT_PTR);
     uint64_t n_ev = (eptr - (buf + events_off)) / 32;
-    printf("site=%#llx page=%#llx br=%#x\n", (unsigned long long)site, (unsigned long long)page, br);
+    printf("site=%#llx page=%#llx\n", (unsigned long long)site,
+           (unsigned long long)page);
     printf("ord=%llu last=%llu events=%llu\n",
            (unsigned long long)ord, (unsigned long long)last,
            (unsigned long long)n_ev);
     if (ord == 0 || last != 1 || n_ev == 0) {
         fprintf(stderr, "TRAMP FAIL\n");
+        return 1;
+    }
+    uint64_t ord2 = *(volatile uint64_t *)(uintptr_t)(buf + A64_ATB_HDR_SIZE +
+                                                      A64_ATB_STATE_SIZE);
+    uint64_t last2 = *(volatile uint64_t *)(uintptr_t)(buf + A64_ATB_HDR_SIZE +
+                                                       A64_ATB_STATE_SIZE + 8);
+    printf("ord2=%llu last2=%llu\n", (unsigned long long)ord2,
+           (unsigned long long)last2);
+    if (ord2 == 0 || last2 != 1) {
+        fprintf(stderr, "TRAMP 16BIT FAIL\n");
         return 1;
     }
     printf("TRAMP OK\n");

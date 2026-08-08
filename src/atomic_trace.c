@@ -205,9 +205,9 @@ static int atomic_scan(pid_t pid, struct asite **out, size_t *n_out,
         for (uint64_t off = 0; off + 4 <= (uint64_t)got; off += 4) {
             uint32_t w;
             memcpy(&w, buf + off, 4);
-            int is64;
+            int size;
             unsigned rt, rn;
-            if (!a64_is_ldar(w, &is64, &rt, &rn))
+            if (!a64_is_ldar(w, &size, &rt, &rn))
                 continue;
             if (rt == 31)
                 continue;       /* 目标 xzr: 罕见, 跳过 */
