@@ -27,6 +27,8 @@
 #include <sys/uio.h>
 #include <signal.h>
 #include <elf.h>
+#include <dirent.h>
+#include <sys/syscall.h>
 
 #include "util.h"
 #include "arch.h"
@@ -469,6 +471,25 @@ int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
             return -1;
     }
 
+    /* 停住其他线程: PTRACE_CONT 会恢复全部线程, waitpid 可能等到
+       worker 线程的 stop (信号/断点), 读到的 x0 是垃圾 (实测 mmap
+       注入偶发返回 0 → event buffer @ 0 写失败)。 */
+    char task[64];
+    snprintf(task, sizeof task, "/proc/%d/task", pid);
+    DIR *td = opendir(task);
+    if (td) {
+        struct dirent *e;
+        while ((e = readdir(td))) {
+            if (e->d_name[0] == '.')
+                continue;
+            pid_t tid = atoi(e->d_name);
+            if (tid != pid)
+                syscall(SYS_tgkill, pid, tid, SIGSTOP);
+        }
+        closedir(td);
+        usleep(1000);   /* 让 SIGSTOP 生效 */
+    }
+
     struct user_regs_struct r = *regs, saved = *regs;
     struct iovec io = {.iov_base = &r, .iov_len = sizeof(r)};
     int ok = -1;
@@ -498,6 +519,21 @@ int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
     ptrace(PTRACE_POKEDATA, pid, page, backup[0]);
     if (ninsn > 2)
         ptrace(PTRACE_POKEDATA, pid, page + 8, backup[1]);
+    /* 恢复其他线程 */
+    if (td) {
+        DIR *td2 = opendir(task);
+        if (td2) {
+            struct dirent *e;
+            while ((e = readdir(td2))) {
+                if (e->d_name[0] == '.')
+                    continue;
+                pid_t tid = atoi(e->d_name);
+                if (tid != pid)
+                    syscall(SYS_tgkill, pid, tid, SIGCONT);
+            }
+            closedir(td2);
+        }
+    }
     return ok;
 }
 

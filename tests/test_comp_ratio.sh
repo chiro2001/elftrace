@@ -38,11 +38,34 @@ MAN="$TF_TMP/calib_ckpts/manifest.txt"
 NCK=$(wc -l < "$MAN")
 [ "$NCK" -ge 6 ] || { echo "FAIL: only $NCK checkpoints"; exit 1; }
 
-FROM=$((NCK / 2 - 1))
-TO=$((FROM + 1))
-FROM_CNT=$(sed -n "$((FROM + 1))p" "$MAN" | awk '{print $1}')
-TO_CNT=$(sed -n "$((TO + 1))p" "$MAN" | awk '{print $1}')
-T=$((TO_CNT - FROM_CNT))
+# 检查点 pc 常落在 libc (syscall 边界), 循环分析不一定命中; 从中间
+# 窗口开始向后搜索, 直到 build 输出 K= (带循环计数器的窗口)
+FROM=0
+TO=0
+T=0
+for cand in $(seq 1 $((NCK - 2))); do
+    F=$((NCK / 2 - 1 + cand - 1))
+    [ "$F" -ge 1 ] && [ "$F" -lt "$NCK" ] || continue
+    TT=$((F + 1))
+    [ "$TT" -le "$((NCK - 1))" ] || continue
+    FCNT=$(sed -n "$((F + 1))p" "$MAN" | awk '{print $1}')
+    TCNT=$(sed -n "$((TT + 1))p" "$MAN" | awk '{print $1}')
+    [ "$TCNT" -gt "$FCNT" ] || continue
+    if "$ELFTRACE" build /dev/null -o "$TF_TMP/calib_probe.elf" \
+        --mode baremetal --bm-strict --checkpoints "$TF_TMP/calib_ckpts" \
+        --from "$F" --to "$TT" --stack-reserve 67108864 \
+        > "$TF_TMP/calib_probe.log" 2>&1; then
+        KB=$(grep -oE 'K=[0-9]+' "$TF_TMP/calib_probe.log" \
+            | head -1 | cut -d= -f2)
+        if [ "${KB:-0}" -gt 0 ]; then
+            FROM=$F
+            TO=$TT
+            T=$((TCNT - FCNT))
+            break
+        fi
+    fi
+done
+[ "$FROM" -gt 0 ] || { echo "FAIL: 找不到带循环计数器的窗口"; exit 1; }
 echo "comp-ratio: window [$FROM,$TO] expected=$T instructions"
 
 SLICE="$TF_TMP/calib_slice.elf"

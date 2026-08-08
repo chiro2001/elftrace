@@ -90,6 +90,11 @@ static int tmem_rw(pid_t pid, int wr, uint64_t addr, void *buf, size_t len)
         return -1;
     ssize_t n = wr ? pwrite(fd, buf, len, (off_t)addr)
                    : pread(fd, buf, len, (off_t)addr);
+    if (n != (ssize_t)len)
+        fprintf(stderr, "atomic: tmem_rw %s @ %#llx len %zu -> %zd "
+                "(errno %d %s)\n",
+                wr ? "write" : "read", (unsigned long long)addr, len, n,
+                errno, strerror(errno));
     close(fd);
     return n == (ssize_t)len ? 0 : -1;
 }
@@ -430,7 +435,8 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
         write_u64(&p, 0);
         write_u64(&p, buf_size);
         if (tmem_rw(pid, 1, ctx->abuf_addr, hdr, sizeof(hdr)) < 0) {
-            warn("atomic: cannot init event buffer");
+            warn("atomic: cannot init event buffer @ %#llx",
+                 (unsigned long long)ctx->abuf_addr);
             goto fail;
         }
     }
