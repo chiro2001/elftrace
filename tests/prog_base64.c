@@ -58,7 +58,7 @@ static size_t b64_decode(const char *in, size_t n, unsigned char *out)
 
 int main(void)
 {
-    enum { N = 2 * 1024 * 1024 };
+    enum { N = 6 * 1024 * 1024 };
     unsigned char *in = malloc(N);
     char *enc = malloc(N * 2);
     unsigned char *dec = malloc(N * 2);

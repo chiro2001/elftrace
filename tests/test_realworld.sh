@@ -120,7 +120,7 @@ run_load alloc "$TF_TMP/prog_alloc" || R=1
 EVERY=20000000 run_load sock "$TF_TMP/prog_sockpair" || R=1
 EVERY=10000000 run_load dir "$TF_TMP/prog_dir" "$TF_TMP/rw_dir" || R=1
 run_load qsort "$TF_TMP/prog_qsort" || R=1
-run_load base64 "$TF_TMP/prog_base64" || R=1
+EVERY=50000000 run_load base64 "$TF_TMP/prog_base64" || R=1
 
 tf_cleanup prog_crc32 prog_lz prog_json prog_sha256 prog_alloc \
     prog_sockpair prog_dir prog_qsort prog_base64
