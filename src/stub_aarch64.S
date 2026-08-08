@@ -990,6 +990,21 @@ probe_dump:
     mov  x30, x25
     ret
 
+/* probe_marker(x0=rec_idx, x24=blob_base): 在数据流里写应用标记
+ * {0xffff...ffff, rec_idx}, 让 build 知道每条记录的实际应用顺序
+ * (目标分歧时记录可能被游标跳过, 顺序不再等于记录序)。
+ * 破坏 x0-x3。 */
+probe_marker:
+    ldr  x1, [x24, #RST_DESC_PROBE_BUF_ABS]
+    ldr  x2, [x24, #RST_DESC_PROBE_BUF_SIZE]
+    add  x1, x1, x2
+    mov  x3, #-1
+    str  x3, [x1]
+    str  x0, [x1, #8]
+    add  x2, x2, #16
+    str  x2, [x24, #RST_DESC_PROBE_BUF_SIZE]
+    ret
+
 /* 解析 /proc/self/maps, 找到 [stack] 行, munmap 之。
  * 破坏: x0-x8, x19-x20 */
 unmap_initial_stack:
@@ -1398,7 +1413,11 @@ comp_found:
     movk x25, #(STUB_STRICT_COMP_OFF >> 16), lsl #16
     sub  x24, x24, x25
     ldr  x0, [x24, #RST_DESC_PROBE_ENABLED]
-    cbnz x0, comp_probe
+    cbz  x0, comp_not_probe
+    sub  x0, x19, #1                /* 本次应用的 rec 索引 */
+    bl   probe_marker
+    b    comp_probe
+comp_not_probe:
     ldr  x0, [x16, #8]              /* 回放表 fmt: 0=整页, 1=字节 run */
     cbnz x0, comp_runs
 
@@ -1606,6 +1625,16 @@ comp_mock:
     mul  x4, x3, x4
     add  x4, x4, x16
     add  x4, x4, #16                /* x4 = rec base (跳过 n_recs+fmt) */
+    /* probe: 记录本次提前应用的 rec 索引 (标记流) */
+    adr  x24, comp_engine
+    movz x25, #(STUB_STRICT_COMP_OFF & 0xffff)
+    movk x25, #(STUB_STRICT_COMP_OFF >> 16), lsl #16
+    sub  x24, x24, x25
+    ldr  x0, [x24, #RST_DESC_PROBE_ENABLED]
+    cbz  x0, mock_fb_no_probe
+    mov  x0, x3
+    bl   probe_marker
+mock_fb_no_probe:
     ldr  x0, [x16, #8]              /* fmt: 1 → 字节 run 应用 */
     cbz  x0, mock_legacy_apply
     mov  x25, x4

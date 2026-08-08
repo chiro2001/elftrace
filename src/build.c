@@ -2219,46 +2219,80 @@ int build_main(int argc, char **argv)
         if (magic != PROBE_FILE_MAGIC || ver != PROBE_FILE_VERSION)
             die("--byte-runs: bad probe dump %s", byte_runs_path);
         size_t pos = PROBE_HDR_SIZE;
+        /* 第一遍: 按标记流切分应用。probe 切片目标分歧时, 引擎游标
+           会跳过未执行的记录, 应用顺序 ≠ 记录序; 每个应用前 stub
+           写 {~0, rec_idx} 标记, 数据 entry 属于最近一个标记。 */
+        struct probe_app { uint64_t rec_idx; size_t off, end; };
+        struct probe_app *apps = NULL;
+        size_t napps = 0, app_cap = 0;
+        while (pos < psz) {
+            uint64_t a, len;
+            if (pos + 16 > psz)
+                die("--byte-runs: truncated probe header");
+            memcpy(&a, pf + pos, 8);
+            memcpy(&len, pf + pos + 8, 8);
+            if (a == UINT64_MAX) {      /* 标记: {~0, rec_idx} */
+                if (napps == app_cap) {
+                    app_cap = app_cap ? app_cap * 2 : 32;
+                    apps = xrealloc(apps, app_cap * sizeof(*apps));
+                }
+                apps[napps].rec_idx = len;
+                apps[napps].off = pos + 16;
+                apps[napps].end = pos + 16;
+                napps++;
+                pos += 16;
+            } else {
+                if (napps == 0)
+                    die("--byte-runs: data entry before marker");
+                if (pos + 16 + len > psz)
+                    die("--byte-runs: truncated data entry");
+                apps[napps - 1].end = pos + 16 + len;
+                pos += 16 + len;
+            }
+        }
+        if (pos != psz)
+            die("--byte-runs: probe size mismatch (%zu vs %zu)",
+                pos, psz);
         uint64_t n_dirty_total = 0, n_newseg_total = 0;
         uint64_t n_dirty_emit = 0, n_newseg_emit = 0;
         uint64_t n_gran_entries = 0, n_full_entries = 0, n_gran_total = 0;
-        size_t orig_nrecs = nrecs;
-        size_t i;
-        for (i = 0; i < nrecs; i++) {
+        size_t n_applied = 0;
+        for (size_t i = 0; i < nrecs; i++) {
             struct rec_tmp *r = &recs[i];
-            /* probe 覆盖的完整前缀: 预计算本条记录所需字节 */
-            uint64_t need = 0;
-            {
-                const uint8_t *nd2 = r->newseg.data;
-                for (uint64_t j = 0; j < r->n_newseg; j++) {
-                    uint64_t fs;
-                    memcpy(&fs, nd2 + 8, 8);
-                    need += 16 + fs;
-                    nd2 += 32 + fs;
-                }
-                need += r->n_dirty * (16 + 4096);
-            }
-            if (pos + need > psz)
-                break;      /* probe 切片提前退出, 只覆盖前缀 */
             buf_init(&r->newseg_run);
             buf_init(&r->dirty_run);
+            /* 找本记录的 probe 应用 (至多一条) */
+            const struct probe_app *app = NULL;
+            for (size_t k = 0; k < napps; k++) {
+                if (apps[k].rec_idx == i) {
+                    if (app)
+                        die("--byte-runs: rec %zu applied twice", i);
+                    app = &apps[k];
+                }
+            }
+            n_newseg_total += r->n_newseg;
+            n_dirty_total += r->n_dirty;
+            if (!app)
+                continue;   /* 切片未执行该 syscall: 表内留空记录 */
+            n_applied++;
+            size_t ep = app->off;
             const uint8_t *nd = r->newseg.data;
             for (uint64_t j = 0; j < r->n_newseg; j++) {
                 uint64_t vv, fs;
                 memcpy(&vv, nd, 8);
                 memcpy(&fs, nd + 8, 8);
-                if (pos + 16 + fs > psz)
+                if (ep + 16 + fs > app->end)
                     die("probe truncated at newseg rec %zu", i);
                 uint64_t pv, plen;
-                memcpy(&pv, pf + pos, 8);
-                memcpy(&plen, pf + pos + 8, 8);
+                memcpy(&pv, pf + ep, 8);
+                memcpy(&plen, pf + ep + 8, 8);
                 if (pv != vv || plen != fs)
                     die("probe newseg mismatch rec %zu (%#llx vs %#llx)",
                         i, (unsigned long long)pv,
                         (unsigned long long)vv);
                 uint32_t mode = 0, ng = 0;
                 uint32_t em = emit_granules(&r->newseg_run, vv,
-                                            pf + pos + 16, nd + 32, fs,
+                                            pf + ep + 16, nd + 32, fs,
                                             &mode, &ng);
                 r->n_newseg_run += em;
                 if (mode == 2)
@@ -2267,27 +2301,26 @@ int build_main(int argc, char **argv)
                     n_gran_entries++;
                     n_gran_total += ng;
                 }
-                pos += 16 + fs;
+                ep += 16 + fs;
                 nd += 32 + fs;
-                n_newseg_total++;
             }
             const uint8_t *dp = r->dirty.data;
             for (uint64_t j = 0; j < r->n_dirty; j++) {
                 uint64_t vv;
                 memcpy(&vv, dp, 8);
                 dp += 8;
-                if (pos + 16 + 4096 > psz)
+                if (ep + 16 + 4096 > app->end)
                     die("probe truncated at dirty rec %zu", i);
                 uint64_t pv, plen;
-                memcpy(&pv, pf + pos, 8);
-                memcpy(&plen, pf + pos + 8, 8);
+                memcpy(&pv, pf + ep, 8);
+                memcpy(&plen, pf + ep + 8, 8);
                 if (pv != vv || plen != 4096)
                     die("probe dirty mismatch rec %zu (%#llx vs %#llx)",
                         i, (unsigned long long)pv,
                         (unsigned long long)vv);
                 uint32_t mode = 0, ng = 0;
                 uint32_t em = emit_granules(&r->dirty_run, vv,
-                                            pf + pos + 16, dp, 4096,
+                                            pf + ep + 16, dp, 4096,
                                             &mode, &ng);
                 r->n_dirty_run += em;
                 if (mode == 2)
@@ -2296,46 +2329,29 @@ int build_main(int argc, char **argv)
                     n_gran_entries++;
                     n_gran_total += ng;
                 }
-                pos += 16 + 4096;
+                ep += 16 + 4096;
                 dp += 4096;
-                n_dirty_total++;
             }
+            if (ep != app->end)
+                die("--byte-runs: rec %zu probe entry count mismatch", i);
             n_newseg_emit += r->n_newseg_run;
             n_dirty_emit += r->n_dirty_run;
         }
-        if (i < orig_nrecs) {
-            fprintf(stderr,
-                    "build: byte-runs: probe covers %zu/%zu records "
-                    "(probe slice exited before window end); truncating\n",
-                    i, orig_nrecs);
-            nrecs = i;
-            if (nrecs == 0)
-                die("--byte-runs: probe covers no records");
-            /* 重新判定 syscall 密集锚点 (截断后窗口终点语义) */
-            syscall_dense = 0;
-            if (ckpt_count_to != UINT64_MAX && ckpt_count_to > ckpt_count0) {
-                uint64_t win = ckpt_count_to - ckpt_count0;
-                uint64_t last = recs[nrecs - 1].orig_count;
-                if (last != UINT64_MAX && last < ckpt_count_to) {
-                    uint64_t tail = ckpt_count_to - last;
-                    if (tail <= win / 5)
-                        syscall_dense = 1;
-                }
-            }
-        } else if (pos != psz) {
-            die("--byte-runs: probe size mismatch (%zu vs %zu)",
-                pos, psz);
-        }
+        if (n_applied == 0)
+            die("--byte-runs: probe applied no records");
+        free(apps);
         free(pf);
         replay_fmt = 1;
         fprintf(stderr,
                 "build: byte-runs: %llu dirty/%llu newseg recorded, "
-                "%llu/%llu emitted (%llu granule entries, %llu full, "
-                "%llu granules; %.1f%%/%.1f%% skipped)\n",
+                "%llu/%llu emitted, %zu/%zu records applied "
+                "(%llu granule entries, %llu full, %llu granules; "
+                "%.1f%%/%.1f%% skipped)\n",
                 (unsigned long long)n_dirty_total,
                 (unsigned long long)n_newseg_total,
                 (unsigned long long)n_dirty_emit,
                 (unsigned long long)n_newseg_emit,
+                n_applied, nrecs,
                 (unsigned long long)n_gran_entries,
                 (unsigned long long)n_full_entries,
                 (unsigned long long)n_gran_total,
