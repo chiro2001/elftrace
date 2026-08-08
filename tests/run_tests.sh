@@ -44,7 +44,8 @@ for t in $TESTS; do
     # aarch64 真机较慢: baremetal/realworld 需要更长超时
     TIMEOUT=600
     case "$t" in
-        baremetal|realworld|http_server|condvar) [ "$(uname -m)" = "aarch64" ] && TIMEOUT=1800 ;;
+        baremetal|realworld|http_server) [ "$(uname -m)" = "aarch64" ] && TIMEOUT=1800 ;;
+        condvar) [ "$(uname -m)" = "aarch64" ] && TIMEOUT=3600 ;;
     esac
     if timeout "$TIMEOUT" "$TS" > "$LOG" 2>&1; then
         LAST=$(grep -E "^PASS" "$LOG" | tail -1)
