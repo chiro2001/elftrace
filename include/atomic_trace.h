@@ -22,8 +22,14 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
 int atomic_trace_step_out(struct atomic_trace_ctx *ctx);
 
 /* 检查点后调用 (目标仍停止): 把各站点序号/最后值快照写入
- * <out>/atomics/ckpt_%06zu.bin。 */
-int atomic_trace_ckpt(struct atomic_trace_ctx *ctx, size_t ckpt_no);
+ * <out>/atomics/ckpt_%06zu.bin, 并累积补偿数据 (measured 为当前 perf
+ * 计数)。 */
+int atomic_trace_ckpt(struct atomic_trace_ctx *ctx, size_t ckpt_no,
+                      uint64_t measured);
+
+/* 读取 Run 1 的 compensation.txt 触发放大系数 r = r_num/r_den */
+int atomic_trace_load_compensation(const char *path, uint64_t *r_num,
+                                   uint64_t *r_den);
 
 /* 结束: 转储 events.bin, 恢复站点原指令, 解除缓冲区映射。
  * 要求目标处于运行或 ptrace-stop; 结束后保持 ptrace-stop (供 detach)。 */

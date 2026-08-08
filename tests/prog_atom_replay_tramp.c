@@ -115,7 +115,7 @@ int main(void)
     size_t bl = a64_atomic_replay_block(blk, page, runs_abs, 3, 0,
                                         1 /* rt */, 0 /* rn */,
                                         (uint64_t)(uintptr_t)spin_site_label
-                                        + 4);
+                                        + 4, 0, 0);
     if (!bl) { fprintf(stderr, "gen failed\n"); return 1; }
     memcpy((void *)(uintptr_t)page, blk, sizeof(blk));
     __builtin___clear_cache((char *)(uintptr_t)page,

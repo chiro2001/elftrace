@@ -59,6 +59,14 @@ struct atomic_trace_ctx {
     uint64_t *pages;            /* 记录页地址 */
     size_t n_pages;
     uint64_t dump_event_ptr;    /* 已转储事件游标 (绝对地址) */
+    uint64_t total_events;      /* 已转储事件数 (补偿模型) */
+    unsigned base_insns, append_insns;
+    /* 补偿: 每检查点 {measured, overhead, orig} */
+    uint64_t *ckpt_measured;
+    uint64_t *ckpt_overhead;
+    uint64_t *ckpt_orig;
+    size_t n_ckpts;
+    uint64_t r_num, r_den;      /* 膨胀系数 r = r_num/r_den (触发缩放) */
 };
 
 int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
@@ -404,16 +412,21 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
             uint64_t state_abs = ctx->abuf_addr + A64_ATB_HDR_SIZE +
                                  i * A64_ATB_STATE_SIZE;
             uint8_t blk[A64_ATOM_BLOCK_SIZE];
+            struct a64_atom_counts cnt;
             size_t bl = a64_atomic_record_block(
                 blk, block_abs, sites[i].orig_insn, ctx->tls, i,
                 state_abs, ctx->abuf_addr + A64_ATB_OFF_EVENT_PTR,
                 ctx->abuf_addr + A64_ATB_OFF_EVENTS_END,
                 ctx->abuf_addr + A64_ATB_OFF_OVERFLOW,
-                sites[i].pc + 4);
+                sites[i].pc + 4, &cnt);
             if (!bl) {
                 warn("atomic: cannot generate block for %#llx",
                      (unsigned long long)sites[i].pc);
                 continue;
+            }
+            if (i == 0) {
+                ctx->base_insns = cnt.base;
+                ctx->append_insns = cnt.append;
             }
             if (tmem_rw(pid, 1, block_abs, blk, sizeof(blk)) < 0) {
                 warn("atomic: cannot write block at %#llx",
@@ -488,7 +501,7 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
         mkdir(dir, 0755);
         char path[600];
         snprintf(path, sizeof(path), "%s/sites.bin", dir);
-        uint8_t *sb = xmalloc(32 + ctx->n_pages * 8 +
+        uint8_t *sb = xmalloc(72 + ctx->n_pages * 8 +
                               ctx->n_sites * 16);
         uint8_t *p = sb;
         write_u64(&p, A64_AT_SITES_MAGIC);
@@ -497,12 +510,15 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
         write_u64(&p, ctx->abuf_addr);
         write_u64(&p, ctx->abuf_size);
         write_u64(&p, ctx->n_pages);
+        write_u64(&p, ctx->base_insns);
+        write_u64(&p, ctx->append_insns);
+        write_u64(&p, 0);               /* skip 计数暂不用 */
         for (size_t i = 0; i < ctx->n_pages; i++)
             write_u64(&p, ctx->pages[i]);
         for (size_t i = 0; i < ctx->n_sites; i++) {
             write_u64(&p, ctx->sites[i].pc);
             memcpy(p, &ctx->sites[i].orig_insn, 4);
-            p += 4;                 /* 无 pad: 每条 16B */
+            p += 8;                 /* 4B orig + 4B pad: 每条 16B */
         }
         FILE *f = fopen(path, "wb");
         if (f) {
@@ -512,7 +528,7 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
             warn("atomic: cannot write %s", path);
         }
         free(sb);
-        atomic_trace_ckpt(ctx, 0);
+        atomic_trace_ckpt(ctx, 0, 0);   /* 基线行: measured 由后续检查点填 */
     }
 
     free(maps);
@@ -564,7 +580,8 @@ int atomic_trace_step_out(struct atomic_trace_ctx *ctx)
     return -1;
 }
 
-int atomic_trace_ckpt(struct atomic_trace_ctx *ctx, size_t ckpt_no)
+int atomic_trace_ckpt(struct atomic_trace_ctx *ctx, size_t ckpt_no,
+                      uint64_t measured)
 {
     if (!ctx || !ctx->armed)
         return 0;
@@ -593,8 +610,30 @@ int atomic_trace_ckpt(struct atomic_trace_ctx *ctx, size_t ckpt_no)
         rc = -1;
     }
     free(sb);
+    atomic_events_append(ctx);      /* 先补齐事件数, 再统计补偿 */
+    /* 补偿: overhead = Σ ord×base + 事件数×append; orig = measured −
+       overhead */
+    if (ctx->n_ckpts < 1024 * 1024) {
+        uint64_t overhead = 0;
+        for (size_t i = 0; i < ctx->n_sites; i++) {
+            uint64_t ord;
+            memcpy(&ord, state + i * A64_ATB_STATE_SIZE, 8);
+            overhead += ord * ctx->base_insns;
+        }
+        overhead += ctx->total_events * ctx->append_insns;
+        uint64_t orig = measured > overhead ? measured - overhead : measured;
+        ctx->ckpt_measured = xrealloc(ctx->ckpt_measured,
+                                      (ctx->n_ckpts + 1) * sizeof(uint64_t));
+        ctx->ckpt_overhead = xrealloc(ctx->ckpt_overhead,
+                                      (ctx->n_ckpts + 1) * sizeof(uint64_t));
+        ctx->ckpt_orig = xrealloc(ctx->ckpt_orig,
+                                  (ctx->n_ckpts + 1) * sizeof(uint64_t));
+        ctx->ckpt_measured[ctx->n_ckpts] = measured;
+        ctx->ckpt_overhead[ctx->n_ckpts] = overhead;
+        ctx->ckpt_orig[ctx->n_ckpts] = orig;
+        ctx->n_ckpts++;
+    }
     free(state);
-    atomic_events_append(ctx);
     return rc;
 }
 
@@ -655,9 +694,64 @@ static int atomic_events_append(struct atomic_trace_ctx *ctx)
         fwrite(&hdr, sizeof(hdr), 1, f);
     }
     fclose(f);
+    ctx->total_events = total;
     if (overflow)
         fprintf(stderr, "atomic: event buffer overflow flag set\n");
     return 0;
+}
+
+/* 读取 Run 1 的 compensation.txt (r_num/r_den) */
+int atomic_trace_load_compensation(const char *path, uint64_t *r_num,
+                                   uint64_t *r_den)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+    char line[256];
+    uint64_t num = 0, den = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "r_num %llu", (unsigned long long *)&num) == 1)
+            continue;
+        if (sscanf(line, "r_den %llu", (unsigned long long *)&den) == 1)
+            continue;
+    }
+    fclose(f);
+    if (!num || !den || num < den)
+        return -1;
+    *r_num = num;
+    *r_den = den;
+    return 0;
+}
+
+/* 写出补偿结果 (Run 1 产物): r = 最后检查点的 measured/orig */
+static void atomic_write_compensation(struct atomic_trace_ctx *ctx)
+{
+    if (!ctx->n_ckpts)
+        return;
+    char path[600];
+    snprintf(path, sizeof(path), "%s/atomics/compensation.txt", ctx->out);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    uint64_t m = ctx->ckpt_measured[ctx->n_ckpts - 1];
+    uint64_t o = ctx->ckpt_orig[ctx->n_ckpts - 1];
+    fprintf(f, "# elftrace atomic compensation v1\n");
+    fprintf(f, "r_num %llu\n", (unsigned long long)m);
+    fprintf(f, "r_den %llu\n", (unsigned long long)o);
+    fprintf(f, "base_insns %u\n", ctx->base_insns);
+    fprintf(f, "append_insns %u\n", ctx->append_insns);
+    fprintf(f, "# idx measured overhead orig\n");
+    for (size_t i = 0; i < ctx->n_ckpts; i++) {
+        fprintf(f, "%zu %llu %llu %llu\n", i,
+                (unsigned long long)ctx->ckpt_measured[i],
+                (unsigned long long)ctx->ckpt_overhead[i],
+                (unsigned long long)ctx->ckpt_orig[i]);
+    }
+    fclose(f);
+    fprintf(stderr, "atomic: compensation r=%llu/%llu (R_est=%.2f%%), "
+            "%zu checkpoints\n",
+            (unsigned long long)m, (unsigned long long)o,
+            o ? 100.0 * (double)(m - o) / (double)m : 0.0, ctx->n_ckpts);
 }
 
 /* 结束: INTERRUPT 停止 → 转储事件 → 恢复站点 → munmap 缓冲区 */
@@ -666,6 +760,8 @@ int atomic_trace_finish(struct atomic_trace_ctx *ctx)
     if (!ctx || !ctx->armed)
         return 0;
     pid_t pid = ctx->pid;
+
+    atomic_write_compensation(ctx);
 
     /* 停止目标 (处理 syscall-stop 后再 INTERRUPT) */
     int stopped = 0;
@@ -734,9 +830,10 @@ int atomic_trace_step_out(struct atomic_trace_ctx *ctx)
     (void)ctx;
     return 0;
 }
-int atomic_trace_ckpt(struct atomic_trace_ctx *ctx, size_t ckpt_no)
+int atomic_trace_ckpt(struct atomic_trace_ctx *ctx, size_t ckpt_no,
+                      uint64_t measured)
 {
-    (void)ctx; (void)ckpt_no;
+    (void)ctx; (void)ckpt_no; (void)measured;
     return 0;
 }
 int atomic_trace_finish(struct atomic_trace_ctx *ctx)

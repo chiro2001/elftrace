@@ -165,7 +165,8 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
                                uint64_t event_ptr_addr,
                                uint64_t events_end_addr,
                                uint64_t overflow_addr,
-                               uint64_t ret_addr)
+                               uint64_t ret_addr,
+                               struct a64_atom_counts *counts)
 {
     uint8_t *p = out;
     unsigned rt, rn;
@@ -289,6 +290,17 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
     uint64_t b_off = (uint64_t)(p - out);
     put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
 
+    /* 路径指令数: 代码区 = 稳态 + 追加路径(14) + 溢出路径(3);
+       追加/溢出只在不稳态执行。跳过路径不做 ordinal(3)+compare(5),
+       但 value/addr 拷贝在 TLS 检查之前, 两路径都有。 */
+    if (counts) {
+        size_t code_n = (size_t)(p - out) / 4;
+        unsigned steady = (unsigned)code_n - 14 - 3;
+        counts->base = steady + 1;          /* +1 = 站点处 b */
+        counts->append = 14;
+        counts->skip = steady - 8 + 1;
+    }
+
     /* 数据区 */
     uint64_t v = tls;           memcpy(out + REC_TLS_OFF, &v, 8);
     v = site_id;                memcpy(out + REC_SITE_ID_OFF, &v, 8);
@@ -306,11 +318,14 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
 #define REP_CURSOR_OFF 0x208
 #define REP_RUNS_ABS_OFF 0x210
 #define REP_NRUNS_OFF 0x218
+#define REP_LOAD_LIMIT_OFF 0x220
+#define REP_EXIT_ABS_OFF 0x228
 
 size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                uint64_t runs_abs, uint64_t n_runs,
                                int is64, unsigned rt, unsigned rn,
-                               uint64_t ret_addr)
+                               uint64_t ret_addr,
+                               uint64_t load_limit, uint64_t exit_abs)
 {
     uint8_t *p = out;
     int rt_off = a64_atom_reg_save_off(rt);
@@ -337,6 +352,16 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     put32(&p, ldr_x16_imm(19, REP_ORD_OFF));
     put32(&p, add_x(19, 19, 1));
     put32(&p, str_x16_imm(19, REP_ORD_OFF));
+    /* 窗口负载上限: 序号超过窗口内该站点负载预算 → 直接退出。
+       窗口结束在自旋里时, 忙循环的退出计数器永远到不了, 必须由
+       回放跳板兜底 exit (exit_abs=0 时禁用, 独立自测用)。 */
+    uint8_t *lim_b = NULL;
+    if (exit_abs) {
+        put32(&p, ldr_x16_imm(17, REP_LOAD_LIMIT_OFF));
+        put32(&p, cmp_x(19, 17));
+        lim_b = p;
+        put32(&p, bcond(0, 8));     /* b.hi limit_exit (占位) */
+    }
 
     /* 游标推进: while (cursor+1 < n_runs &&
      *          runs[cursor+1].start <= ordinal) cursor++; */
@@ -398,6 +423,12 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     emit_restore(&p);
     uint64_t b_off = (uint64_t)(p - out);
     put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
+    uint8_t *limit_exit = NULL;
+    if (exit_abs) {
+        limit_exit = p;
+        put32(&p, ldr_x16_imm(16, REP_EXIT_ABS_OFF));
+        put32(&p, INSN_BR_X16);
+    }
 
     /* 回填 */
     {
@@ -413,6 +444,10 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
         w = bcond(d3, 8);   memcpy(lo_b, &w, 4);
         w = bcond(d4, 1);   memcpy(ne_b, &w, 4);
         memcpy(set_jmp, &w5, 4);
+        if (lim_b) {
+            uint32_t w6 = bcond((int32_t)(limit_exit - lim_b), 8);
+            memcpy(lim_b, &w6, 4);
+        }
     }
 
     {
@@ -420,6 +455,8 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
         v = 0;                  memcpy(out + REP_CURSOR_OFF, &v, 8);
         v = runs_abs;           memcpy(out + REP_RUNS_ABS_OFF, &v, 8);
         v = n_runs;             memcpy(out + REP_NRUNS_OFF, &v, 8);
+        v = load_limit;         memcpy(out + REP_LOAD_LIMIT_OFF, &v, 8);
+        v = exit_abs;           memcpy(out + REP_EXIT_ABS_OFF, &v, 8);
     }
 
     return A64_ATOM_BLOCK_SIZE;

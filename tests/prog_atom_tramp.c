@@ -123,6 +123,7 @@ int main(void)
 
     /* 生成记录跳板 (站点: ldar w1,[x0] = 88dffc01) */
     uint8_t blk[A64_ATOM_BLOCK_SIZE];
+    struct a64_atom_counts ac;
     size_t bl = a64_atomic_record_block(blk, page, 0x88DFFC01U,
                                         get_tpidr(),
                                         0,
@@ -130,7 +131,8 @@ int main(void)
                                         buf + A64_ATB_OFF_EVENT_PTR,
                                         buf + A64_ATB_OFF_EVENTS_END,
                                         buf + A64_ATB_OFF_OVERFLOW,
-                                        (uint64_t)(uintptr_t)spin_site_label + 4);
+                                        (uint64_t)(uintptr_t)spin_site_label
+                                        + 4, &ac);
     if (!bl) { fprintf(stderr, "gen failed\n"); return 1; }
     fprintf(stderr, "gen ok bl=%zu\n", bl);
     fprintf(stderr, "tls=%#llx blk_tls=%#llx\n", (unsigned long long)get_tpidr(), (unsigned long long)*(uint64_t *)(blk + 0x200));
@@ -155,6 +157,8 @@ int main(void)
     pthread_create(&t, NULL, setter, NULL);
     spin_site_label((uint64_t)(uintptr_t)&flag);   /* 期望 0.2s 后返回 */
     fprintf(stderr, "runtime page_tls=%#llx mrs=%#llx\n", (unsigned long long)*(uint64_t *)(uintptr_t)(page + 0x200), (unsigned long long)get_tpidr());
+    fprintf(stderr, "path insns base=%u append=%u skip=%u\n",
+            ac.base, ac.append, ac.skip);
     fprintf(stderr, "spin returned\n");
     pthread_join(t, NULL);
     fprintf(stderr, "joined\n");

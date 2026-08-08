@@ -42,13 +42,23 @@ int a64_atom_reg_save_off(unsigned reg);
  * 数据区 @0x200: tls, site_id, state_abs, event_ptr_addr,
  * events_end_addr, overflow_addr, ret_addr。
  */
+/* 各执行路径的额外指令数 (含站点处的 b):
+ *   base   = 目标线程稳态负载 (ldar + 序号 + 比较, 不追加事件)
+ *   append = 追加事件时的额外指令
+ *   skip   = 非目标线程 (只执行 ldar + TLS 过滤后返回)
+ * 用于采集侧补偿: perf 测量计数 = 原始计数 + Σ(ord×base + ev×append)。 */
+struct a64_atom_counts {
+    unsigned base, append, skip;
+};
+
 size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
                                uint32_t orig_insn, uint64_t tls,
                                uint64_t site_id, uint64_t state_abs,
                                uint64_t event_ptr_addr,
                                uint64_t events_end_addr,
                                uint64_t overflow_addr,
-                               uint64_t ret_addr);
+                               uint64_t ret_addr,
+                               struct a64_atom_counts *counts);
 
 /* ---- 回放跳板块 ----
  * 入口: stp x16,x17; nop; ldr x16,[pc,#8]; br x16; .quad block_abs。
@@ -60,7 +70,8 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
 size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                uint64_t runs_abs, uint64_t n_runs,
                                int is64, unsigned rt, unsigned rn,
-                               uint64_t ret_addr);
+                               uint64_t ret_addr,
+                               uint64_t load_limit, uint64_t exit_abs);
 
 /* ---- 缓冲区头 (注入到目标地址空间, tracer 与跳板共享) ---- */
 #define A64_ATB_MAGIC    0x41544F4DULL   /* "ATOM" */

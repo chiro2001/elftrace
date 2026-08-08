@@ -54,6 +54,8 @@ struct trace_ctx {
     uint8_t *ring;
     size_t ring_size;
     uint64_t count;             /* 已记录的指令计数 */
+    uint64_t every_eff;         /* 实际触发间隔 (补偿后 = every×r) */
+    uint64_t next_trigger;      /* 下一次 read-counter 触发阈值 (measured) */
     size_t ckpt_no;
     size_t cow_ok, cow_fail;
     pid_t *cow_children;
@@ -107,7 +109,7 @@ static void perf_open(struct trace_ctx *tc)
     attr.type = PERF_TYPE_HARDWARE;
     attr.size = sizeof(attr);
     attr.config = PERF_COUNT_HW_INSTRUCTIONS;
-    attr.sample_period = tc->every;
+    attr.sample_period = tc->every_eff;
     attr.sample_type = PERF_SAMPLE_IP;
     attr.disabled = 1;
     attr.exclude_kernel = 1;
@@ -336,6 +338,7 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
 
     if (!already_stopped && collect_interrupt_sc(tc) < 0)
         return;                 /* tracee 已退出 */
+    tc->next_trigger = perf_count_now(tc) + tc->every_eff;
 
 #if defined(__aarch64__)
     /* 原子记录跳板中被打断: 单步到跳板结束 (检查点状态才有效) */
@@ -423,7 +426,7 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
 
 #if defined(__aarch64__)
     if (tc->atomic)
-        atomic_trace_ckpt(tc->atomic, tc->ckpt_no);
+        atomic_trace_ckpt(tc->atomic, tc->ckpt_no, perf_count_now(tc));
 #endif
 
     collect_free(&sn);
@@ -438,8 +441,12 @@ int trace_main(int argc, char **argv)
 {
     struct trace_ctx tc = {0};
     pid_t pid = 0;
+#if defined(__aarch64__)
+    const char *comp_path = NULL;
+#endif
 
     tc.every = TRACE_DEFAULT_EVERY;
+    tc.every_eff = tc.every;
     tc.out = "./ckpts";
 #if defined(__aarch64__)
     tc.atomic_buf_size = 64UL << 20;
@@ -456,6 +463,9 @@ int trace_main(int argc, char **argv)
         } else if (strcmp(argv[i], "--atomic-buf-size") == 0 &&
                    i + 1 < argc) {
             tc.atomic_buf_size = strtoull(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--atomic-compensate") == 0 &&
+                   i + 1 < argc) {
+            comp_path = argv[++i];
 #endif
         } else if (argv[i][0] >= '0' && argv[i][0] <= '9') {
             pid = atoi(argv[i]);
@@ -470,6 +480,29 @@ int trace_main(int argc, char **argv)
     if (pid == 0)
         die("usage: elftrace trace <pid> [--every N] [--out DIR]");
     tc.pid = pid;
+
+#if defined(__aarch64__)
+    /* Run 2 补偿: 读 Run 1 的 compensation.txt, 放大检查点触发间隔
+       (measured 空间), 使检查点仍约每 N 条原始指令一个 */
+    if (comp_path) {
+        uint64_t rn = 0, rd = 0;
+        if (atomic_trace_load_compensation(comp_path, &rn, &rd) == 0) {
+            tc.every_eff = (tc.every * rn + rd / 2) / rd;
+            if (tc.every_eff < tc.every)
+                tc.every_eff = tc.every;
+            fprintf(stderr, "trace: atomic compensation r=%llu/%llu, "
+                    "checkpoint every %llu -> %llu (measured)\n",
+                    (unsigned long long)rn, (unsigned long long)rd,
+                    (unsigned long long)tc.every,
+                    (unsigned long long)tc.every_eff);
+        } else {
+            warn("trace: cannot load %s, running uncompensated", comp_path);
+        }
+        if (!tc.atomic_enabled)
+            warn("trace: --atomic-compensate without --atomic-replay has "
+                 "no effect");
+    }
+#endif
 
     if (mkdir(tc.out, 0755) < 0 && errno != EEXIST)
         die("mkdir %s", tc.out);
@@ -578,7 +611,7 @@ int trace_main(int argc, char **argv)
             {
                 uint64_t val = 0;
                 if (read(tc.perf_fd, &val, sizeof(val)) == sizeof(val) &&
-                    val >= tc.count + tc.every) {
+                    val >= tc.next_trigger) {
                     uint64_t ip;
                     while ((ip = perf_next_sample(&tc)) != 0) {
                         if (kill(pid, 0) < 0 && errno == ESRCH)

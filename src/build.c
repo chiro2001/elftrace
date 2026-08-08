@@ -144,6 +144,7 @@ struct ab_site {
     uint64_t pc;
     uint32_t orig_insn;
     uint64_t from_ord, to_ord;  /* 窗口内序号边界 */
+    uint64_t from_val, from_addr;   /* 检查点时刻站点最后读到的值/地址 */
 };
 struct ab_run {
     uint64_t start;             /* 窗口内起始序号 (1-based) */
@@ -151,6 +152,7 @@ struct ab_run {
 };
 struct atomic_build {
     int have;
+    uint64_t r_num, r_den;      /* 采集补偿系数 r = measured/orig */
     struct ab_site *sites;
     size_t n_sites;
     struct ab_run *runs;
@@ -162,7 +164,7 @@ struct atomic_build {
 static uint64_t rd_u64(const uint8_t **p)
 {
     uint64_t v;
-    memcpy(*p, &v, 8);
+    memcpy(&v, *p, 8);
     *p += 8;
     return v;
 }
@@ -203,6 +205,9 @@ static void atomic_load(const char *dir, long from, long to,
     uint64_t buf_addr = rd_u64(&p);
     uint64_t buf_size = rd_u64(&p);
     uint64_t n_pages = rd_u64(&p);
+    rd_u64(&p);                 /* base_insns (采集补偿用) */
+    rd_u64(&p);                 /* append_insns */
+    rd_u64(&p);                 /* skip_insns */
     (void)buf_addr; (void)buf_size;
     if (n_sites > 100000 || n_pages > 100000)
         goto bad;
@@ -214,7 +219,7 @@ static void atomic_load(const char *dir, long from, long to,
     for (size_t i = 0; i < n_sites; i++) {
         ab->sites[i].pc = rd_u64(&p);
         memcpy(&ab->sites[i].orig_insn, p, 4);
-        p += 4;
+        p += 8;                 /* 4B orig + 4B pad: 每条 16B */
     }
     free(buf);
 
@@ -252,6 +257,8 @@ static void atomic_load(const char *dir, long from, long to,
         for (size_t i = 0; i < n_sites; i++) {
             const uint8_t *q = st + i * 24;
             ab->sites[i].from_ord = rd_u64(&q);
+            ab->sites[i].from_val = rd_u64(&q);
+            ab->sites[i].from_addr = rd_u64(&q);
         }
         free(st);
 
@@ -297,9 +304,10 @@ static void atomic_load(const char *dir, long from, long to,
             if (fread(eb, 1, (size_t)esz, f) == (size_t)esz) {
                 const uint8_t *ep = eb;
                 const uint8_t *ee = eb + esz;
-                if (ee - ep >= 24 && rd_u64(&ep) == A64_AT_EVENTS_MAGIC &&
+                if (ee - ep >= 32 && rd_u64(&ep) == A64_AT_EVENTS_MAGIC &&
                     rd_u64(&ep) == 1) {
                     uint64_t n_ev = rd_u64(&ep);
+                    rd_u64(&ep);            /* bytes */
                     if (ee - ep >= (long)(n_ev * 32)) {
                         ab->runs = xmalloc((n_ev ? n_ev : 1) *
                                            sizeof(*ab->runs));
@@ -330,7 +338,7 @@ static void atomic_load(const char *dir, long from, long to,
     }
     /* 事件 → 每站点运行段 (窗口内, 全局有序 → 每站点单调) */
     {
-        ab->run_off = xcalloc(n_sites ? n_sites : 1, sizeof(size_t));
+    ab->run_off = xcalloc(n_sites ? n_sites : 1, sizeof(size_t));
         ab->run_cnt = xcalloc(n_sites ? n_sites : 1, sizeof(size_t));
         /* 先统计每站点窗口事件数 (事件全局有序, 站点内单调) */
         snprintf(path, sizeof(path), "%s/atomics/events.bin", dir);
@@ -345,9 +353,10 @@ static void atomic_load(const char *dir, long from, long to,
             if (fread(eb, 1, (size_t)esz, f) == (size_t)esz) {
                 const uint8_t *ep = eb;
                 const uint8_t *ee = eb + esz;
-                if (ee - ep >= 24 && rd_u64(&ep) == A64_AT_EVENTS_MAGIC &&
+                if (ee - ep >= 32 && rd_u64(&ep) == A64_AT_EVENTS_MAGIC &&
                     rd_u64(&ep) == 1) {
                     uint64_t n_ev = rd_u64(&ep);
+                    rd_u64(&ep);            /* bytes */
                     size_t total = 0;
                     for (uint64_t k = 0; k < n_ev && ee - ep >= 32; k++) {
                         uint64_t site_id = rd_u64(&ep);
@@ -365,15 +374,30 @@ static void atomic_load(const char *dir, long from, long to,
                     size_t acc = 0;
                     for (size_t i = 0; i < n_sites; i++) {
                         ab->run_off[i] = acc;
-                        acc += ab->run_cnt[i];
+                        /* 每站点合成首段: 检查点 last_val 作为窗口内
+                           第 1 次读的值 (事件序号相对检查点快照存在
+                           一阶偏移, 首个事件值会超前冻结内存状态,
+                           曾导致回放从"队列溢出"开始永远自旋) */
+                        acc += ab->run_cnt[i] + (ab->run_cnt[i] ? 1 : 0);
                     }
-                    ab->runs = xmalloc((total ? total : 1) *
+                    ab->runs = xmalloc((total ? total + n_sites : 1) *
                                        sizeof(*ab->runs));
                     ab->n_runs = total;
                     /* 第二遍填内容 (位置由 run_off + 已计数偏移) */
                     size_t *filled = xcalloc(n_sites ? n_sites : 1,
                                              sizeof(size_t));
-                    ep = eb + 24;
+                    for (size_t i = 0; i < n_sites; i++) {
+                        if (!ab->run_cnt[i])
+                            continue;
+                        ab->runs[ab->run_off[i]].start = 1;
+                        ab->runs[ab->run_off[i]].addr =
+                            ab->sites[i].from_addr;
+                        ab->runs[ab->run_off[i]].value =
+                            ab->sites[i].from_val;
+                        filled[i] = 1;
+                        ab->n_runs++;
+                    }
+                    ep = eb + 32;
                     for (uint64_t k = 0; k < n_ev && ee - ep >= 32; k++) {
                         uint64_t site_id = rd_u64(&ep);
                         uint64_t ord = rd_u64(&ep);
@@ -386,7 +410,7 @@ static void atomic_load(const char *dir, long from, long to,
                             continue;
                         size_t o = ab->run_off[site_id] + filled[site_id]++;
                         ab->runs[o].start = ord -
-                                            ab->sites[site_id].from_ord;
+                                            ab->sites[site_id].from_ord + 1;
                         ab->runs[o].addr = addr;
                         ab->runs[o].value = value;
                     }
@@ -404,6 +428,25 @@ static void atomic_load(const char *dir, long from, long to,
     else
         fprintf(stderr, "atomic: %zu sites, %zu window run segments\n",
                 (size_t)n_sites, ab->n_runs);
+
+    /* 补偿系数 (Run 1 或 Run 2 的 compensation.txt) */
+    {
+        char cp[PATH_MAX];
+        snprintf(cp, sizeof(cp), "%s/atomics/compensation.txt", dir);
+        FILE *cf = fopen(cp, "r");
+        if (cf) {
+            char cl[256];
+            while (fgets(cl, sizeof(cl), cf)) {
+                if (sscanf(cl, "r_num %llu",
+                           (unsigned long long *)&ab->r_num) == 1)
+                    continue;
+                if (sscanf(cl, "r_den %llu",
+                           (unsigned long long *)&ab->r_den) == 1)
+                    continue;
+            }
+            fclose(cf);
+        }
+    }
     ab->have = 1;
     return;
 no_runs:
@@ -998,7 +1041,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 buf_zero(blob, 8 - (blob->size & 7));
             st->ab_run_off = blob->size;
             size_t o = ab->run_off[st->ab_id];
-            size_t cnt = ab->run_cnt[st->ab_id];
+            size_t cnt = ab->run_cnt[st->ab_id] + 1;   /* 含合成首段 */
             for (size_t k = 0; k < cnt; k++) {
                 struct ab_run *r = &ab->runs[o + k];
                 buf_append(blob, &r->start, 8);
@@ -1123,7 +1166,10 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                         (unsigned long long)st->pc);
                 size_t bl = a64_atomic_replay_block(
                     page + o, taddr + o, runs_abs,
-                    ab->run_cnt[st->ab_id], is64, rt, rn, st->pc + 4);
+                    ab->run_cnt[st->ab_id] + 1, is64, rt, rn, st->pc + 4,
+                    ab->sites[st->ab_id].to_ord -
+                        ab->sites[st->ab_id].from_ord,
+                    base + STUB_STRICT_EXIT_OFF);
                 if (!bl)
                     die("atomic: cannot generate replay block at %#llx",
                         (unsigned long long)st->pc);
@@ -1398,6 +1444,8 @@ int build_main(int argc, char **argv)
     uint64_t replay_size = 0;
     uint64_t stack_vaddr = 0;   /* [stack] 段 vaddr (MAP_GROWSDOWN) */
     uint64_t exit_count_override = 0; /* --bm-exit-count: 覆盖循环 K */
+    uint64_t from_count = 0, to_count = 0;
+    int have_from_count = 0, have_to_count = 0;
     /* strict 循环判定用: 窗口内检查点 PC 与计数 */
     uint64_t *ckpt_pcs = NULL;
     size_t nckpt_pcs = 0;
@@ -1432,6 +1480,12 @@ int build_main(int argc, char **argv)
         } else if (strcmp(argv[i], "--stack-reserve") == 0 &&
                    i + 1 < argc) {
             stack_reserve = strtoull(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--from-count") == 0 && i + 1 < argc) {
+            from_count = strtoull(argv[++i], NULL, 10);
+            have_from_count = 1;
+        } else if (strcmp(argv[i], "--to-count") == 0 && i + 1 < argc) {
+            to_count = strtoull(argv[++i], NULL, 10);
+            have_to_count = 1;
         } else if (strcmp(argv[i], "--checkpoints") == 0 && i + 1 < argc) {
             ckpts = argv[++i];
             /* bundle 单文件: 解包到临时目录 */
@@ -1452,14 +1506,16 @@ int build_main(int argc, char **argv)
             die("usage: elftrace build <file.elftrace> [-o out.elf] "
                 "[--mode real|baremetal] [--ipc N] [--checkpoints DIR] "
                 "[--from K] [--to M] [--breakpoint ADDR] "
-                "[--bm-strict] [--bm-exit-count N] [--stack-reserve N]");
+                "[--bm-strict] [--bm-exit-count N] [--stack-reserve N] "
+                "[--from-count N] [--to-count N]");
         }
     }
     if (!in)
         die("usage: elftrace build <file.elftrace> [-o out.elf] "
             "[--mode real|baremetal] [--ipc N] [--checkpoints DIR] "
             "[--from K] [--to M] [--breakpoint ADDR] "
-            "[--bm-strict] [--bm-exit-count N] [--stack-reserve N]");
+            "[--bm-strict] [--bm-exit-count N] [--stack-reserve N] "
+            "[--from-count N] [--to-count N]");
 #if !defined(__aarch64__)
     if (bm_strict)
         die("--bm-strict is only supported on aarch64 builds");
@@ -1488,6 +1544,42 @@ int build_main(int argc, char **argv)
         f = fopen(path, "r");
         if (!f)
             die("cannot open %s", path);
+        /* --from-count/--to-count: 按 manifest 计数 (Run 2 补偿后即
+           原始指令数) 映射到检查点索引 */
+        if (have_from_count || have_to_count) {
+            FILE *pf = fopen(path, "r");
+            long idx2 = 0;
+            long f_idx = -1, t_idx = -1;
+            char l2[1024];
+            while (pf && fgets(l2, sizeof(l2), pf)) {
+                uint64_t c2 = 0;
+                if (sscanf(l2, "%llu", &c2) != 1)
+                    continue;
+                if (have_from_count && f_idx < 0 && c2 >= from_count)
+                    f_idx = idx2;
+                if (have_to_count && t_idx < 0 && c2 >= to_count)
+                    t_idx = idx2;
+                idx2++;
+            }
+            if (pf)
+                fclose(pf);
+            if (have_from_count && f_idx >= 0) {
+                fprintf(stderr, "build: --from-count %llu -> checkpoint "
+                        "%ld\n", (unsigned long long)from_count, f_idx);
+                from_ckpt = f_idx;
+            } else if (have_from_count) {
+                die("--from-count %llu beyond last checkpoint (%ld)",
+                    (unsigned long long)from_count, idx2);
+            }
+            if (have_to_count && t_idx >= 0) {
+                fprintf(stderr, "build: --to-count %llu -> checkpoint "
+                        "%ld\n", (unsigned long long)to_count, t_idx);
+                to_ckpt = t_idx;
+            } else if (have_to_count) {
+                die("--to-count %llu beyond last checkpoint (%ld)",
+                    (unsigned long long)to_count, idx2);
+            }
+        }
         char line[1024];
         while (fgets(line, sizeof(line), f)) {
             uint64_t cnt, ip, nsys = 0;
@@ -1762,6 +1854,10 @@ int build_main(int argc, char **argv)
        DIR/syscalls/syscall.map → 内存中的 recs)。只保留切片区间
        [syscall_start, syscall_end) 内的记录。记录 pc 修正放到 int3
        替换之后 (见 3.5b)。 */
+#if defined(__aarch64__)
+    if (mode_baremetal && bm_strict && ckpts && to_ckpt >= 0)
+        atomic_load(ckpts, from_ckpt, to_ckpt, &ab);
+#endif
     replay_off = 0;
     replay_size = 0;
     struct rec_tmp *recs = NULL;
@@ -1800,8 +1896,16 @@ int build_main(int argc, char **argv)
                      窗口内 syscall 会被误删)。
                    - 旧格式: 按 manifest nsys 索引过滤 (兼容) */
                 if (rec_count != UINT64_MAX) {
-                    if (rec_count < ckpt_count0 ||
-                        rec_count >= ckpt_count_to) {
+                    uint64_t rc = rec_count;
+#if defined(__aarch64__)
+                    /* map 计数是 measured 空间; manifest 计数 (补偿后)
+                       是原始空间, 按 r 转换 */
+                    if (ab.have && ab.r_num && ab.r_den)
+                        rc = (uint64_t)(((__uint128_t)rc * ab.r_den) /
+                                        ab.r_num);
+#endif
+                    if (rc < ckpt_count0 ||
+                        rc >= ckpt_count_to) {
                         map_idx++;
                         continue;
                     }
@@ -2112,8 +2216,6 @@ int build_main(int argc, char **argv)
     /* 3.7 strict baremetal (aarch64): ELF loader 全内存 + 分支补偿 */
 #if defined(__aarch64__)
     if (mode_baremetal && bm_strict) {
-        if (ckpts && to_ckpt >= 0)
-            atomic_load(ckpts, from_ckpt, to_ckpt, &ab);
         if (build_strict_aarch64(&s, &blob, base, blob_total, payload_off,
                                  segs,
                                  recs, nrecs, have_map, &ab, exit_override,
