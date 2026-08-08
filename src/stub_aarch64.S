@@ -257,18 +257,6 @@ seg_next:
 
 seg_done:
 seg_restore_skip:
-    /* strict: 移植当前进程 [vvar] 内容到恢复的 [vvar] 段。
-       内核拒绝 ptrace 读取 vvar (快照为 0 字节), 切片里 vDSO 读到
-       空 vvar 会回退到真实 clock_gettime syscall — strict 泄漏。
-       同一内核的 vvar 内容通用, 从自身映射拷贝即可。 */
-    ldr  x0, [x9, #RST_DESC_MODE]
-    ldr  x10, [x9, #RST_DESC_BM_STYLE]
-    cmp  x0, #1
-    bne  vvar_done
-    cbz  x10, vvar_done
-    bl   transplant_vvar
-vvar_done:
-
     /* ======== 2. munmap loader 初始栈 (暂禁) ======== */
 
     /* ======== 3. 恢复 fd ======== */
@@ -1086,12 +1074,19 @@ uis_done:
  * 破坏 x0-x8, x14-x20 (经 find_substr 还会破坏 x21-x27)。 */
 transplant_vvar:
     stp  x19, x30, [sp, #-16]!      /* 保存调用者 x30 (bl 会覆盖) */
-    /* strings_off = fds_off + n_fds * 40 (blob 内字符串池起点;
-       seg.name_off 是快照字符串池偏移, 需叠加) */
+    /* 调试: 标记 transplant_vvar 已进入 */
+    adrp x0, str_tvv_enter
+    add  x1, x0, :lo12:str_tvv_enter
+    mov  x0, #2
+    mov  x2, #6
+    mov  x8, #64
+    svc  #0
+    /* strings_off = fds_off + n_fds * 48 (elftrace_fd 48 字节;
+       blob 内字符串池起点, seg.name_off 是快照字符串池偏移需叠加) */
     ldr  x16, [x9, #RST_DESC_N_FDS]
     ldr  x17, [x9, #RST_DESC_FDS_OFF]
     add  x17, x17, x16, lsl #5
-    add  x17, x17, x16, lsl #3
+    add  x17, x17, x16, lsl #4
     mov  x16, x17
     ldr  x14, [x9, #RST_DESC_N_SEGS]
     ldr  x15, [x9, #RST_DESC_SEGS_OFF]
@@ -1124,17 +1119,18 @@ tvv_read_maps:
     svc  #0
     tbnz x0, #63, tvv_pop_done
     mov  x19, x0                    /* fd */
+    mov  x18, #0                    /* 偏移 (find_substr 不破坏 x18) */
+tvv_map_loop:
     mov  x0, x19
     adrp x1, maps_buf
     add  x1, x1, :lo12:maps_buf
     mov  x2, #STUB_MAPS_SIZE
-    mov  x8, #SYS_read
+    mov  x3, x18
+    mov  x8, #67                    /* pread64 */
     svc  #0
+    tbnz x0, #63, tvv_map_done
     mov  x20, x0                    /* bytes */
-    mov  x0, x19
-    mov  x8, #SYS_close
-    svc  #0
-    tbnz x20, #63, tvv_pop_done
+    cbz  x20, tvv_map_done
     adrp x0, maps_buf
     add  x0, x0, :lo12:maps_buf
     mov  x1, x20
@@ -1142,9 +1138,35 @@ tvv_read_maps:
     add  x2, x2, :lo12:str_vvar
     mov  x3, #6
     bl   find_substr
-    cbz  x0, tvv_pop_done
+    cbnz x0, tvv_map_found
+    cmp  x20, #STUB_MAPS_SIZE
+    blt  tvv_map_done
+    add  x18, x18, #(STUB_MAPS_SIZE - 512)  /* 重叠 512B 防行被截断 */
+    b    tvv_map_loop
+tvv_map_found:
+    mov  x24, x0                    /* 保存匹配地址 (close 会破坏 x0) */
+    /* 匹配落在重叠区 (前 512B) 时回退重搜, 保证行首在当前块内 */
+    adrp x25, maps_buf
+    add  x25, x25, :lo12:maps_buf
+    sub  x25, x24, x25
+    cmp  x25, #512
+    b.hs 1f
+    cmp  x18, #512
+    blo  1f
+    sub  x18, x18, #512
+    b    tvv_map_loop
+1:
+    mov  x0, x19
+    mov  x8, #57                    /* close */
+    svc  #0
     /* 回退到该行行首 */
-    mov  x1, x0
+    mov  x1, x24
+    b    tvv_line
+tvv_map_done:
+    mov  x0, x19
+    mov  x8, #57                    /* close */
+    svc  #0
+    b    tvv_pop_done
 tvv_line:
     cmp  x1, #0
     beq  tvv_parse
@@ -1154,6 +1176,13 @@ tvv_line:
     sub  x1, x1, #1
     b    tvv_line
 tvv_parse:
+    /* 调试: dump [vvar] 行原始字节 (恢复阶段允许 write) */
+    stp  x1, x30, [sp, #-16]!
+    mov  x0, #2
+    mov  x2, #96
+    mov  x8, #64
+    svc  #0
+    ldp  x1, x30, [sp], #16
     mov  x3, x1
     mov  x4, #0
 tvv_num:
@@ -1178,6 +1207,15 @@ tvv_shift:
 tvv_parse_done:
     /* 恢复 vaddr/memsz; len = min(memsz, 0x4000) */
     ldp  x19, x20, [sp], #16
+    /* 调试: dump 解析出的 src 原始字节 */
+    adrp x0, debug_ring
+    add  x0, x0, :lo12:debug_ring
+    str  x4, [x0, #0x1000]
+    add  x1, x0, #0x1000
+    mov  x0, #2
+    mov  x2, #8
+    mov  x8, #64
+    svc  #0
     mov  x0, x19
     mov  x1, x4                     /* src = 当前进程 vvar */
     mov  x2, x20
@@ -1234,6 +1272,10 @@ str_stack:
     .asciz "[stack]"
 str_vvar:
     .asciz "[vvar]"
+str_tvv_enter:
+    .asciz "TVVIN\n"
+fake_clock:
+    .quad 0
 
 rlimit_stack:
     .quad 0, 0
@@ -1402,11 +1444,33 @@ comp_mock:
     beq  comp_mock_zero
     cmp  x2, #135                   /* rt_sigprocmask → 0 */
     beq  comp_mock_zero
-    /* 未支持: 0x5e 退出 */
-    mov  x0, #0x5e
-    mov  x8, #94
-    svc  #0
-    b    .
+    cmp  x2, #113                   /* clock_gettime → 伪单调时钟 */
+    beq  comp_mock_clock
+    cmp  x2, #98                    /* futex → 0 (维持前进) */
+    beq  comp_mock_zero
+    cmp  x2, #233                   /* madvise → 0 */
+    beq  comp_mock_zero
+    cmp  x2, #278                   /* getrandom → -EAGAIN */
+    beq  comp_mock_again
+    cmp  x2, #79                    /* getcwd → "/" */
+    beq  comp_mock_getcwd
+    /* 未支持: -ENOSYS (不能真实 exit, strict 禁止额外 syscall) */
+    adrp x5, debug_ring
+    add  x5, x5, :lo12:debug_ring
+    str  x2, [x5, #0x1008]          /* 调试: 记录未支持 sysno */
+    mov  x1, #-38
+    b    comp_mock_set
+comp_mock_again:
+    mov  x1, #-11
+    b    comp_mock_set
+comp_mock_getcwd:
+    ldr  x1, [x17, #(24 + 1*8)]     /* 目标 x1 = buf */
+    mov  w2, #'/'
+    strb w2, [x1]
+    mov  w2, #0
+    strb w2, [x1, #1]
+    mov  x1, #2                     /* 返回长度 */
+    b    comp_mock_set
 comp_mock_exit:
     ldr  x0, [x17, #24]             /* 目标 x0 = 退出码 */
     mov  x8, #94
@@ -1436,6 +1500,23 @@ comp_mock_brk:
     str  x2, [x17, #272]
     mov  x1, x2
 1:
+comp_mock_clock:
+    /* clock_gettime(id, ts): 返回伪单调时钟 (tv_sec=0,
+       tv_nsec = 每调用 +100us 的计数器), 避免 vDSO 回退真实 syscall
+       泄漏; Python 只用于相对超时计算 */
+    ldr  x1, [x17, #(24 + 1*8)]     /* 目标 x1 = ts 缓冲区 */
+    adrp x2, fake_clock
+    add  x2, x2, :lo12:fake_clock
+    ldr  x3, [x2]
+    movz x5, #0x86A0
+    movk x5, #0x1, lsl #16          /* 0x186A0 = 100000 */
+    add  x3, x3, x5
+    str  x3, [x2]
+    mov  x4, #0
+    str  x4, [x1]                   /* tv_sec = 0 */
+    str  x3, [x1, #8]               /* tv_nsec = counter */
+    mov  x1, #0                     /* 返回值 0 */
+    b    comp_mock_set
 comp_mock_set:
     str  x1, [x17, #24]             /* x0 槽 */
 

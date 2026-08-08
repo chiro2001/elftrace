@@ -758,8 +758,10 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
         st->kind = 0;
         st->rec_id = (int)k;
     }
-    if (!have_map) {
-        /* freeze 快照 (无 trace 回放数据): 全段扫描 svc → mock 站点 */
+    /* 全段扫描 svc → mock 站点: 无回放数据时全部 mock; 有回放表时,
+       未记录的 svc (vDSO 回退的 clock_gettime、musl 的 brk 等) 也要
+       patch, 否则 strict 会泄漏真实 syscall */
+    {
         size_t scanned = 0;
         for (size_t i = 0; i < nsegs; i++) {
             if (!(segs[i].flags & ET_SEG_X))
@@ -776,21 +778,32 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                     continue;   /* 段内非可执行部分 (如 ELF 头/RW 数据) */
                 if (!a64_mov_x8_before(basep, segs[i].filesz, j))
                     continue;   /* 数据表误报, 跳过 */
+                uint64_t pc = segs[i].vaddr + j;
+                /* 跳过已有站点 (回放站点优先) */
+                int dup = 0;
+                for (size_t m = 0; m < nsites; m++) {
+                    if (sites[m].pc == pc) {
+                        dup = 1;
+                        break;
+                    }
+                }
+                if (dup)
+                    continue;
                 if (nsites == sites_cap) {
                     sites_cap = sites_cap ? sites_cap * 2 : 32;
                     sites = xrealloc(sites, sites_cap * sizeof(*sites));
                 }
                 struct strict_site *st = &sites[nsites++];
                 memset(st, 0, sizeof(*st));
-                st->pc = segs[i].vaddr + j;
+                st->pc = pc;
                 st->kind = 0;
                 st->rec_id = -1;
                 scanned++;
             }
         }
         if (scanned)
-            warn("strict: no replay map, %zu svc sites patched as mock "
-                 "(scan)", scanned);
+            warn("strict: %zu unrecorded svc sites patched as mock (scan)",
+                 scanned);
     }
 
     /* 2. 退出点: 唯一路径埋 exit; 循环内 patch 回边 */
@@ -1058,8 +1071,11 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             v = s->h.task_tid;          memcpy(b + 280, &v, 8);
             v = (uint64_t)(st->rec_id >= 0 ? st->rec_id : 0);
             memcpy(b + 288, &v, 8);     /* 游标初始 = 首个记录索引 */
-            v = base + STUB_STRICT_EXIT_OFF;
-            memcpy(b + 296, &v, 8);     /* 回放表耗尽 → strict 退出 */
+            if (st->rec_id >= 0) {
+                v = base + STUB_STRICT_EXIT_OFF;
+                memcpy(b + 296, &v, 8); /* 回放表耗尽 → strict 退出 */
+            }
+            /* rec_id < 0 的 mock 站点: [296]=0 → 耗尽后走 comp_mock */
         } else if (st->kind == 2) {
             uint8_t *b = blob->data + (st->block_addr - base);
             uint64_t v;
