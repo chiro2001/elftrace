@@ -27,6 +27,8 @@ static void *writer_main(void *arg)
     usleep(2000000);            /* 让 trace 在写 payload 之前冻结 */
     memcpy(s->data, "NEW", 4);
     atomic_store_explicit(&s->seq, 1, memory_order_release);
+    printf("WROTE\n");
+    fflush(stdout);
     return NULL;
 }
 

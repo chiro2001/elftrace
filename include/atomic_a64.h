@@ -30,11 +30,7 @@ int a64_is_ldar(uint32_t w, int *size, unsigned *rt, unsigned *rn);
 #define A64_ATOM_PAGE_SIZE   0x1000
 #define A64_ATOM_BLOCKS_PER_PAGE  7   /* 7*0x240=0xFC0 */
 
-/* 寄存器保存布局: 保存区顶 = 最终 sp (flags@0, x30@16, ..., x16@256,
- * x17@264), 总大小 272B。 */
-#define A64_ATOM_SAVE_SIZE   272
-/* 返回寄存器号 r (0..30) 的保存偏移; 31 (sp) 返回 -1 */
-int a64_atom_reg_save_off(unsigned reg);
+/* 逐站点最小保存集 (生成器内部动态布局), 此处无固定偏移 */
 
 /* ---- 记录跳板块 ----
  * 入口: stp x16,x17; ldar <原始指令>; [mov x17,x16 | nop]; ldr x16,

@@ -111,23 +111,32 @@ for i in range(n_ev):
     events.append((sid, ordv))
 def site_events_between(sid, lo, hi):
     return any(e_s == sid and lo < e_o <= hi for (e_s, e_o) in events)
-# 取中后段 (消费者活跃区), 要求有事件
-for frac in (0.70, 0.75, 0.60, 0.80):
-    lo_c = int(total * frac)
-    from_k = next((k for k in range(len(cnt)) if cnt[k] >= lo_c), None)
-    if from_k is None or from_k + 2 >= len(cnt):
-        continue
-    st = states(from_k)
-    for to_k in range(from_k + 2, min(from_k + 5, len(cnt))):
-        st2 = states(to_k)
-        if pcs[to_k] in sites:
+# 选窗候选: 出现"站点序号增长且窗口内有实际事件"的检查点窗口 (消费者
+# 已推进队列)。自旋阶段序号也增长但值不变 (无事件)。输出多组候选,
+# 由测试逐个构建, 直到退出点可计数 (count target insn)。
+def to_ok(k):
+    return pcs[k] not in sites
+
+# 从后往前找事件窗口: 靠后的检查点对应消费者活跃后期, 忙循环主导,
+# 原子回放开销占比小 (补偿比例才能收敛); 靠前的事件窗口自旋占比大,
+# 真机/服务器时序不同, 可能永远到不了 5%。
+cands = []
+for k in range(len(cnt) - 3, 0, -1):
+    st = states(k)
+    for to_k in range(k + 1, min(k + 5, len(cnt))):
+        if not to_ok(to_k):
             continue
+        st2 = states(to_k)
         if any(st2[i][0] > st[i][0] and
                site_events_between(i, st[i][0], st2[i][0])
                for i in range(n_sites)):
-            print(cnt[from_k], cnt[to_k])
-            sys.exit(0)
-sys.exit(2)
+            cands.append((cnt[k], cnt[to_k]))
+    if len(cands) >= 6:
+        break
+if not cands:
+    sys.exit(2)
+for c in cands:
+    print(c[0], c[1])
 EOF
 )
 case $? in
@@ -135,14 +144,32 @@ case $? in
     2) echo "FAIL: no suitable window with atomic events"; exit 1 ;;
     *) echo "FAIL: window selection error"; exit 1 ;;
 esac
-FROM_C=${WIN%% *}
-TO_C=${WIN##* }
-echo "atomic: window from-count=$FROM_C to-count=$TO_C"
 
 # ---------- build + K 校准 (补偿指令比例 ≤ 5%) ----------
-T=$((TO_C - FROM_C))
 A0=0
 K0=0
+SELECTED=0
+while read -r FROM_C TO_C; do
+    T=$((TO_C - FROM_C))
+    echo "atomic: trying window from-count=$FROM_C to-count=$TO_C"
+    EXTRA=()
+    [ "$K0" -gt 0 ] && EXTRA=(--bm-exit-count "$K0")
+    tf_build /dev/null "$TF_TMP/spsc_slice.elf" --mode baremetal --bm-strict \
+        --checkpoints "$TF_TMP/spsc_r2" \
+        --from-count "$FROM_C" --to-count "$TO_C" \
+        --stack-reserve 67108864 "${EXTRA[@]}" \
+        > "$TF_TMP/spsc_build.log" 2>&1 || continue
+    grep -q "count target insn" "$TF_TMP/spsc_build.log" || continue
+    SELECTED=1
+    break
+done <<EOF
+$WIN
+EOF
+[ "$SELECTED" = 1 ] || {
+    echo "FAIL: no candidate window has a countable exit"
+    tail -5 "$TF_TMP/spsc_build.log"
+    exit 1; }
+
 for iter in 1 2 3; do
     EXTRA=()
     [ "$K0" -gt 0 ] && EXTRA=(--bm-exit-count "$K0")

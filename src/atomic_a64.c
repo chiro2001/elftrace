@@ -32,19 +32,6 @@ static void put64(uint8_t **p, uint64_t v)
 #define INSN_LDAR_W29_X27 0x88DFFF7DU
 #define INSN_BR_X16     0xD61F0200U
 
-/* stp xA,xB,[sp,#-16]! / ldp xA,xB,[sp],#16, 按保存顺序索引 */
-static const uint32_t stp_pre_tab[] = {
-    0xA9BF07E0U, 0xA9BF0FE2U, 0xA9BF17E4U, 0xA9BF1FE6U,
-    0xA9BF27E8U, 0xA9BF2FEAU, 0xA9BF37ECU, 0xA9BF3FEEU,
-    0xA9BF4FF2U, 0xA9BF57F4U, 0xA9BF5FF6U, 0xA9BF67F8U,
-    0xA9BF6FFAU, 0xA9BF77FCU, 0xA9BF7FFEU,
-};
-static const uint32_t ldp_post_tab[] = {
-    0xA8C107E0U, 0xA8C10FE2U, 0xA8C117E4U, 0xA8C11FE6U,
-    0xA8C127E8U, 0xA8C12FEAU, 0xA8C137ECU, 0xA8C13FEEU,
-    0xA8C14FF2U, 0xA8C157F4U, 0xA8C15FF6U, 0xA8C167F8U,
-    0xA8C16FFAU, 0xA8C177FCU, 0xA8C17FFEU,
-};
 static const uint32_t stp_flags = 0xA9BF7FEFU;  /* stp x15,xzr */
 static const uint32_t ldp_flags = 0xA8C17FEFU;  /* ldp x15,xzr */
 
@@ -105,23 +92,114 @@ static uint32_t mul_x(unsigned rd, unsigned rn, unsigned rm)
     return 0x9B007C00U | (rm << 16) | (rn << 5) | rd;
 }
 
-/* ---- 保存/恢复序列 (入口的 x16/x17 已由入口 stp 保存) ---- */
-static void emit_save(uint8_t **p)
+/* ---- 逐站点最小保存集 ----
+ * 跳板只保存自己会破坏的寄存器: 基础 scratch 集 + 站点 Rt/Rn (保证
+ * 加载值经槽写回、地址经槽取回, rt==rn 时地址仍可恢复)。保存/恢复
+ * 指令数从 35 降到 ~11-15, 栈流量从 272B 降到 ~112-144B。
+ */
+struct save_plan {
+    uint32_t stp[16];
+    uint32_t ldp[16];
+    int off[32];                /* reg → 最终 sp 偏移; -1 = 未保存 */
+    int n_pairs;
+    int save_size;              /* 含 flags 的总字节 */
+};
+
+static uint32_t stp_pre_64(unsigned rt1, unsigned rt2, unsigned rn)
 {
-    for (size_t i = 0; i < sizeof(stp_pre_tab) / sizeof(stp_pre_tab[0]); i++)
-        put32(p, stp_pre_tab[i]);
+    return 0xA9800000U | (0x7EU << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+static uint32_t ldp_post_64(unsigned rt1, unsigned rt2, unsigned rn)
+{
+    return 0xA8C00000U | (0x02U << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+
+static void plan_save(struct save_plan *pl, const unsigned *base,
+                      size_t n_base, unsigned rt, unsigned rn)
+{
+    unsigned regs[32];
+    size_t n = 0;
+    memset(pl, 0, sizeof(*pl));
+    for (int i = 0; i < 32; i++)
+        pl->off[i] = -1;
+    for (size_t i = 0; i < n_base; i++) {
+        unsigned r = base[i];
+        int dup = 0;
+        for (size_t j = 0; j < n; j++)
+            if (regs[j] == r)
+                dup = 1;
+        if (!dup && r < 31)
+            regs[n++] = r;
+    }
+    if (rt < 31) {
+        int dup = 0;
+        for (size_t j = 0; j < n; j++)
+            if (regs[j] == rt)
+                dup = 1;
+        if (!dup)
+            regs[n++] = rt;
+    }
+    if (rn < 31) {
+        int dup = 0;
+        for (size_t j = 0; j < n; j++)
+            if (regs[j] == rn)
+                dup = 1;
+        if (!dup)
+            regs[n++] = rn;
+    }
+    /* 升序 */
+    for (size_t i = 1; i < n; i++)
+        for (size_t j = i; j > 0 && regs[j - 1] > regs[j]; j--) {
+            unsigned t = regs[j - 1];
+            regs[j - 1] = regs[j];
+            regs[j] = t;
+        }
+    /* 入口 (16,17) 最先推 (最高地址); 其余两两成对, 单数补 xzr */
+    unsigned rest[32];
+    size_t nr = 0;
+    int has16 = 0, has17 = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (regs[i] == 16 && !has16) { has16 = 1; continue; }
+        if (regs[i] == 17 && !has17) { has17 = 1; continue; }
+        rest[nr++] = regs[i];
+    }
+    if (nr & 1)
+        rest[nr++] = 31;        /* xzr 占位 */
+    pl->n_pairs = (int)(nr / 2);        /* 仅体内对; 入口对由入口代码推入 */
+    pl->save_size = (pl->n_pairs + 2) * 16;   /* 入口对 + 体内对 + flags */
+    /* 入口对占据 [save_size-16, save_size); 体内对 b 占据
+       [save_size-(b+2)*16, save_size-(b+1)*16) */
+    pl->off[16] = pl->save_size - 16;
+    pl->off[17] = pl->save_size - 8;
+    size_t k = 0;
+    for (size_t i = 0; i + 1 < nr; i += 2, k++) {
+        unsigned a = rest[i], b = rest[i + 1];
+        pl->stp[k] = stp_pre_64(a, b, 31);
+        pl->off[a] = pl->save_size - (int)(k + 2) * 16;
+        pl->off[b] = pl->off[a] + 8;
+    }
+    for (int i = 0; i < pl->n_pairs; i++) {
+        uint32_t w = pl->stp[pl->n_pairs - 1 - i];
+        unsigned rt2 = (w >> 10) & 0x1F, rt1 = w & 0x1F;
+        pl->ldp[i] = ldp_post_64(rt1, rt2, 31);
+    }
+}
+
+static void emit_plan_save(uint8_t **p, const struct save_plan *pl)
+{
+    for (int i = 0; i < pl->n_pairs; i++)
+        put32(p, pl->stp[i]);
     put32(p, INSN_MRS_X15_NZCV);
     put32(p, stp_flags);
 }
 
-static void emit_restore(uint8_t **p)
+static void emit_plan_restore(uint8_t **p, const struct save_plan *pl)
 {
     put32(p, ldp_flags);
     put32(p, INSN_MSR_NZCV_X15);
-    for (size_t i = sizeof(ldp_post_tab) / sizeof(ldp_post_tab[0]);
-         i > 0; i--)
-        put32(p, ldp_post_tab[i - 1]);
-    put32(p, 0xA8C147F0U);      /* ldp x16,x17,[sp],#16 (入口保存) */
+    for (int i = 0; i < pl->n_pairs; i++)
+        put32(p, pl->ldp[i]);
+    put32(p, 0xA8C147F0U);      /* ldp x16,x17,[sp],#16 (入口对) */
 }
 
 int a64_is_ldar(uint32_t w, int *size, unsigned *rt, unsigned *rn)
@@ -146,21 +224,6 @@ static uint32_t a64_ldar_insn(int size, unsigned rn, unsigned rt)
                     size == 2 ? 0x48DFFC00U :
                     size == 4 ? 0x88DFFC00U : 0xC8DFFC00U;
     return base | (rn << 5) | rt;
-}
-
-int a64_atom_reg_save_off(unsigned reg)
-{
-    if (reg <= 15)
-        return (reg & 1) ? (int)(256 - reg * 8) : (int)(240 - reg * 8);
-    if (reg == 30)
-        return 16;
-    if (reg >= 18 && reg <= 29)
-        return (reg & 1) ? (int)(272 - reg * 8) : (int)(256 - reg * 8);
-    if (reg == 16)
-        return 256;
-    if (reg == 17)
-        return 264;
-    return -1;
 }
 
 /* ---- 记录跳板 ---- */
@@ -206,7 +269,12 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
     /* 入口 br 过来时 x16 = 代码地址 (block+0x1C); 数据区偏移按块基算,
        先减回去 */
     put32(&p, 0xD1007210U);     /* sub x16, x16, #0x1c (入口 5 指令) */
-    emit_save(&p);
+    unsigned base_rec[] = {12, 13, 14, 15, 16, 17, 18, 19,
+                           20, 21, 22, 23};
+    struct save_plan pl;
+    plan_save(&pl, base_rec, sizeof(base_rec) / sizeof(base_rec[0]),
+              rt, rn);
+    emit_plan_save(&p, &pl);
 
     /* 值 → x13 */
     if (rt == 13) {
@@ -218,20 +286,12 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
     } else {
         put32(&p, mov_x(13, rt));
     }
-    /* 地址 → x12 */
-    if (rn == 12) {
-        /* 已在 x12 */
-    } else if (rn == 13) {
-        put32(&p, mov_x(12, 13));
-    } else if (rn == 31) {
-        put32(&p, add_x(12, 31, A64_ATOM_SAVE_SIZE));
-    } else if (rn == 16) {
-        put32(&p, ldr_x_imm(31, 12, 256));  /* 入口已覆盖 x16, 从栈取回 */
-    } else if (rn == 17) {
-        put32(&p, ldr_x_imm(31, 12, 264));
-    } else {
-        put32(&p, mov_x(12, rn));
-    }
+    /* 地址 → x12 (逐站点保存计划: rn 必在保存槽内, rt==rn 时地址
+       也能从槽恢复) */
+    if (rn == 31)
+        put32(&p, add_x(12, 31, (unsigned)pl.save_size));
+    else
+        put32(&p, ldr_x_imm(31, 12, (unsigned)pl.off[rn]));
 
     /* TLS 过滤: 非目标线程只执行原始 ldar, 不记录 */
     put32(&p, INSN_MRS_X14_TPIDR);
@@ -281,12 +341,12 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
        保存区是 ldar 执行前的快照; 所有提前跳转路径都经过这里),
        然后恢复现场 + 跳回站点下一条 */
     {
-        int rt_off = a64_atom_reg_save_off(rt);
+        int rt_off = pl.off[rt];
         if (rt_off < 0)
             return 0;
         uint8_t *done = p;
         put32(&p, str_x_imm(31, 13, (unsigned)rt_off));
-        emit_restore(&p);
+        emit_plan_restore(&p, &pl);
 
         /* 回填条件分支 */
         int32_t d1 = (int32_t)(done - tls_bne);
@@ -341,11 +401,13 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                uint64_t load_limit, uint64_t exit_abs)
 {
     uint8_t *p = out;
-    int rt_off = a64_atom_reg_save_off(rt);
+    unsigned base_rep[] = {16, 17, 18, 19, 20, 21, 22, 23,
+                           24, 25, 26, 27, 28, 29};
+    struct save_plan pl;
+    plan_save(&pl, base_rep, sizeof(base_rep) / sizeof(base_rep[0]),
+              rt, rn);
+    int rt_off = pl.off[rt];
     if (rt_off < 0 || rt == 31)
-        return 0;
-    int rn_off = rn == 31 ? -1 : a64_atom_reg_save_off(rn);
-    if (rn != 31 && rn_off < 0)
         return 0;
 
     memset(out, 0, A64_ATOM_BLOCK_SIZE);
@@ -359,7 +421,7 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     /* p == out + 0x18 (sub) */
 
     put32(&p, 0xD1006210U);     /* sub x16, x16, #0x18 (入口 4 指令) */
-    emit_save(&p);
+    emit_plan_save(&p, &pl);
 
     /* 序号 = ++ordinal */
     put32(&p, ldr_x16_imm(19, REP_ORD_OFF));
@@ -410,9 +472,9 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                    序号越过运行段起点后误回退真实值) */
     /* 地址校验: 实际地址 == 运行段地址? */
     if (rn == 31)
-        put32(&p, add_x(27, 31, A64_ATOM_SAVE_SIZE));
+        put32(&p, add_x(27, 31, (unsigned)pl.save_size));
     else
-        put32(&p, ldr_x_imm(31, 27, (unsigned)rn_off));
+        put32(&p, ldr_x_imm(31, 27, (unsigned)pl.off[rn]));
     put32(&p, ldr_x_imm(24, 28, 8));    /* run.addr */
     put32(&p, cmp_x(27, 28));
     uint8_t *ne_b = p;
@@ -424,15 +486,16 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     put32(&p, 0x14000000U);     /* b set (占位, 无条件) */
     uint8_t *use_real = p;
     if (rn == 31)
-        put32(&p, add_x(27, 31, A64_ATOM_SAVE_SIZE));
+        put32(&p, add_x(27, 31, (unsigned)pl.save_size));
     else
-        put32(&p, ldr_x_imm(31, 27, (unsigned)rn_off));
-    put32(&p, a64_ldar_insn(size, 27, 13));
-    put32(&p, mov_x(23, 13));           /* 真实值 → x23 (set 统一写槽) */
+        put32(&p, ldr_x_imm(31, 27, (unsigned)pl.off[rn]));
+    /* 真实值: 用保存集内的 x29 做加载 (x13 不在最小保存集, 不能破坏) */
+    put32(&p, a64_ldar_insn(size, 27, 29));
+    put32(&p, mov_x(23, 29));           /* 真实值 → x23 (set 统一写槽) */
     uint8_t *set = p;
     /* 把最终值写入 Rt 的保存槽 (恢复时弹出) */
     put32(&p, str_x_imm(31, 23, (unsigned)rt_off));
-    emit_restore(&p);
+    emit_plan_restore(&p, &pl);
     uint64_t b_off = (uint64_t)(p - out);
     put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
     uint8_t *limit_exit = NULL;
