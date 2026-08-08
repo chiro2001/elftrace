@@ -1505,41 +1505,9 @@ comp_runs:
     adr  x27, comp_done             /* 应用完跳回 comp_done */
     b    apply_rec_runs
 
-/* apply_rec_runs: x25=rec base, x16=replay_abs, x27=完成地址。
- * 应用 newseg + dirty 的 32B granule / 整段回放 (纯访存)。
- * 每条 entry: {vaddr u64, n_gran u32, mode u32, size u32, pad u32};
- *   mode=1: {off u32, data[32]} × n_gran
- *   mode=2: data[size] 整段
- * 破坏 x18-x22, x24, x26; x23 (rec base) 保留。 */
-apply_rec_runs:
-    ldr  x18, [x25, #40]            /* n_newseg (emitted) */
-    ldr  x19, [x25, #48]
-    add  x19, x19, x16
-arr_ns_loop:
-    cbz  x18, arr_dirty
-    ldr  x20, [x19]                 /* vaddr */
-    ldr  w21, [x19, #8]             /* n_gran */
-    ldr  w22, [x19, #12]            /* mode */
-    ldr  w26, [x19, #16]            /* size */
-    add  x19, x19, #24
-    cmp  w22, #2
-    beq  arr_full_ns
-arr_gran_ns:
-    cbz  w21, arr_ns_adv
-    ldr  w24, [x19]                 /* off */
-    add  x0, x20, x24
-    add  x1, x19, #4
-    ldp  x4, x5, [x1]
-    ldp  x6, x7, [x1, #16]
-    stp  x4, x5, [x0]
-    stp  x6, x7, [x0, #16]
-    add  x19, x19, #36
-    sub  w21, w21, #1
-    b    arr_gran_ns
-arr_full_ns:
-    mov  x0, x20
-    mov  x1, x19
-    mov  x2, x26
+/* copy_blob(dst=x0, src=x1, len=x2): 32B 展开拷贝 + 字节尾。
+ * 破坏 x0-x5。 */
+copy_blob:
     lsr  x3, x2, #5
     cbz  x3, 2f
 1:  ldp  x4, x5, [x1], #32
@@ -1552,7 +1520,22 @@ arr_full_ns:
     strb w4, [x0], #1
     subs x3, x3, #1
     b.ne 2b
-3:  add  x19, x19, x26
+3:  ret
+
+/* apply_rec_runs: x25=rec base, x16=replay_abs, x27=完成地址。
+ * 应用 newseg + dirty 的 32B granule / span / 整段回放 (纯访存)。
+ * 每条 entry: {vaddr u64, n_gran u32, mode u32, size u32, pad u32};
+ *   mode=1: {off u32, data[32]} × n_gran
+ *   mode=2: data[size] 整段
+ * 破坏 x18-x22, x24, x26; x23 (rec base) 保留。 */
+apply_rec_runs:
+    ldr  x18, [x25, #40]            /* n_newseg (emitted) */
+    ldr  x19, [x25, #48]
+    add  x19, x19, x16
+    adr  x28, arr_ns_adv
+    cbz  x18, arr_dirty
+arr_ns_loop:
+    b    arr_entry
 arr_ns_adv:
     sub  x18, x18, #1
     cbnz x18, arr_ns_loop
@@ -1560,17 +1543,28 @@ arr_dirty:
     ldr  x18, [x25, #56]            /* n_dirty (emitted) */
     ldr  x19, [x25, #64]
     add  x19, x19, x16
-arr_d_loop:
+    adr  x28, arr_d_adv
     cbz  x18, arr_done
+arr_d_loop:
+    b    arr_entry
+arr_d_adv:
+    sub  x18, x18, #1
+    cbnz x18, arr_d_loop
+arr_done:
+    br   x27
+
+/* 共享 entry 处理器: x20=vaddr, x21=n_gran, x22=mode, x26=size,
+ * x19=数据指针 (已过 24B 头), x28=完成后返回地址。 */
+arr_entry:
     ldr  x20, [x19]                 /* vaddr */
     ldr  w21, [x19, #8]             /* n_gran */
     ldr  w22, [x19, #12]            /* mode */
     ldr  w26, [x19, #16]            /* size */
     add  x19, x19, #24
     cmp  w22, #2
-    beq  arr_full_d
-arr_gran_d:
-    cbz  w21, arr_d_adv
+    beq  arr_full
+arr_gran:
+    cbz  w21, arr_next
     ldr  w24, [x19]                 /* off */
     add  x0, x20, x24
     add  x1, x19, #4
@@ -1580,29 +1574,15 @@ arr_gran_d:
     stp  x6, x7, [x0, #16]
     add  x19, x19, #36
     sub  w21, w21, #1
-    b    arr_gran_d
-arr_full_d:
+    b    arr_gran
+arr_full:
     mov  x0, x20
     mov  x1, x19
     mov  x2, x26
-    lsr  x3, x2, #5
-    cbz  x3, 5f
-4:  ldp  x4, x5, [x1], #32
-    stp  x4, x5, [x0], #32
-    subs x3, x3, #1
-    b.ne 4b
-5:  and  x3, x2, #31
-    cbz  x3, 6f
-    ldrb w4, [x1], #1
-    strb w4, [x0], #1
-    subs x3, x3, #1
-    b.ne 5b
-6:  add  x19, x19, x26
-arr_d_adv:
-    sub  x18, x18, #1
-    cbnz x18, arr_d_loop
-arr_done:
-    br   x27
+    bl   copy_blob
+    add  x19, x19, x26
+arr_next:
+    br   x28
 
 comp_done:
     ldr  x1, [x23, #16]             /* rec.rax */

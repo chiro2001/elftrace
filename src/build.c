@@ -1365,12 +1365,12 @@ static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
                               size_t n, uint32_t *mode_out,
                               uint32_t *gran_out)
 {
-    uint64_t ng = 0, full = 0;
+    uint32_t ng = 0, full = 0;
     for (size_t g = 0; g < n; g += 32) {
         size_t len = n - g < 32 ? n - g : 32;
         if (memcmp(oldp + g, newp + g, len) != 0) {
             ng++;
-            full += len;
+            full += (uint32_t)len;
         }
     }
     if (!ng)
@@ -1379,7 +1379,7 @@ static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
     if (mode_out)
         *mode_out = mode;
     if (gran_out)
-        *gran_out = (uint32_t)ng;
+        *gran_out = ng;
     uint32_t n32 = (uint32_t)ng;
     uint32_t size = (uint32_t)(mode == 2 ? n : ng * 32);
     uint32_t pad = 0;
@@ -2186,7 +2186,7 @@ int build_main(int argc, char **argv)
                     off += 4096;
                 }
                 free(f);
-                recs[nrecs].map_idx = map_idx;
+                recs[nrecs].map_idx = map_idx - 1;   /* 行号 0 基 */
                 nrecs++;
             }
             fclose(mf);
