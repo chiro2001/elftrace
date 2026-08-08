@@ -1540,8 +1540,19 @@ arr_full_ns:
     mov  x0, x20
     mov  x1, x19
     mov  x2, x26
-    bl   memcpy_bytes
-    add  x19, x19, x26
+    lsr  x3, x2, #5
+    cbz  x3, 2f
+1:  ldp  x4, x5, [x1], #32
+    stp  x4, x5, [x0], #32
+    subs x3, x3, #1
+    b.ne 1b
+2:  and  x3, x2, #31
+    cbz  x3, 3f
+    ldrb w4, [x1], #1
+    strb w4, [x0], #1
+    subs x3, x3, #1
+    b.ne 2b
+3:  add  x19, x19, x26
 arr_ns_adv:
     sub  x18, x18, #1
     cbnz x18, arr_ns_loop
@@ -1574,8 +1585,19 @@ arr_full_d:
     mov  x0, x20
     mov  x1, x19
     mov  x2, x26
-    bl   memcpy_bytes
-    add  x19, x19, x26
+    lsr  x3, x2, #5
+    cbz  x3, 5f
+4:  ldp  x4, x5, [x1], #32
+    stp  x4, x5, [x0], #32
+    subs x3, x3, #1
+    b.ne 4b
+5:  and  x3, x2, #31
+    cbz  x3, 6f
+    ldrb w4, [x1], #1
+    strb w4, [x0], #1
+    subs x3, x3, #1
+    b.ne 5b
+6:  add  x19, x19, x26
 arr_d_adv:
     sub  x18, x18, #1
     cbnz x18, arr_d_loop
