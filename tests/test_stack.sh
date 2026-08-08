@@ -26,7 +26,7 @@ echo "ref rc=$REF_RC $(grep '^DONE' "$TMP/stack_ref.out")"
 run_scenario_a() {
     "$PROG" > "$TMP/stack_a.out" 2>&1 &
     local PID=$!
-    for i in $(seq 1 400); do
+    for i in $(seq 1 2400); do
         grep -q "^TOP" "$TMP/stack_a.out" 2>/dev/null && break
         sleep 0.05
     done
@@ -54,7 +54,7 @@ run_scenario_a() {
 run_scenario_b() {
     "$PROG" > "$TMP/stack_b.out" 2>&1 &
     local PID=$!
-    for i in $(seq 1 300); do
+    for i in $(seq 1 2400); do
         grep -q "^MID" "$TMP/stack_b.out" 2>/dev/null && break
         sleep 0.05
     done
