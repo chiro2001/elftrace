@@ -118,7 +118,8 @@ PRC=$?
 tf_build /dev/null "$TF_TMP/http_slice.elf" --mode baremetal --bm-strict \
     --checkpoints "$TF_TMP/http_r2" --from 3 --to 5 \
     --stack-reserve 67108864 \
-    --byte-runs "$TF_TMP/http_probe.bin" > "$TF_TMP/http_build2.log" 2>&1 \
+    --byte-runs "$TF_TMP/http_probe.bin" \
+    --newseg-big-skip 1048576 > "$TF_TMP/http_build2.log" 2>&1 \
     || { echo "FAIL: byte-run build"; tail -5 "$TF_TMP/http_build2.log"; exit 1; }
 
 # 目标阶段零 syscall

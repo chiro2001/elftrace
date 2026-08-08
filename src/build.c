@@ -1608,6 +1608,9 @@ int build_main(int argc, char **argv)
     int have_from_count = 0, have_to_count = 0;
     const char *probe_dump_path = NULL; /* --probe-dump: 预状态 dump */
     const char *byte_runs_path = NULL;  /* --byte-runs: 压缩回放表 */
+    uint64_t newseg_big_skip = 0;       /* --newseg-big-skip: 跳过 >=N
+                                           字节的 newseg 回放 (worker
+                                           线程栈等主线程不读的段) */
     uint64_t replay_fmt = 0;            /* 0=整页, 1=字节 run (表内 u64) */
     /* strict 循环判定用: 窗口内检查点 PC 与计数 */
     uint64_t *ckpt_pcs = NULL;
@@ -1651,6 +1654,9 @@ int build_main(int argc, char **argv)
         } else if (strcmp(argv[i], "--byte-runs") == 0 &&
                    i + 1 < argc) {
             byte_runs_path = argv[++i];
+        } else if (strcmp(argv[i], "--newseg-big-skip") == 0 &&
+                   i + 1 < argc) {
+            newseg_big_skip = strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--from-count") == 0 && i + 1 < argc) {
             from_count = strtoull(argv[++i], NULL, 10);
             have_from_count = 1;
@@ -1679,6 +1685,7 @@ int build_main(int argc, char **argv)
                 "[--from K] [--to M] [--breakpoint ADDR] "
                 "[--bm-strict] [--bm-exit-count N] [--stack-reserve N] "
                 "[--probe-dump FILE] [--byte-runs FILE] "
+                "[--newseg-big-skip N] "
                 "[--from-count N] [--to-count N]");
         }
     }
@@ -1688,6 +1695,7 @@ int build_main(int argc, char **argv)
             "[--from K] [--to M] [--breakpoint ADDR] "
             "[--bm-strict] [--bm-exit-count N] [--stack-reserve N] "
             "[--probe-dump FILE] [--byte-runs FILE] "
+            "[--newseg-big-skip N] "
             "[--from-count N] [--to-count N]");
 #if !defined(__aarch64__)
     if (bm_strict)
@@ -2290,16 +2298,26 @@ int build_main(int argc, char **argv)
                     die("probe newseg mismatch rec %zu (%#llx vs %#llx)",
                         i, (unsigned long long)pv,
                         (unsigned long long)vv);
-                uint32_t mode = 0, ng = 0;
-                uint32_t em = emit_granules(&r->newseg_run, vv,
-                                            pf + ep + 16, nd + 32, fs,
-                                            &mode, &ng);
-                r->n_newseg_run += em;
-                if (mode == 2)
-                    n_full_entries++;
-                else if (em) {
-                    n_gran_entries++;
-                    n_gran_total += ng;
+                if (newseg_big_skip && fs >= newseg_big_skip) {
+                    /* 大段 newseg (worker 线程栈等): 预映射已含内容,
+                       主线程不读这些段, 跳过回放拷贝 (纯浪费; 实测
+                       手机 12MB 线程栈拷贝占切片 80% 指令) */
+                    fprintf(stderr, "build: byte-runs: skip big newseg "
+                            "rec %zu (%llu bytes @ %#llx)\n",
+                            i, (unsigned long long)fs,
+                            (unsigned long long)vv);
+                } else {
+                    uint32_t mode = 0, ng = 0;
+                    uint32_t em = emit_granules(&r->newseg_run, vv,
+                                                pf + ep + 16, nd + 32, fs,
+                                                &mode, &ng);
+                    r->n_newseg_run += em;
+                    if (mode == 2)
+                        n_full_entries++;
+                    else if (em) {
+                        n_gran_entries++;
+                        n_gran_total += ng;
+                    }
                 }
                 ep += 16 + fs;
                 nd += 32 + fs;
