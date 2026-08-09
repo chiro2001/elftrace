@@ -516,12 +516,17 @@ static void atomic_load(const char *dir, long from, long to,
                        检查点时 locked=1, 录制中主线程恒读 0), diff 未
                        到达前真实读会让切片走进录制中不存在的等待路径。
                        原子自旋站点 (kind 0/1) 保持不 patch: 真实读 +
-                       syscall diff 才能让等待 worker 标志的自旋退出。 */
+                       syscall diff 才能让等待 worker 标志的自旋退出。
+                       仅当站点在窗口内确实执行过 (to_ord > from_ord,
+                       事件被游程压缩) 才允许 carry-in; 窗口内从未执行
+                       的站点 (to_ord == from_ord) 若切片命中即为控制流
+                       分歧, 不合成旧值掩盖。 */
                     for (size_t i = 0; i < n_sites; i++) {
                         if (ab->run_cnt[i] ||
                             !(ab->sites[i].kind == 2 ||
                               ab->sites[i].kind == 3) ||
-                            !ab->sites[i].from_addr)
+                            !ab->sites[i].from_addr ||
+                            ab->sites[i].to_ord <= ab->sites[i].from_ord)
                             continue;
                         ab->runs[ab->run_off[i]].start = 1;
                         ab->runs[ab->run_off[i]].addr =

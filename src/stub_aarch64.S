@@ -1334,6 +1334,10 @@ mock_spin_cnt:
     .quad 0
 next_pending:
     .quad 0
+mock_stack_lo:
+    .quad 0                 /* spin-apply 栈保护区间 (0 = 关闭) */
+mock_stack_hi:
+    .quad 0
 
 rlimit_stack:
     .quad 0, 0
@@ -1574,6 +1578,27 @@ arr_entry:
     ldr  w22, [x19, #12]            /* mode */
     ldr  w26, [x19, #16]            /* size */
     add  x19, x19, #24
+    /* 栈保护 (仅 spin-apply 启用): 跳过主线程活动栈页的 entry */
+    adrp x7, mock_stack_lo
+    add  x7, x7, :lo12:mock_stack_lo
+    ldr  x8, [x7]
+    cbz  x8, arr_noguard
+    cmp  x20, x8
+    b.lo arr_noguard
+    ldr  x8, [x7, #8]
+    cmp  x20, x8
+    b.hs arr_noguard
+    cmp  w22, #2
+    beq  arr_skip_full
+    mov  x8, x21
+    mov  x9, #36
+    mul  x8, x8, x9
+    add  x19, x19, x8
+    b    arr_next
+arr_skip_full:
+    add  x19, x19, x26
+    b    arr_next
+arr_noguard:
     cmp  w22, #2
     beq  arr_full
 arr_gran:
@@ -1633,6 +1658,16 @@ comp_mock:
     cmp  x3, #256
     b.lt mock_dispatch
     str  xzr, [x5]
+    /* spin-apply 栈保护: 记录当前目标 sp 附近的区间, 应用 diff 时
+       跳过落入该区间的页 (worker 的 diff 可能含主线程栈页, 提前
+       灌入会覆盖切片活动栈帧 → 垃圾 pc) */
+    mov  x8, sp
+    sub  x8, x8, #0x20000
+    adrp x7, mock_stack_lo
+    add  x7, x7, :lo12:mock_stack_lo
+    str  x8, [x7]
+    add  x8, sp, #0x2000
+    str  x8, [x7, #8]
     adrp x6, next_pending
     add  x6, x6, :lo12:next_pending
     ldr  x3, [x6]
@@ -1683,6 +1718,21 @@ mock_dirty:
 mock_dirty_loop:
     cbz  x18, mock_applied
     ldr  x20, [x19]                 /* dst */
+    /* 栈保护: 跳过主线程活动栈页 */
+    adrp x7, mock_stack_lo
+    add  x7, x7, :lo12:mock_stack_lo
+    ldr  x8, [x7]
+    cbz  x8, 2f
+    cmp  x20, x8
+    b.lo 2f
+    ldr  x8, [x7, #8]
+    cmp  x20, x8
+    b.hs 2f
+    add  x19, x19, #4096
+    add  x19, x19, #8
+    sub  x18, x18, #1
+    b    mock_dirty_loop
+2:
     add  x21, x19, #8               /* src */
     mov  x0, x20
     mov  x1, x21
@@ -1693,6 +1743,11 @@ mock_dirty_loop:
     sub  x18, x18, #1
     b    mock_dirty_loop
 mock_applied:
+    /* 清除栈保护 (下次 spin-apply 重新设置) */
+    adrp x7, mock_stack_lo
+    add  x7, x7, :lo12:mock_stack_lo
+    str  xzr, [x7]
+    str  xzr, [x7, #8]
     adrp x7, debug_ring
     add  x7, x7, :lo12:debug_ring
     ldr  x5, [x7, #0x1018]

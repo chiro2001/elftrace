@@ -833,17 +833,12 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
             put32(&p, movz_x(28, 0, 0));
         put32(&p, add_xr_lsl(27, 27, 28, (unsigned)ad->shift));
     }
-    /* 地址校验: 实际地址 == 运行段地址?
-       单段常量回放 (合成首段, 站点窗口内无事件) 跳过校验 —— 站点在
-       录制中从未被主线程读到 (如 drop_gil 的 gil_drop_request), 检查点
-       last_val 就是要回放的恒定值, 地址无关。多段运行仍按段地址匹配。 */
-    uint8_t *ne_b = NULL;
-    if (n_runs > 1) {
-        put32(&p, ldr_x_imm(24, 28, 8));    /* run.addr */
-        put32(&p, cmp_x(27, 28));
-        ne_b = p;
-        put32(&p, bcond(0, 1));     /* b.ne use_real (占位) */
-    }
+    /* 地址校验: 实际地址 == 运行段地址 (任何段数都校验 —— 地址失配
+       是最早的对象身份分歧信号, 不允许因单段常量就放宽)。 */
+    put32(&p, ldr_x_imm(24, 28, 8));    /* run.addr */
+    put32(&p, cmp_x(27, 28));
+    uint8_t *ne_b = p;
+    put32(&p, bcond(0, 1));     /* b.ne use_real (占位) */
     put32(&p, ldr_x_imm(24, 23, 16));   /* run.value */
     /* 真实屏障: 对原地址执行 ldar/ldaxr/普通 load (值丢弃), 保证排序语义;
        ldaxr 额外设置排他监视器, 使后续真实 stlxr/stxr 成功 (锁获取);
@@ -899,17 +894,15 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
         int32_t d1 = (int32_t)(have - hs_b);
         int32_t d2 = (int32_t)(have - hi_b);
         int32_t d3 = (int32_t)(use_real - lo_b);
-        int32_t d4 = ne_b ? (int32_t)(use_real - ne_b) : 0;
+        int32_t d4 = (int32_t)(use_real - ne_b);
         uint32_t w5 = a64_encode_b(block_abs + (uint64_t)(set_jmp - out),
                                    block_abs + (uint64_t)(set - out));
         uint32_t w;
         w = bcond(d1, 2);   memcpy(hs_b, &w, 4);
         w = bcond(d2, 8);   memcpy(hi_b, &w, 4);
         w = bcond(d3, 8);   memcpy(lo_b, &w, 4);
-        if (ne_b) {
-            w = bcond(d4, 1);
-            memcpy(ne_b, &w, 4);
-        }
+        w = bcond(d4, 1);
+        memcpy(ne_b, &w, 4);
         memcpy(set_jmp, &w5, 4);
         if (lim_b) {
             uint32_t w6 = bcond((int32_t)(limit_exit - lim_b), 8);
