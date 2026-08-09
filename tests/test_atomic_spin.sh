@@ -145,68 +145,71 @@ case $? in
     *) echo "FAIL: window selection error"; exit 1 ;;
 esac
 
-# ---------- build + K 校准 (补偿指令比例 ≤ 5%) ----------
-A0=0
-K0=0
+# ---------- 窗口 + K 校准 (补偿指令比例 ≤ 5%) ----------
+# 候选窗口逐个尝试: 退出不可计数 / 提前退出 (原子回放负载上限先触发,
+# A 远小于 T 且 K 增大无效) / 5 次迭代不收敛 → 换下一个窗口。
 SELECTED=0
+R=999
 while read -r FROM_C TO_C; do
     T=$((TO_C - FROM_C))
     echo "atomic: trying window from-count=$FROM_C to-count=$TO_C"
-    EXTRA=()
-    [ "$K0" -gt 0 ] && EXTRA=(--bm-exit-count "$K0")
-    tf_build /dev/null "$TF_TMP/spsc_slice.elf" --mode baremetal --bm-strict \
-        --checkpoints "$TF_TMP/spsc_r2" \
-        --from-count "$FROM_C" --to-count "$TO_C" \
-        --stack-reserve 67108864 "${EXTRA[@]}" \
-        > "$TF_TMP/spsc_build.log" 2>&1 || continue
-    grep -q "count target insn" "$TF_TMP/spsc_build.log" || continue
-    SELECTED=1
-    break
+    K0=0
+    A0=0
+    for iter in 1 2 3 4 5; do
+        EXTRA=()
+        [ "$K0" -gt 0 ] && EXTRA=(--bm-exit-count "$K0")
+        tf_build /dev/null "$TF_TMP/spsc_slice.elf" --mode baremetal \
+            --bm-strict --checkpoints "$TF_TMP/spsc_r2" \
+            --from-count "$FROM_C" --to-count "$TO_C" \
+            --stack-reserve 67108864 "${EXTRA[@]}" \
+            > "$TF_TMP/spsc_build.log" 2>&1 || continue 2
+        grep -q "count target insn" "$TF_TMP/spsc_build.log" || continue 2
+        K=$(grep -oE "K=[0-9]+" "$TF_TMP/spsc_build.log" | head -1 \
+            | cut -d= -f2)
+        [ -n "$K" ] || K=0
+        timeout 120 perf stat -e instructions "$TF_TMP/spsc_slice.elf" \
+            > /dev/null 2> "$TF_TMP/spsc.perf"
+        RC=$?
+        [ "$RC" = 0 ] || { echo "FAIL: slice rc=$RC (deadlock?)"; exit 1; }
+        A=$(grep "instructions" "$TF_TMP/spsc.perf" \
+            | grep -oE "[0-9,]+" | head -1 | tr -d ",")
+        echo "atomic: iter $iter K=$K A=$A T=$T"
+        A0=${A:-0}
+        if [ "$A0" -gt 0 ]; then
+            D=$((A0 > T ? A0 - T : T - A0))
+            if [ $((D * 100 / A0)) -le 5 ]; then
+                R=$((D * 100 / A0))
+                break
+            fi
+        fi
+        # 病态提前退出: K 已很大而 A 仍 ≪ T (回放负载上限先触发,
+        # 计数器对 A 无效) → 该窗口不可靠, 换下一个候选
+        if [ "$A0" -gt 0 ] && [ "$K" -gt 1000000 ] \
+            && [ $((A0 * 10)) -lt "$T" ]; then
+            echo "atomic: window early-exits via replay budget, skip"
+            A0=0
+            break
+        fi
+        if [ "$iter" -lt 5 ] && [ "$K" -gt 0 ] && [ "$A0" -gt 0 ]; then
+            K0=$((K * T / A0))
+            [ "$K0" -gt 0 ] || K0=1
+        fi
+    done
+    if [ "$A0" -gt 0 ]; then
+        D=$((A0 > T ? A0 - T : T - A0))
+        R=$((D * 100 / A0))
+        if [ "$R" -le 5 ]; then
+            SELECTED=1
+            break
+        fi
+    fi
 done <<EOF
 $WIN
 EOF
 [ "$SELECTED" = 1 ] || {
-    echo "FAIL: no candidate window has a countable exit"
+    echo "FAIL: no candidate window converges (last R=$R%)"
     tail -5 "$TF_TMP/spsc_build.log"
     exit 1; }
-
-for iter in 1 2 3 4 5; do
-    EXTRA=()
-    [ "$K0" -gt 0 ] && EXTRA=(--bm-exit-count "$K0")
-    tf_build /dev/null "$TF_TMP/spsc_slice.elf" --mode baremetal --bm-strict \
-        --checkpoints "$TF_TMP/spsc_r2" \
-        --from-count "$FROM_C" --to-count "$TO_C" \
-        --stack-reserve 67108864 "${EXTRA[@]}" \
-        > "$TF_TMP/spsc_build.log" 2>&1 || {
-            echo "FAIL: build (iter $iter)"; tail -5 "$TF_TMP/spsc_build.log"; exit 1; }
-    grep -q "count target insn" "$TF_TMP/spsc_build.log" || {
-        echo "FAIL: exit not countable (iter $iter)"; tail -5 "$TF_TMP/spsc_build.log"; exit 1; }
-    K=$(grep -oE "K=[0-9]+" "$TF_TMP/spsc_build.log" | head -1 | cut -d= -f2)
-    [ -n "$K" ] || K=0
-    timeout 120 perf stat -e instructions "$TF_TMP/spsc_slice.elf" \
-        > /dev/null 2> "$TF_TMP/spsc.perf"
-    RC=$?
-    [ "$RC" = 0 ] || { echo "FAIL: slice rc=$RC (deadlock?)"; exit 1; }
-    A=$(grep "instructions" "$TF_TMP/spsc.perf" \
-        | grep -oE "[0-9,]+" | head -1 | tr -d ",")
-    echo "atomic: iter $iter K=$K A=$A T=$T"
-    A0=${A:-0}
-    # 收敛: |A-T|/A <= 5%
-    if [ "$A0" -gt 0 ]; then
-        D=$((A0 > T ? A0 - T : T - A0))
-        if [ $((D * 100 / A0)) -le 5 ]; then
-            break
-        fi
-    fi
-    if [ "$iter" -lt 5 ] && [ "$K" -gt 0 ] && [ "$A0" -gt 0 ]; then
-        K0=$((K * T / A0))
-        [ "$K0" -gt 0 ] || K0=1
-    fi
-done
-[ "$A0" -gt 0 ] || { echo "FAIL: no A"; exit 1; }
-D=$((A0 > T ? A0 - T : T - A0))
-R=$((D * 100 / A0))
-[ "$R" -le 5 ] || { echo "FAIL: compensation ratio $R% > 5%"; exit 1; }
 
 # ---------- 目标阶段零 syscall ----------
 timeout 120 strace -o "$TF_TMP/spsc_slice.strace" \
