@@ -1720,8 +1720,27 @@ static void apply_diff(struct collect_snapshot *sn, const char *path)
                 break;
             }
         }
-        if (si == (size_t)-1)
+        if (si == (size_t)-1) {
+            /* dirty 页未被现有段覆盖 (brk 扩展等新映射在检查点 diff 里
+               录为 dirty 而非 newseg): 补为新段, 否则合成快照缺页 →
+               中间窗口切片 malloc 返回垃圾指针 (alloc mid rc=139)。 */
+            sn->segs = xrealloc(sn->segs,
+                                (sn->nsegs + 1) * sizeof(struct cseg));
+            sn->payload_offs = xrealloc(sn->payload_offs,
+                                        (sn->nsegs + 1) *
+                                        sizeof(uint64_t));
+            struct cseg *c = &sn->segs[sn->nsegs];
+            memset(c, 0, sizeof(*c));
+            c->vaddr = vaddr & ~0xfffULL;
+            c->filesz = 4096;
+            c->memsz = 4096;
+            c->flags = PF_R | PF_W | PF_X;
+            c->name = NULL;
+            sn->payload_offs[sn->nsegs] = sn->payload.size;
+            sn->nsegs++;
+            cbuf_append(&sn->payload, data, 4096);
             continue;
+        }
         uint64_t rel = vaddr - sn->segs[si].vaddr;
         size_t avail = sn->segs[si].filesz > rel
                            ? sn->segs[si].filesz - rel : 0;
