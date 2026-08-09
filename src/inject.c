@@ -618,6 +618,7 @@ int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
         struct user_regs_struct r = *regs, saved = *regs;
         struct iovec io = {.iov_base = &r, .iov_len = sizeof(r)};
         int ok = -1;
+        int stopped_ok = 0;
         r.pc = page;
         if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io) == 0 &&
             ptrace(PTRACE_CONT, pid, 0, 0) == 0) {
@@ -641,6 +642,7 @@ int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
                     waitpid(pid, &st, 0);
                 }
                 if (WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP) {
+                    stopped_ok = 1;
                     struct user_regs_struct r2;
                     struct iovec io2 = {.iov_base = &r2,
                                         .iov_len = sizeof(r2)};
@@ -671,6 +673,13 @@ int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
         for (size_t i = 0; i < nwords; i++)
             ptrace(PTRACE_POKEDATA, pid, page + i * 8, backup[i]);
         free(backup);
+        /* 恢复后刷新目标 I-cache: 片段执行时该页 I-cache 行已被注入
+           指令填充, 只恢复数据不失效缓存, 目标随后执行该页会跑注入
+           垃圾 → condvar Run1 目标 SIGSEGV。flush 片段自身写同一页
+           并执行 ic ivau, 执行后恢复页字节。必须在恢复其他线程前做
+           (其他线程可能正在执行该代码页)。 */
+        if (stopped_ok)
+            inject_flush_icache(pid, &saved, page, ninsn * 4);
         /* 恢复其他线程 */
         if (td) {
             DIR *td2 = opendir(task);

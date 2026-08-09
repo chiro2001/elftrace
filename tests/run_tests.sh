@@ -29,6 +29,20 @@ TESTS="strict atomic_spin atomic_tramp atomic_boundary basic dbg fd ipc cpp fd_r
 PASS=0
 FAIL=0
 
+# 环境清理: 残留孤儿进程会拖慢/干扰测试 (曾发现 6 小时 100% CPU 的
+# /tmp/vr_*.elf 和失败测试残留的 http.server/tracer, 导致 HTTP Run1
+# 负载请求超时 flake)。pgrep -f 锚定 cmdline 开头, 避免匹配本脚本。
+for p in $(pgrep -f '^/tmp/vr_.*\.elf$' 2>/dev/null); do
+    kill -9 "$p" 2>/dev/null
+done
+for p in $(pgrep -x http.server 2>/dev/null); do
+    kill -9 "$p" 2>/dev/null
+done
+for p in $(pgrep -f '/build/elftrace trace ' 2>/dev/null); do
+    kill -9 "$p" 2>/dev/null
+done
+sleep 0.3
+
 # 清理残留测试进程 (避免干扰)
 for p in prog_simple prog_fd prog_fd_rw prog_cpp python3 prog_syscall prog_stack prog_bigmem prog_thread prog_append prog_bareheap prog_bm_imm prog_bm_loopread prog_crc32 prog_lz prog_json prog_sha256 prog_alloc prog_sockpair prog_dir prog_ioctl prog_calib prog_spsc_spin prog_atomic_boundary; do
     pgrep -x "$p" | xargs -r kill -9 2>/dev/null
