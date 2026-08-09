@@ -939,33 +939,46 @@ tls_snippet:
 /* memset_zero(dst=x0, len=x1, byte=x2) — 破坏 x0-x3 */
 memset_zero:
     mov  x3, x0
-    cbz  x1, 2f
+    cbz  x1, 5f
+    cbnz w2, 6f                 /* 非零填充: 字节循环 */
+    lsr  x4, x1, #5
+    cbz  x4, 3f
 1:
-    strb w2, [x3], #1
-    subs x1, x1, #1
+    stp  xzr, xzr, [x3], #32
+    subs x4, x4, #1
     bne  1b
-2:
+3:
+    and  x4, x1, #31
+    cbz  x4, 5f
+    b    4b
+6:
+    mov  x4, x1
+4:
+    strb w2, [x3], #1
+    subs x4, x4, #1
+    bne  4b
+5:
     ret
 
 /* memcpy_bytes(dst=x0, src=x1, len=x2) — 破坏 x0-x4 */
 memcpy_bytes:
-    cbz  x2, 3f
-    lsr  x3, x2, #4
-    cbz  x3, 5f
+    cbz  x2, 5f
+    lsr  x3, x2, #5
+    cbz  x3, 3f
 4:
-    ldp  x4, x5, [x1], #16
-    stp  x4, x5, [x0], #16
+    ldp  q0, q1, [x1], #32
+    stp  q0, q1, [x0], #32
     subs x3, x3, #1
     bne  4b
-5:
-    and  x3, x2, #0xf
-    cbz  x3, 3f
+3:
+    and  x3, x2, #31
+    cbz  x3, 5f
 6:
     ldrb w4, [x1], #1
     strb w4, [x0], #1
     subs x3, x3, #1
     bne  6b
-3:
+5:
     ret
 
 /* probe_dump(x20=src_abs, x21=len, x24=blob_base)
@@ -983,7 +996,7 @@ probe_dump:
     add  x0, x0, #16              /* dst = buf + 16 */
     mov  x1, x20                  /* src */
     mov  x2, x21
-    bl   memcpy_bytes
+    bl   copy_blob                /* x-reg 拷贝, 不碰 NEON */
     ldr  x1, [x24, #RST_DESC_PROBE_BUF_SIZE]
     add  x1, x1, x21
     str  x1, [x24, #RST_DESC_PROBE_BUF_SIZE]
@@ -1438,7 +1451,7 @@ comp_newseg_loop:
     mov  x0, x20
     mov  x1, x22
     mov  x2, x21
-    bl   memcpy_bytes
+    bl   copy_blob                /* 目标阶段: 不碰 NEON */
     add  x19, x19, #32
     add  x19, x19, x21
     sub  x18, x18, #1
@@ -1454,7 +1467,7 @@ comp_dirty_loop:
     mov  x0, x20
     mov  x1, x21
     mov  x2, #4096
-    bl   memcpy_bytes
+    bl   copy_blob
     add  x19, x19, #4096
     add  x19, x19, #8
     sub  x18, x18, #1
@@ -1474,7 +1487,7 @@ comp_probe_ns_loop:
     mov  x0, x20
     mov  x1, x22
     mov  x2, x21
-    bl   memcpy_bytes
+    bl   copy_blob
     add  x19, x19, #32
     add  x19, x19, x21
     sub  x18, x18, #1
@@ -1492,7 +1505,7 @@ comp_probe_d_loop:
     mov  x0, x20
     mov  x1, x22
     mov  x2, x21
-    bl   memcpy_bytes
+    bl   copy_blob
     add  x19, x19, #4096
     add  x19, x19, #8
     sub  x18, x18, #1
@@ -1658,7 +1671,7 @@ mock_ns_loop:
     mov  x0, x20
     mov  x1, x22
     mov  x2, x21
-    bl   memcpy_bytes
+    bl   copy_blob                /* 目标阶段: 不碰 NEON */
     add  x19, x19, #32
     add  x19, x19, x21
     sub  x18, x18, #1
@@ -1674,7 +1687,7 @@ mock_dirty_loop:
     mov  x0, x20
     mov  x1, x21
     mov  x2, #4096
-    bl   memcpy_bytes
+    bl   copy_blob
     add  x19, x19, #4096
     add  x19, x19, #8
     sub  x18, x18, #1
