@@ -454,73 +454,114 @@ static unsigned long find_stage1_page_a64(pid_t pid, unsigned long pc,
 
 /* 在 scratch 页执行 dc cvau / ic ivau 片段, 刷新 [page, page+len) 的
  * I-cache。执行后恢复页原始字节 (该范围已被 ic ivau 失效, 目标下次
- * 执行会重新取指)。 */
+ * 执行会重新取指)。
+ *
+ * 关键: 片段不能写在被刷的同一页 —— 该页 I-cache 若已是旧片段字节
+ * (例如 mmap 注入刚执行过), 写入新片段后取指仍得到旧指令, flush
+ * 不会真正执行, 页面保持陈旧 → 目标稍后执行该页即 SIGSEGV
+ * (condvar 崩溃链)。因此用另一块冷页承载片段, 并同时失效两页。
+ * 若找不到其他页, 回退到同页 (旧行为, 至少覆盖缓存干净的情形)。 */
 void inject_flush_icache(pid_t pid,
                          const struct user_regs_struct *regs,
                          unsigned long page, size_t len)
 {
-    uint32_t code[32];
+    unsigned long host = page;
+    for (int sk = 0; sk < 8; sk++) {
+        unsigned long q = find_stage1_page_a64(pid, REG_PC(*regs), sk);
+        if (q && (q & ~0xfffUL) != (page & ~0xfffUL)) {
+            host = q;
+            break;
+        }
+    }
+    uint32_t code[48];
     size_t n = 0;
-    uint64_t start = page, end = page + len;
-    uint64_t v = start;
-    code[n++] = 0xD2800000U | ((uint32_t)(v & 0xffff) << 5) | 16U;
-    if (v & 0xFFFF0000ULL)
-        code[n++] = 0xF2800000U | (1U << 21) |
-                    ((uint32_t)((v >> 16) & 0xffff) << 5) | 16U;
-    if (v & 0xFFFFFFFF0000ULL)
-        code[n++] = 0xF2800000U | (2U << 21) |
-                    ((uint32_t)((v >> 32) & 0xffff) << 5) | 16U;
-    if (v & 0xFFFFFFFFFFFF0000ULL)
-        code[n++] = 0xF2800000U | (3U << 21) |
-                    ((uint32_t)((v >> 48) & 0xffff) << 5) | 16U;
-    v = end;
-    code[n++] = 0xD2800000U | ((uint32_t)(v & 0xffff) << 5) | 17U;
-    if (v & 0xFFFF0000ULL)
-        code[n++] = 0xF2800000U | (1U << 21) |
-                    ((uint32_t)((v >> 16) & 0xffff) << 5) | 17U;
-    if (v & 0xFFFFFFFF0000ULL)
-        code[n++] = 0xF2800000U | (2U << 21) |
-                    ((uint32_t)((v >> 32) & 0xffff) << 5) | 17U;
-    if (v & 0xFFFFFFFFFFFF0000ULL)
-        code[n++] = 0xF2800000U | (3U << 21) |
-                    ((uint32_t)((v >> 48) & 0xffff) << 5) | 17U;
-    code[n++] = 0xD50B7B30U;             /* dc cvau, x16 */
-    code[n++] = 0xD50B7530U;             /* ic ivau, x16 */
-    code[n++] = 0x91010210U;             /* add x16, x16, #64 */
-    code[n++] = 0xEB11021F;              /* cmp x16, x17 */
-    code[n++] = 0x54FFFF83U;             /* b.lo loop (imm19=-4) */
+    uint64_t p0 = page & ~0xfffUL;
+    uint64_t h0 = host & ~0xfffUL;
+    uint64_t ranges[2][2] = {{p0, p0 + 4096}, {h0, h0 + 4096}};
+    for (int rr = 0; rr < 2; rr++) {
+        uint64_t v = ranges[rr][0];
+        code[n++] = 0xD2800000U |
+                    ((uint32_t)(v & 0xffff) << 5) | 16U;
+        if (v & 0xFFFF0000ULL)
+            code[n++] = 0xF2800000U | (1U << 21) |
+                        ((uint32_t)((v >> 16) & 0xffff) << 5) | 16U;
+        if (v & 0xFFFFFFFF0000ULL)
+            code[n++] = 0xF2800000U | (2U << 21) |
+                        ((uint32_t)((v >> 32) & 0xffff) << 5) | 16U;
+        if (v & 0xFFFFFFFFFFFF0000ULL)
+            code[n++] = 0xF2800000U | (3U << 21) |
+                        ((uint32_t)((v >> 48) & 0xffff) << 5) | 16U;
+        v = ranges[rr][1];
+        code[n++] = 0xD2800000U |
+                    ((uint32_t)(v & 0xffff) << 5) | 17U;
+        if (v & 0xFFFF0000ULL)
+            code[n++] = 0xF2800000U | (1U << 21) |
+                        ((uint32_t)((v >> 16) & 0xffff) << 5) | 17U;
+        if (v & 0xFFFFFFFF0000ULL)
+            code[n++] = 0xF2800000U | (2U << 21) |
+                        ((uint32_t)((v >> 32) & 0xffff) << 5) | 17U;
+        if (v & 0xFFFFFFFFFFFF0000ULL)
+            code[n++] = 0xF2800000U | (3U << 21) |
+                        ((uint32_t)((v >> 48) & 0xffff) << 5) | 17U;
+        code[n++] = 0xD50B7B30U;         /* dc cvau, x16 */
+        code[n++] = 0xD50B7530U;         /* ic ivau, x16 */
+        code[n++] = 0x91010210U;         /* add x16, x16, #64 */
+        code[n++] = 0xEB11021F;          /* cmp x16, x17 */
+        code[n++] = 0x54FFFF83U;         /* b.lo loop (imm19=-4) */
+    }
     code[n++] = 0xD5033B9FU;             /* dsb ish */
     code[n++] = 0xD5033FDFU;             /* isb */
     code[n++] = 0xD4200000U;             /* brk #0 */
-    /* 备份片段覆盖区 → 写片段 → 执行 → 恢复 */
+    /* 备份片段覆盖区 → 写片段到 host → 执行 → 恢复 */
     size_t nwords = (n * 4 + 7) / 8;
     unsigned long *backup = xmalloc(nwords * sizeof(*backup));
     for (size_t i = 0; i < nwords; i++)
-        backup[i] = ptrace(PTRACE_PEEKDATA, pid, page + i * 8, 0);
+        backup[i] = ptrace(PTRACE_PEEKDATA, pid, host + i * 8, 0);
     for (size_t i = 0; i < n; i += 2) {
         unsigned long w = 0;
         size_t m = n - i;
         memcpy(&w, code + i, m >= 2 ? 8 : 4);
-        ptrace(PTRACE_POKEDATA, pid, page + i, w);
+        ptrace(PTRACE_POKEDATA, pid, host + i, w);
     }
     struct user_regs_struct r = *regs;
     struct iovec io = {.iov_base = &r, .iov_len = sizeof(r)};
     int st;
-    r.pc = page;
+    r.pc = host;
     if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io) == 0 &&
         ptrace(PTRACE_CONT, pid, 0, 0) == 0) {
-        if (waitpid(pid, &st, 0) > 0 && WIFSTOPPED(st)) {
-            if (WSTOPSIG(st) == SIGSTOP) {
-                ptrace(PTRACE_CONT, pid, 0, SIGCONT);
-                waitpid(pid, &st, 0);
+        /* 带超时: host 缓存万一也是旧的 (罕见), 不能永久阻塞 */
+        int got = 0;
+        for (int w = 0; w < 4000; w++) {
+            pid_t wr = waitpid(pid, &st, WNOHANG);
+            if (wr == pid) {
+                got = 1;
+                break;
             }
+            if (wr < 0)
+                break;
+            usleep(500);
+        }
+        if (!got) {
+            ptrace(PTRACE_INTERRUPT, pid, 0, 0);
+            for (int w = 0; w < 4000; w++) {
+                pid_t wr = waitpid(pid, &st, WNOHANG);
+                if (wr == pid)
+                    break;
+                if (wr < 0)
+                    break;
+                usleep(500);
+            }
+        }
+        if (got && WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP) {
+            ptrace(PTRACE_CONT, pid, 0, SIGCONT);
+            waitpid(pid, &st, 0);
         }
     }
     struct iovec io_orig = {.iov_base = (void *)regs,
                             .iov_len = sizeof(*regs)};
     ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io_orig);
     for (size_t i = 0; i < nwords; i++)
-        ptrace(PTRACE_POKEDATA, pid, page + i * 8, backup[i]);
+        ptrace(PTRACE_POKEDATA, pid, host + i * 8, backup[i]);
     free(backup);
 }
 
@@ -635,11 +676,56 @@ int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
                     break;
                 usleep(500);
             }
+            if (!got) {
+                /* 片段跑飞 (I-cache 旧行执行垃圾, 未到 brk): 必须先
+                   停住目标再恢复页字节, 否则 POKEDATA 无效且目标带着
+                   损坏状态继续跑 → condvar 目标稍后 SIGSEGV。 */
+                ptrace(PTRACE_INTERRUPT, pid, 0, 0);
+                for (int w = 0; w < 4000; w++) {
+                    pid_t wr = waitpid(pid, &st, WNOHANG);
+                    if (wr == pid) {
+                        got = 1;
+                        stopped_ok = 1;   /* INTERRUPT 停住: 可安全
+                                             恢复 + flush */
+                        break;
+                    }
+                    if (wr < 0)
+                        break;
+                    usleep(500);
+                }
+            }
             if (got && WIFSTOPPED(st)) {
                 if (WSTOPSIG(st) == SIGSTOP) {
                     /* 组停 (SIGSTOP): CONT 后先停在组停, SIGCONT 放行 */
                     ptrace(PTRACE_CONT, pid, 0, SIGCONT);
-                    waitpid(pid, &st, 0);
+                    int g2 = 0;
+                    for (int w = 0; w < 4000; w++) {
+                        pid_t wr = waitpid(pid, &st, WNOHANG);
+                        if (wr == pid) {
+                            g2 = 1;
+                            break;
+                        }
+                        if (wr < 0)
+                            break;
+                        usleep(500);
+                    }
+                    if (!g2) {
+                        /* SIGCONT 后仍跑飞: 停住再恢复 */
+                        ptrace(PTRACE_INTERRUPT, pid, 0, 0);
+                        for (int w = 0; w < 4000; w++) {
+                            pid_t wr = waitpid(pid, &st, WNOHANG);
+                            if (wr == pid) {
+                                g2 = 1;
+                                break;
+                            }
+                            if (wr < 0)
+                                break;
+                            usleep(500);
+                        }
+                    }
+                    if (g2 && WIFSTOPPED(st) &&
+                        (WSTOPSIG(st) & ~0x80U) == SIGTRAP)
+                        stopped_ok = 1;
                 }
                 if (WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP) {
                     stopped_ok = 1;
