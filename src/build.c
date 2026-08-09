@@ -1052,6 +1052,31 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                            PF_R | PF_W | PF_X);
         }
     }
+    /* 3a. 预映射 dirty 页: brk 扩展等新映射在录制里表现为 dirty 页
+       (不是 newseg), 切片 loader 不预建的话回放写入未映射内存 →
+       SIGSEGV (alloc 负载)。用录制页内容作文件数据直接映射:
+       回放再写幂等, 且全新页没有"切片活对象图"可保护, 不能走指针
+       过滤 (会把 malloc 元数据/链表指针当地址跳过)。 */
+    for (size_t k = 0; k < nrecs; k++) {
+        const uint8_t *dp = recs[k].dirty.data;
+        for (uint64_t j = 0; j < recs[k].n_dirty; j++) {
+            uint64_t vv;
+            memcpy(&vv, dp, 8);
+            dp += 8;
+            if (!range_covered(segs, nsegs, pl, npl, vv, 4096)) {
+                size_t idx = npl;
+                spload_add(&pl, &npl, &pl_cap, vv, 4096,
+                           PF_R | PF_W | PF_X);
+                pl[idx].filesz = 4096;
+                /* 拷贝稳定副本: recs 的 dirty 缓冲在回放表发射后被
+                   free, 指向它们会在 ELF 组装段时悬垂 (SIGSEGV)。 */
+                uint8_t *pg = xmalloc(4096);
+                memcpy(pg, dp, 4096);
+                pl[idx].data = pg;
+            }
+            dp += 4096;
+        }
+    }
 
     /* 4. 栈预留 (零填充, 在 [stack] 下方; 只取空闲区间, 避免与
        libc 等已有段重叠 — 预留过大时内核会先映射预留再被段覆盖,
