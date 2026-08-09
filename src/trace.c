@@ -794,6 +794,59 @@ main_done:
     if (tc.atomic)
         atomic_trace_finish(tc.atomic);
 #endif
+    /* 诊断: 保持 ptrace 观察目标在 finish 后的运行, 捕获崩溃 PC
+       (注入恢复是否完整的关键证据)。设 ELFTRACE_DEBUG_FAULT=1 启用。 */
+    if (getenv("ELFTRACE_DEBUG_FAULT")) {
+        ptrace(PTRACE_SYSCALL, pid, 0, 0);
+        for (;;) {
+            int wst;
+            pid_t wr = waitpid(pid, &wst, 0);
+            if (wr != pid)
+                break;
+            if (WIFEXITED(wst) || WIFSIGNALED(wst)) {
+#if defined(__aarch64__)
+                struct user_regs_struct rr;
+                struct iovec io = {.iov_base = &rr,
+                                   .iov_len = sizeof(rr)};
+                if (WIFSIGNALED(wst) &&
+                    ptrace(PTRACE_GETREGSET, pid,
+                           (void *)NT_PRSTATUS, &io) == 0)
+                    fprintf(stderr,
+                            "trace: post-finish target signal %d "
+                            "pc %#llx x0 %#llx x30 %#llx sp %#llx\n",
+                            WTERMSIG(wst),
+                            (unsigned long long)rr.pc,
+                            (unsigned long long)rr.regs[0],
+                            (unsigned long long)rr.regs[30],
+                            (unsigned long long)rr.sp);
+                else if (WIFSIGNALED(wst))
+                    fprintf(stderr, "trace: post-finish target signal %d\n",
+                            WTERMSIG(wst));
+#endif
+                break;
+            }
+            if (WIFSTOPPED(wst)) {
+                int si = WSTOPSIG(wst);
+#if defined(__aarch64__)
+                if (si == SIGSEGV || si == SIGBUS || si == SIGILL) {
+                    struct user_regs_struct rr;
+                    struct iovec io = {.iov_base = &rr,
+                                       .iov_len = sizeof(rr)};
+                    if (ptrace(PTRACE_GETREGSET, pid,
+                               (void *)NT_PRSTATUS, &io) == 0)
+                        fprintf(stderr,
+                                "trace: post-finish fault signal %d "
+                                "pc %#llx x0 %#llx x30 %#llx sp %#llx\n",
+                                si, (unsigned long long)rr.pc,
+                                (unsigned long long)rr.regs[0],
+                                (unsigned long long)rr.regs[30],
+                                (unsigned long long)rr.sp);
+                }
+#endif
+                ptrace(PTRACE_SYSCALL, pid, 0, si);
+            }
+        }
+    }
     if (kill(pid, 0) == 0)
         collect_detach_run(pid);   /* 目标已退出则无需 detach */
     close(tc.perf_fd);

@@ -451,9 +451,9 @@ static unsigned long find_stage1_page_a64(pid_t pid, unsigned long pc)
 /* 在 scratch 页执行 dc cvau / ic ivau 片段, 刷新 [page, page+len) 的
  * I-cache。执行后恢复页原始字节 (该范围已被 ic ivau 失效, 目标下次
  * 执行会重新取指)。 */
-static void inject_flush_icache(pid_t pid,
-                                const struct user_regs_struct *regs,
-                                unsigned long page, size_t len)
+void inject_flush_icache(pid_t pid,
+                         const struct user_regs_struct *regs,
+                         unsigned long page, size_t len)
 {
     uint32_t code[32];
     size_t n = 0;
@@ -484,7 +484,7 @@ static void inject_flush_icache(pid_t pid,
     code[n++] = 0xD50B7530U;             /* ic ivau, x16 */
     code[n++] = 0x91010210U;             /* add x16, x16, #64 */
     code[n++] = 0xEB11021F;              /* cmp x16, x17 */
-    code[n++] = 0x54FFFFF83U;            /* b.lo loop (imm19=-4) */
+    code[n++] = 0x54FFFF83U;             /* b.lo loop (imm19=-4) */
     code[n++] = 0xD5033B9FU;             /* dsb ish */
     code[n++] = 0xD5033FDFU;             /* isb */
     code[n++] = 0xD4200000U;             /* brk #0 */

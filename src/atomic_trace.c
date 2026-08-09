@@ -18,6 +18,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+
+extern void inject_flush_icache(pid_t pid,
+                                const struct user_regs_struct *regs,
+                                unsigned long page, size_t len);
 #include <errno.h>
 #include <signal.h>
 #include <sys/ptrace.h>
@@ -935,7 +939,18 @@ int atomic_trace_finish(struct atomic_trace_ctx *ctx)
             break;
         }
         int st;
-        if (waitpid(pid, &st, 0) < 0 || !WIFSTOPPED(st))
+        int got = 0;
+        for (int w = 0; w < 200; w++) {
+            pid_t wr = waitpid(pid, &st, WNOHANG);
+            if (wr == pid) {
+                got = 1;
+                break;
+            }
+            if (wr < 0)
+                break;
+            usleep(5000);
+        }
+        if (!got || !WIFSTOPPED(st))
             break;
         if (WSTOPSIG(st) == (SIGTRAP | 0x80)) {
             ptrace(PTRACE_SYSCALL, pid, 0, 0);
@@ -961,6 +976,21 @@ int atomic_trace_finish(struct atomic_trace_ctx *ctx)
         if (ctx->sites[i].page)
             tmem_rw(pid, 1, ctx->sites[i].pc,
                     &ctx->sites[i].orig_insn, 4);
+    }
+    /* 刷新站点范围的 I-cache: 只恢复数据不失效缓存, 目标会继续执行
+       缓存的跳转指令 (跳到已恢复/已解映射的跳板) → SIGSEGV。 */
+    {
+        uint64_t lo = ~0ULL, hi = 0;
+        for (size_t i = 0; i < ctx->n_sites; i++) {
+            uint64_t pc = ctx->sites[i].pc;
+            if (pc < lo)
+                lo = pc;
+            if (pc > hi)
+                hi = pc;
+        }
+        if (hi >= lo)
+            inject_flush_icache(pid, &ctx->regs, lo & ~0x3fULL,
+                                (size_t)(hi - lo) + 0x80);
     }
     /* 解除缓冲区 (记录页保留: 其他线程可能正在执行, 解映射会崩) */
     {
