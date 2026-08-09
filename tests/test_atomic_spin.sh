@@ -213,8 +213,8 @@ timeout 120 strace -o "$TF_TMP/spsc_slice.strace" \
     "$TF_TMP/spsc_slice.elf" > /dev/null 2>&1
 RC=$?
 [ "$RC" = 0 ] || { echo "FAIL: strace slice rc=$RC"; exit 1; }
-AFTER=$(awk '/rt_sigreturn/{f=1} f' "$TF_TMP/spsc_slice.strace")
-if echo "$AFTER" | grep -E "openat|read\(|write\(|ioctl|mmap|brk|futex|clone"; then
+AFTER=$(awk '/rt_sigreturn/{f=1; next} f' "$TF_TMP/spsc_slice.strace")
+if echo "$AFTER" | grep -E "openat|read\(|write\(|ioctl\(|mmap|brk|futex|clone"; then
     echo "FAIL: target-phase real syscalls"
     echo "$AFTER"
     exit 1

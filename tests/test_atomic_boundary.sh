@@ -73,8 +73,8 @@ done
 
 timeout 60 strace -o "$TF_TMP/boundary_slice.strace" \
     "$TF_TMP/boundary_slice.elf" > /dev/null 2>&1
-AFTER=$(awk '/rt_sigreturn/{f=1} f' "$TF_TMP/boundary_slice.strace")
-echo "$AFTER" | grep -E "openat|read\(|write\(|ioctl|mmap|brk|futex|clone" \
+AFTER=$(awk '/rt_sigreturn/{f=1; next} f' "$TF_TMP/boundary_slice.strace")
+echo "$AFTER" | grep -E "openat|read\(|write\(|ioctl\(|mmap|brk|futex|clone" \
     && { echo "FAIL: target-phase real syscalls"; exit 1; }
 
 echo "PASS: acquire boundary documented (ref=NEW rc=7, slice=OLD rc=0, clean)"

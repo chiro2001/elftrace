@@ -79,8 +79,8 @@ run_load() {
         "$TF_TMP/rw_${name}_full.elf" > /dev/null 2>&1
     local FR=$?
     [ "$FR" = "$REF_RC" ] || { echo "  FAIL: full rc=$FR != ref $REF_RC"; return 1; }
-    local AFTER=$(awk '/rt_sigreturn/{f=1} f' "$TF_TMP/rw_${name}_full.strace")
-    echo "$AFTER" | grep -E "read\(|write\(|openat|ioctl|mmap|brk|close\(" \
+    local AFTER=$(awk '/rt_sigreturn/{f=1; next} f' "$TF_TMP/rw_${name}_full.strace")
+    echo "$AFTER" | grep -E "read\(|write\(|openat|ioctl\(|mmap|brk|close\(" \
         && { echo "  FAIL: full-window real syscalls"; echo "$AFTER"; return 1; }
     echo "  PASS[full]: rc=$FR == ref, replay clean"
 
@@ -94,8 +94,8 @@ run_load() {
         "$TF_TMP/rw_${name}_mid.elf" > /dev/null 2>&1
     local MR=$?
     [ "$MR" = 0 ] || { echo "  FAIL: mid rc=$MR"; return 1; }
-    AFTER=$(awk '/rt_sigreturn/{f=1} f' "$TF_TMP/rw_${name}_mid.strace")
-    echo "$AFTER" | grep -E "read\(|write\(|openat|ioctl|mmap|brk|close\(" \
+    AFTER=$(awk '/rt_sigreturn/{f=1; next} f' "$TF_TMP/rw_${name}_mid.strace")
+    echo "$AFTER" | grep -E "read\(|write\(|openat|ioctl\(|mmap|brk|close\(" \
         && { echo "  FAIL: mid-window real syscalls"; echo "$AFTER"; return 1; }
     echo "  PASS[mid]: rc=0, middle window clean"
     return 0

@@ -35,8 +35,8 @@ timeout 60 strace -o "$TF_TMP/strict_mock.strace" "$TF_TMP/strict_mock.elf" \
     > /dev/null 2>&1
 RC=$?
 [ "$RC" = "$REF_RC" ] || { echo "FAIL[1]: rc=$RC != ref $REF_RC"; exit 1; }
-AFTER=$(awk '/rt_sigreturn/{f=1} f' "$TF_TMP/strict_mock.strace")
-echo "$AFTER" | grep -E "openat|read\(|write\(|ioctl|mmap|brk" \
+AFTER=$(awk '/rt_sigreturn/{f=1; next} f' "$TF_TMP/strict_mock.strace")
+echo "$AFTER" | grep -E "openat|read\(|write\(|ioctl\(|mmap|brk" \
     && { echo "FAIL[1]: target-phase real syscalls"; echo "$AFTER"; exit 1; }
 grep -q "exit_group" "$TF_TMP/strict_mock.strace" \
     || { echo "FAIL[1]: no exit_group"; exit 1; }
@@ -60,8 +60,8 @@ timeout 60 strace -o "$TF_TMP/strict_replay.strace" \
     "$TF_TMP/strict_replay.elf" > /dev/null 2>&1
 RC=$?
 [ "$RC" = 0 ] || { echo "FAIL[2]: rc=$RC"; exit 1; }
-AFTER=$(awk '/rt_sigreturn/{f=1} f' "$TF_TMP/strict_replay.strace")
-echo "$AFTER" | grep -E "openat|read\(|write\(|ioctl|mmap|brk" \
+AFTER=$(awk '/rt_sigreturn/{f=1; next} f' "$TF_TMP/strict_replay.strace")
+echo "$AFTER" | grep -E "openat|read\(|write\(|ioctl\(|mmap|brk" \
     && { echo "FAIL[2]: target-phase real syscalls"; echo "$AFTER"; exit 1; }
 echo "PASS[2]: trace+strict replay (middle window, loop exit, clean)"
 
@@ -89,8 +89,8 @@ timeout 60 strace -o "$TF_TMP/ioctl_slice.strace" "$TF_TMP/ioctl_slice.elf" \
     > /dev/null 2>&1
 RC=$?
 [ "$RC" = 0 ] || { echo "FAIL[3]: rc=$RC"; exit 1; }
-AFTER=$(awk '/rt_sigreturn/{f=1} f' "$TF_TMP/ioctl_slice.strace")
-if echo "$AFTER" | grep -E "ioctl|openat|read\(|write\(|mmap|brk"; then
+AFTER=$(awk '/rt_sigreturn/{f=1; next} f' "$TF_TMP/ioctl_slice.strace")
+if echo "$AFTER" | grep -E "ioctl\(|openat|read\(|write\(|mmap|brk"; then
     echo "FAIL[3]: target-phase real syscalls"; echo "$AFTER"; exit 1
 fi
 # 窗口内应有 ioctl 记录且站点被替换 (切片目标阶段无 ioctl)

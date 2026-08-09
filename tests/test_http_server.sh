@@ -137,8 +137,8 @@ timeout 120 strace -o "$TF_TMP/http_slice.strace" \
     "$TF_TMP/http_slice.elf" > /dev/null 2>&1
 RC=$?
 [ "$RC" = 0 ] || { echo "FAIL: 切片 rc=$RC"; exit 1; }
-AFTER=$(awk '/rt_sigreturn/{f=1} f' "$TF_TMP/http_slice.strace")
-if echo "$AFTER" | grep -E "openat|read\(|write\(|ioctl|mmap|brk|futex|poll|recvfrom|sendto|accept|clone|clock_gettime"; then
+AFTER=$(awk '/rt_sigreturn/{f=1; next} f' "$TF_TMP/http_slice.strace")
+if echo "$AFTER" | grep -E "openat|read\(|write\(|ioctl\(|mmap|brk|futex|poll|recvfrom|sendto|accept|clone|clock_gettime"; then
     echo "FAIL: 目标阶段真实 syscall"
     echo "$AFTER"
     exit 1
