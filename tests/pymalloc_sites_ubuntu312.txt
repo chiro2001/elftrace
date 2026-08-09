@@ -64,3 +64,7 @@
 # 陈旧值会让切片跳过 list 分配 → 分配序列整体前移一位)
 4d82a8 b9428020
 4d82b4 f860d833
+# _thread.lock.locked(): 读 futex 字 (普通 ldr, 非原子) — worker 结束
+# 释放锁后切片仍读陈旧值 → is_alive() 误判存活 → _Threads.reap() 多
+# 保留一个线程 → 多一次 GET_ITER → 分配序列前移一位 (HTTP 卡点)
+46292c b9401000

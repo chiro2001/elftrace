@@ -27,6 +27,7 @@
 #include "arch.h"
 
 static uint64_t blob_vaddr, blob_size;
+static uint64_t blob_file_off;
 static uint64_t strict_lo, strict_hi;   /* stub 回放引擎代码范围 */
 
 static int parse_elf(const char *path)
@@ -49,6 +50,7 @@ static int parse_elf(const char *path)
         if (ph.p_filesz > blob_size) {
             blob_vaddr = ph.p_vaddr;
             blob_size = ph.p_filesz;
+            blob_file_off = ph.p_offset;
         }
     }
     close(fd);
@@ -184,6 +186,52 @@ int main(int argc, char **argv)
     struct user_regs_struct regs;
     struct iovec io = {.iov_base = &regs, .iov_len = sizeof(regs)};
     do_ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &io);
+
+    /* 恢复期防护: 在目标入口 PC 放软断点, 恢复完成 (stub 跳到目标)
+       后再 mprotect, 避免恢复写对受保护页逐写逐故障 (极慢且可能
+       死锁)。入口 PC 存于 blob 描述符 RST_DESC_TARGET_RIP (+0x18)。 */
+    uint64_t target_rip = 0;
+    {
+        int fd = open(argv[1], O_RDONLY);
+        if (fd >= 0) {
+            uint8_t d[0x20];
+            if (pread(fd, d, sizeof(d),
+                      (off_t)(blob_file_off + 0x18)) == sizeof(d))
+                target_rip = *(uint64_t *)d;
+            close(fd);
+        }
+    }
+    if (target_rip) {
+        long saved = do_ptrace(PTRACE_PEEKDATA, pid, (void *)target_rip, 0);
+        do_ptrace(PTRACE_POKEDATA, pid, (void *)target_rip,
+                  (void *)(uintptr_t)0xD4200000ULL);   /* brk #0 */
+        do_ptrace(PTRACE_CONT, pid, 0, 0);
+        int st;
+        waitpid(pid, &st, 0);
+        int at_entry = 0;
+        if (WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP) {
+            struct user_regs_struct r2;
+            struct iovec io2 = {.iov_base = &r2, .iov_len = sizeof(r2)};
+            if (do_ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
+                          &io2) == 0 &&
+                REG_PC(r2) == target_rip)
+                at_entry = 1;
+        }
+        /* 无论如何先还原 brk (若未停在入口, 后续循环会放行到崩溃) */
+        do_ptrace(PTRACE_POKEDATA, pid, (void *)target_rip,
+                  (void *)saved);
+        if (at_entry) {
+            fprintf(stderr, "census: recovery done at %#llx, arming\n",
+                    (unsigned long long)target_rip);
+        } else {
+            uint64_t t = target_rip;
+            target_rip = 0;
+            fprintf(stderr, "census: target entry %#llx not reached, "
+                    "arming anyway\n", (unsigned long long)t);
+            /* 已还原 brk; 目标可能已崩, 由主循环处理 */
+        }
+    }
+
     for (size_t i = 0; i < npages; i++) {
         long mr = inject_syscall(pid, &regs, 226 /* mprotect */, pages[i],
                                  4096, 0 /* PROT_NONE */, 0);
@@ -219,9 +267,14 @@ int main(int argc, char **argv)
         else
             same_pc = 0;
         last_pc = pc;
-        /* 非普查页重复同 pc 故障 = 目标自身真实崩溃 (如 NULL deref):
-           放行会无限循环, 终止普查。 */
-        if (same_pc >= 3 && addr < 0x1000) {
+        /* 非普查页重复同 pc 故障 = 目标自身真实崩溃 (NULL deref /
+           代码访问等): 放行会无限循环, 终止普查。 */
+        unsigned long pg = addr & ~0xfffUL;
+        int in_list = 0;
+        for (size_t k = 0; k < npages; k++)
+            if (pages[k] == pg)
+                in_list = 1;
+        if (same_pc >= 3 && !in_list) {
             fprintf(stderr, "census: target crashed at pc %#lx "
                     "(addr %#lx), stop\n", pc, addr);
             break;
