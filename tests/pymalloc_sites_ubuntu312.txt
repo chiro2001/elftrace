@@ -68,3 +68,11 @@
 # 释放锁后切片仍读陈旧值 → is_alive() 误判存活 → _Threads.reap() 多
 # 保留一个线程 → 多一次 GET_ITER → 分配序列前移一位 (HTTP 卡点)
 46292c b9401000
+# LOAD_ATTR_INSTANCE_VALUE 的 values[ix] 值加载 (eval 区) — 读
+# Thread._is_stopped 等实例字典属性; worker 结束置 True 的存储若在
+# 边界间被改写, 切片读到陈旧 False → reap() 误判存活 → 分配序列
+# 前移一位 (HTTP 卡点)
+563500 f8637841
+563548 f8617801
+563598 f8627801
+563608 f8647861
