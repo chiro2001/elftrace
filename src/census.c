@@ -290,13 +290,11 @@ int main(int argc, char **argv)
         if (pi == npages)
             continue;               /* 非普查页: 直接重执行 */
         if (pc >= strict_lo && pc < strict_hi) {
-            /* 回放写: 解保护 + 单步重执行 + 重新保护 (保持页受保护,
-               之后的目标读仍会 fault 并记录) */
+            /* 回放写: 永久解保护 (不再单步/重保护)。引擎 diff 应用
+               的页面数量大, 逐写单步极慢; 目标对这些页的后续读不
+               再记录, 但我们关心的是非引擎写的 worker 共享页读。 */
             writes++;
             inject_syscall(pid, &regs, 226, page, 4096, 3 /* RW */, 0);
-            do_ptrace(PTRACE_SINGLESTEP, pid, 0, 0);
-            waitpid(pid, &st, 0);
-            inject_syscall(pid, &regs, 226, page, 4096, 0 /* NONE */, 0);
             continue;
         }
         if (!seen[pi]) {
