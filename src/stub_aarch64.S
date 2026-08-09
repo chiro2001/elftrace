@@ -1334,6 +1334,8 @@ mock_spin_cnt:
     .quad 0
 next_pending:
     .quad 0
+mock_last_pc:
+    .quad 0                 /* 上次 mock 站点 pc (同站点自旋判定) */
 mock_stack_lo:
     .quad 0                 /* spin-apply 栈保护区间 (0 = 关闭) */
 mock_stack_hi:
@@ -1812,6 +1814,18 @@ comp_mock:
     ldr  x2, [x17, #(24 + 8*8)]     /* 目标 x8 = syscall 号 */
     str  x2, [x5, #0x1010]          /* 调试: 记录最近 mock sysno */
     ldr  x21, [x17, #(24 + 0*8)]    /* 目标 x0 = futex uaddr (前瞻用) */
+    /* 同站点自旋判定: mock 站点变化 → 计数归零 */
+    adrp x5, mock_last_pc
+    add  x5, x5, :lo12:mock_last_pc
+    ldr  x8, [x5]
+    ldr  x9, [x17]
+    cmp  x8, x9
+    beq  1f
+    str  x9, [x5]
+    adrp x5, mock_spin_cnt
+    add  x5, x5, :lo12:mock_spin_cnt
+    str  wzr, [x5]
+1:
     /* mock 自旋检测 + 前瞻回放: 同一 mock 站点连续命中说明切片在
        等待循环里空转 (等 worker 写入, 如 GIL 释放、锁状态, 落在后续
        记录的边界 diff 里)。每次自旋把 next_pending 记录 (尚未被任何
@@ -1836,7 +1850,7 @@ comp_mock:
     ldr  x19, [x5]
     ldr  x18, [x16]                 /* n_recs */
     cmp  x19, x18
-    b.hs mock_dispatch
+    b.hs 1f                          /* 无更多记录 → 仍走看门狗阈值 */
     lsl  x0, x19, #4
     lsl  x1, x0, #2
     add  x0, x0, x1
@@ -1882,6 +1896,7 @@ mock_la_done:
     ldr  x19, [x5]
     add  x19, x19, #1
     str  x19, [x5]
+1:
     cmp  w3, #256
     b.lo mock_dispatch
     adrp x5, mock_spin_cnt
