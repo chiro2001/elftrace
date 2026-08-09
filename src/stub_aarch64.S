@@ -1394,7 +1394,7 @@ comp_scan:
     lsl  x1, x0, #2                 /* *64 */
     add  x0, x0, x1                 /* *80 */
     add  x0, x16, x0
-    add  x0, x0, #16                /* n_recs(8) + fmt(8) 之后 */
+    add  x0, x0, #24                /* 表头 24B 之后 */
     ldr  x20, [x0]                  /* rec.pc */
     cmp  x20, x2
     beq  comp_found
@@ -1475,13 +1475,17 @@ comp_dirty:
     movk x25, #(STUB_STRICT_COMP_OFF >> 16), lsl #16
     sub  x24, x24, x25              /* blob base */
     ldr  x25, [x24, #RST_DESC_STACK_VADDR]
+    ldr  x27, [x16, #16]            /* threaded: 指针过滤开关 */
     b    comp_dirty_loop
 comp_dirty_loop:
     cbz  x18, comp_done
     ldr  x20, [x19]                 /* dst */
     add  x21, x19, #8               /* src */
     /* 堆页 [0x100000000, stack_vaddr) 用指针保护应用,
-       其余 (BSS/rodata/栈/vdso) 保持整页拷贝 */
+       其余 (BSS/rodata/栈/vdso) 保持整页拷贝。仅多线程 trace
+       (threaded=1) 启用过滤: 单线程无并发分配分叉, 过滤会把静态
+       BSS 数据 (sock rcv 缓冲区 8B 图案) 误判为地址跳过 → 整页拷贝。 */
+    cbz  x27, comp_dirty_raw
     movz x8, #1, lsl #32
     cmp  x20, x8
     b.lo comp_dirty_raw
@@ -1526,6 +1530,7 @@ comp_probe_dirty:
     ldr  x19, [x23, #64]
     add  x19, x19, x16
     ldr  x25, [x24, #RST_DESC_STACK_VADDR]  /* x24 = blob base (probe) */
+    ldr  x27, [x16, #16]            /* threaded: 指针过滤开关 */
     b    comp_probe_d_loop
 comp_probe_d_loop:
     cbz  x18, comp_done
@@ -1533,7 +1538,9 @@ comp_probe_d_loop:
     mov  x21, #4096
     bl   probe_dump
     add  x22, x19, #8               /* src (录制页) */
-    /* 堆页 [0x100000000, stack_vaddr) 用指针保护应用 (同 comp_dirty_loop) */
+    /* 堆页 [0x100000000, stack_vaddr) 用指针保护应用 (同 comp_dirty_loop);
+       仅多线程 trace 启用 */
+    cbz  x27, comp_probe_d_raw
     movz x8, #1, lsl #32
     cmp  x20, x8
     b.lo comp_probe_d_raw
@@ -1728,7 +1735,7 @@ comp_done:
     mov  x4, #80
     mul  x4, x19, x4
     add  x4, x4, x16
-    add  x4, x4, #16                /* x4 = 下一条 rec base */
+    add  x4, x4, #24                /* x4 = 下一条 rec base (表头 24B) */
     /* 栈保护区间: [sp-0x100000, sp+0x2000) —— Python eval 帧链可能
        深于 128KB, 早应用的 diff 若含主栈页会覆盖活动 eval 帧
        (x23=-1 垃圾帧崩溃)。 */
@@ -1875,6 +1882,8 @@ comp_mock:
     cbz  x16, mock_dispatch         /* 无回放表 (纯 mock) → 无前瞻 */
     ldr  x0, [x16, #8]              /* 回放表 fmt */
     cbnz x0, mock_dispatch          /* fmt=1 变长格式: 前瞻禁用 */
+    ldr  x0, [x16, #16]             /* threaded: 仅多线程前瞻 */
+    cbz  x0, mock_dispatch
     adrp x5, next_pending
     add  x5, x5, :lo12:next_pending
     ldr  x19, [x5]
@@ -1885,7 +1894,7 @@ comp_mock:
     lsl  x1, x0, #2
     add  x0, x0, x1
     add  x0, x16, x0
-    add  x0, x0, #16                /* rec base */
+    add  x0, x0, #24                /* rec base (表头 24B) */
     ldr  x18, [x0, #56]             /* n_dirty */
     ldr  x19, [x0, #64]
     add  x19, x19, x16

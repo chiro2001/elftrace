@@ -784,8 +784,8 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
         /* 回放表 rec.pc 统一为 svc 地址 (3.5b 的定点替换在 strict 模式
            被跳过, 表里还是 entry-stop ip = svc+4; 引擎按站点 pc 匹配) */
         {
-            /* 回放表: n_recs(8) + fmt(8) + rec×80 */
-            uint8_t *recp = blob->data + replay_off + 16 + (size_t)k * 80;
+            /* 回放表: n_recs(8) + fmt(8) + threaded(8) + rec×80 */
+            uint8_t *recp = blob->data + replay_off + 24 + (size_t)k * 80;
             memcpy(recp, &site, 8);
         }
         /* exit/exit_group 保持真实 (切片结束的合法 syscall) */
@@ -1489,13 +1489,16 @@ static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
                               const uint8_t *oldp, const uint8_t *newp,
                               size_t n, uint32_t *mode_out,
                               uint32_t *gran_out,
-                              const uint64_t *read_set, size_t n_read_set)
+                              const uint64_t *read_set, size_t n_read_set,
+                              int ptr_filter)
 {
     uint32_t ng = 0, full = 0;
     int any_ptr = 0;        /* 页内存在"指针保护"granule → 强制 mode 1 */
     for (size_t g = 0; g < n; g += 32) {
         size_t len = n - g < 32 ? n - g : 32;
-        int em = gran_emitable(oldp + g, newp + g, len);
+        int em = ptr_filter ? gran_emitable(oldp + g, newp + g, len) : 1;
+        if (em && memcmp(oldp + g, newp + g, len) == 0)
+            em = 0;
         if (em < 0) {
             any_ptr = 1;
             continue;       /* 整 32B granule 跳过 (含混合标量) */
@@ -1533,7 +1536,9 @@ static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
     }
     for (size_t g = 0; g < n; g += 32) {
         size_t len = n - g < 32 ? n - g : 32;
-        int em = gran_emitable(oldp + g, newp + g, len);
+        int em = ptr_filter ? gran_emitable(oldp + g, newp + g, len) : 1;
+        if (em && memcmp(oldp + g, newp + g, len) == 0)
+            em = 0;
         if (em <= 0)
             continue;
         if (read_set &&
@@ -2571,6 +2576,12 @@ int build_main(int argc, char **argv)
         uint64_t n_dirty_emit = 0, n_newseg_emit = 0;
         uint64_t n_gran_entries = 0, n_full_entries = 0, n_gran_total = 0;
         size_t n_applied = 0;
+        int bm_threaded = 0;
+        for (size_t i = 0; i < nrecs; i++)
+            if (recs[i].sysno == 435) {
+                bm_threaded = 1;
+                break;
+            }
         for (size_t i = 0; i < nrecs; i++) {
             struct rec_tmp *r = &recs[i];
             buf_init(&r->newseg_run);
@@ -2616,7 +2627,8 @@ int build_main(int argc, char **argv)
                     uint32_t mode = 0, ng = 0;
                     uint32_t em = emit_granules(&r->newseg_run, vv,
                                                 pf + ep + 16, nd + 32, fs,
-                                                &mode, &ng, NULL, 0);
+                                                &mode, &ng, NULL, 0,
+                                                bm_threaded);
                     r->n_newseg_run += em;
                     if (mode == 2)
                         n_full_entries++;
@@ -2655,7 +2667,7 @@ int build_main(int argc, char **argv)
                 uint32_t em = emit_granules(
                     &r->dirty_run, vv, pf + ep + 16, dp, 4096, &mode, &ng,
                     read_set_path ? read_set : NULL,
-                    read_set_path ? n_read_set : 0);
+                    read_set_path ? n_read_set : 0, bm_threaded);
                 r->n_dirty_run += em;
                 if (mode == 2)
                     n_full_entries++;
@@ -2878,6 +2890,7 @@ int build_main(int argc, char **argv)
             buf_zero(&blob, 8 - (blob.size & 7)); /* 8B 对齐 */
         buf_zero(&replay, 8);                    /* n_recs */
         buf_zero(&replay, 8);                    /* fmt (0=整页, 1=字节 run) */
+        buf_zero(&replay, 8);                    /* threaded (指针过滤开关) */
         uint64_t *rec_off = xmalloc(nrecs * 8);
         for (size_t i = 0; i < nrecs; i++) {
             rec_off[i] = replay.size;
@@ -2908,6 +2921,16 @@ int build_main(int argc, char **argv)
         }
         memcpy(replay.data, &nrecs, 8);
         memcpy(replay.data + 8, &replay_fmt, 8);
+        /* 多线程 trace (含 clone3): 回放需要指针过滤保护切片自洽对象图;
+           单线程 trace 无并发分配分叉, 过滤会把静态 BSS 数据 (如 sock
+           的 rcv 缓冲区 8B 图案) 误判为地址跳过 → 整页拷贝。 */
+        uint64_t threaded = 0;
+        for (size_t i = 0; i < nrecs; i++)
+            if (recs[i].sysno == 435) {
+                threaded = 1;
+                break;
+            }
+        memcpy(replay.data + 16, &threaded, 8);
         /* 早应用标记 (rec.pad): clone3 之后的近邻记录 (worker 启动
            写入落在其后若干条边界 diff 里) 置 1, 切片在这些记录回放
            时提前应用下一条记录的堆/BSS 差异。单线程 trace 无 clone3
