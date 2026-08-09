@@ -2427,6 +2427,14 @@ int build_main(int argc, char **argv)
                 "(above runtime maps < %#llx)\n",
                 (unsigned long long)blob_total, (unsigned long long)base,
                 (unsigned long long)min_above);
+    } else if (mode_baremetal && bm_strict && ckpts) {
+        /* 窗口内无 syscall 记录 (纯用户态循环): 3.54 不执行, 仍需
+           选合法 blob 基址 — 否则 base 保持未初始化/0, 首段映射在
+           vaddr 0x0 被内核 mmap_min_addr 拒绝 (exec 即 SIGSEGV)。 */
+        base = pick_base(&s, blob_total, 0);
+        fprintf(stderr, "build: blob %llu bytes at base %#llx "
+                "(no syscall records in window)\n",
+                (unsigned long long)blob_total, (unsigned long long)base);
     }
 
     /* syscall 密集窗口判定: 窗口内最后一个 syscall 距窗口终点很近

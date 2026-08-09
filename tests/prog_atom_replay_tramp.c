@@ -147,7 +147,7 @@ int main(void)
     size_t bl = a64_atomic_replay_block(blk, page, runs_abs, 3, 0,
                                         1 /* rt */, 0 /* rn */,
                                         (uint64_t)(uintptr_t)spin_site_label
-                                        + 4, 0, 0);
+                                        + 4, 0, 0, 0, NULL);
     if (!bl) { fprintf(stderr, "gen failed\n"); return 1; }
     memcpy((void *)(uintptr_t)page, blk, sizeof(blk));
     __builtin___clear_cache((char *)(uintptr_t)page,
@@ -189,7 +189,7 @@ int main(void)
                                      (uint64_t)(uintptr_t)&runs8[0], 2,
                                      8, 18, 2,
                                      (uint64_t)(uintptr_t)spin8_label + 4,
-                                     0, 0)) {
+                                     0, 0, 0, NULL)) {
             fprintf(stderr, "gen8 failed\n");
             return 1;
         }
@@ -215,7 +215,7 @@ int main(void)
                                      (uint64_t)(uintptr_t)&runs1[0], 2,
                                      1, 16, 0,
                                      (uint64_t)(uintptr_t)spin1_label + 4,
-                                     0, 0)) {
+                                     0, 0, 0, NULL)) {
             fprintf(stderr, "gen1 failed\n");
             return 1;
         }
