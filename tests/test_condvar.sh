@@ -37,6 +37,9 @@ run_trace() {  # <输出目录> [补偿文件]
     timeout 600 "$ELFTRACE" trace "$PID" --every 50000000 \
         --out "$out" --atomic-replay "${extra[@]}" \
         > "$TF_TMP/cv_trace.log" 2>&1
+    # trace 数据来自检查点, 不依赖目标跑完; 优雅 detach 后目标可能
+    # 死锁 (两线程都在 condvar 上睡死), 不 kill 会让 wait 永久阻塞
+    kill -9 "$PID" 2>/dev/null
     wait $PID 2>/dev/null
     [ -f "$out/manifest.txt" ] || { tail -3 "$TF_TMP/cv_trace.log"; return 1; }
 }
