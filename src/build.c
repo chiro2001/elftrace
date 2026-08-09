@@ -1360,22 +1360,31 @@ static void blob_patch_u64(uint8_t *blob, uint64_t off, uint64_t val)
  *     mode=2: data[size] 整段 (密集内容, 整段拷贝更省指令)
  *   末个不完整 granule 以 0 填充 (BSS 语义, 防越界写)。
  * 返回 1 = 发射, 0 = 预状态与目标一致 (整体跳过)。 */
+static int cmp_u64(const void *a, const void *b);
+
 static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
                               const uint8_t *oldp, const uint8_t *newp,
                               size_t n, uint32_t *mode_out,
-                              uint32_t *gran_out)
+                              uint32_t *gran_out,
+                              const uint64_t *read_set, size_t n_read_set)
 {
     uint32_t ng = 0, full = 0;
     for (size_t g = 0; g < n; g += 32) {
         size_t len = n - g < 32 ? n - g : 32;
         if (memcmp(oldp + g, newp + g, len) != 0) {
-            ng++;
-            full += (uint32_t)len;
+            if (!read_set ||
+                bsearch(&(uint64_t){vaddr | g}, read_set, n_read_set,
+                        sizeof(*read_set), cmp_u64)) {
+                ng++;
+                full += (uint32_t)len;
+            }
         }
     }
     if (!ng)
         return 0;
-    uint32_t mode = full >= 1536 ? 2 : 1;   /* 密集 → 整段 */
+    uint32_t mode = read_set ? 1 : (full >= 1536 ? 2 : 1);
+                            /* 读集过滤时只能逐 granule (整段会写回
+                               未被读的字节) */
     if (mode_out)
         *mode_out = mode;
     if (gran_out)
@@ -1395,6 +1404,10 @@ static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
     for (size_t g = 0; g < n; g += 32) {
         size_t len = n - g < 32 ? n - g : 32;
         if (memcmp(oldp + g, newp + g, len) == 0)
+            continue;
+        if (read_set &&
+            !bsearch(&(uint64_t){vaddr | g}, read_set, n_read_set,
+                     sizeof(*read_set), cmp_u64))
             continue;
         uint32_t off = (uint32_t)g;
         uint8_t gran[32] = {0};
@@ -1425,6 +1438,12 @@ static uint8_t *read_probe(const char *path, size_t *outsz)
     close(fd);
     *outsz = (size_t)st.st_size;
     return f;
+}
+
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y ? 1 : 0;
 }
 
 /* 应用差异文件到合成快照 (增量检查点重建) */
@@ -1612,6 +1631,8 @@ int build_main(int argc, char **argv)
     uint64_t newseg_big_skip = 0;       /* --newseg-big-skip: 跳过 >=N
                                            字节的 newseg 回放 (worker
                                            线程栈等主线程不读的段) */
+    const char *census_pages_path = NULL; /* --census-pages: 输出脏页表 */
+    const char *read_set_path = NULL;     /* --read-set: 只回放被读页 */
     uint64_t replay_fmt = 0;            /* 0=整页, 1=字节 run (表内 u64) */
     /* strict 循环判定用: 窗口内检查点 PC 与计数 */
     uint64_t *ckpt_pcs = NULL;
@@ -1658,6 +1679,12 @@ int build_main(int argc, char **argv)
         } else if (strcmp(argv[i], "--newseg-big-skip") == 0 &&
                    i + 1 < argc) {
             newseg_big_skip = strtoull(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--census-pages") == 0 &&
+                   i + 1 < argc) {
+            census_pages_path = argv[++i];
+        } else if (strcmp(argv[i], "--read-set") == 0 &&
+                   i + 1 < argc) {
+            read_set_path = argv[++i];
         } else if (strcmp(argv[i], "--from-count") == 0 && i + 1 < argc) {
             from_count = strtoull(argv[++i], NULL, 10);
             have_from_count = 1;
@@ -1686,7 +1713,8 @@ int build_main(int argc, char **argv)
                 "[--from K] [--to M] [--breakpoint ADDR] "
                 "[--bm-strict] [--bm-exit-count N] [--stack-reserve N] "
                 "[--probe-dump FILE] [--byte-runs FILE] "
-                "[--newseg-big-skip N] "
+                "[--newseg-big-skip N] [--census-pages FILE] "
+                "[--read-set FILE] "
                 "[--from-count N] [--to-count N]");
         }
     }
@@ -1696,7 +1724,8 @@ int build_main(int argc, char **argv)
             "[--from K] [--to M] [--breakpoint ADDR] "
             "[--bm-strict] [--bm-exit-count N] [--stack-reserve N] "
             "[--probe-dump FILE] [--byte-runs FILE] "
-            "[--newseg-big-skip N] "
+            "[--newseg-big-skip N] [--census-pages FILE] "
+            "[--read-set FILE] "
             "[--from-count N] [--to-count N]");
 #if !defined(__aarch64__)
     if (bm_strict)
@@ -2221,6 +2250,46 @@ int build_main(int argc, char **argv)
     if (byte_runs_path) {
         if (nrecs == 0)
             die("--byte-runs requires syscall replay records in window");
+        /* 读集 (census 输出): 主线程实际读过的脏页; 只回放这些页 */
+        uint64_t *read_set = NULL;
+        size_t n_read_set = 0, read_cap = 0;
+        if (read_set_path) {
+            FILE *rf = fopen(read_set_path, "r");
+            if (!rf)
+                die("cannot open read-set %s", read_set_path);
+            char rl[128];
+            while (fgets(rl, sizeof rl, rf)) {
+                unsigned long long pc, pg, off32;
+                if (sscanf(rl, "%llx %llx %llx", &pc, &pg, &off32) == 3) {
+                    if (n_read_set == read_cap) {
+                        read_cap = read_cap ? read_cap * 2 : 256;
+                        read_set = xrealloc(read_set,
+                                            read_cap * sizeof(*read_set));
+                    }
+                    read_set[n_read_set++] = pg | (off32 & 0xfffULL);
+                } else if (sscanf(rl, "%llx %llx", &pc, &pg) == 2) {
+                    /* 旧格式: 整页视为已读 */
+                    if (n_read_set == read_cap) {
+                        read_cap = read_cap ? read_cap * 2 : 256;
+                        read_set = xrealloc(read_set,
+                                            read_cap * sizeof(*read_set));
+                    }
+                    read_set[n_read_set++] = pg;
+                }
+            }
+            fclose(rf);
+            qsort(read_set, n_read_set, sizeof(*read_set),
+                  (int (*)(const void *, const void *))cmp_u64);
+            /* 去重 */
+            size_t w = 0;
+            for (size_t k = 0; k < n_read_set; k++)
+                if (w == 0 || read_set[w - 1] != read_set[k])
+                    read_set[w++] = read_set[k];
+            n_read_set = w;
+            fprintf(stderr, "build: read-set: %zu pages\n", n_read_set);
+        }
+        uint64_t *census_pages = NULL;
+        size_t n_census = 0, census_cap = 0;
         size_t psz = 0;
         uint8_t *pf = read_probe(byte_runs_path, &psz);
         uint64_t magic, ver;
@@ -2312,7 +2381,7 @@ int build_main(int argc, char **argv)
                     uint32_t mode = 0, ng = 0;
                     uint32_t em = emit_granules(&r->newseg_run, vv,
                                                 pf + ep + 16, nd + 32, fs,
-                                                &mode, &ng);
+                                                &mode, &ng, NULL, 0);
                     r->n_newseg_run += em;
                     if (mode == 2)
                         n_full_entries++;
@@ -2338,10 +2407,20 @@ int build_main(int argc, char **argv)
                     die("probe dirty mismatch rec %zu (%#llx vs %#llx)",
                         i, (unsigned long long)pv,
                         (unsigned long long)vv);
+                if (census_pages_path) {
+                    if (n_census == census_cap) {
+                        census_cap = census_cap ? census_cap * 2 : 512;
+                        census_pages = xrealloc(census_pages,
+                                                census_cap *
+                                                sizeof(*census_pages));
+                    }
+                    census_pages[n_census++] = vv;
+                }
                 uint32_t mode = 0, ng = 0;
-                uint32_t em = emit_granules(&r->dirty_run, vv,
-                                            pf + ep + 16, dp, 4096,
-                                            &mode, &ng);
+                uint32_t em = emit_granules(
+                    &r->dirty_run, vv, pf + ep + 16, dp, 4096, &mode, &ng,
+                    read_set_path ? read_set : NULL,
+                    read_set_path ? n_read_set : 0);
                 r->n_dirty_run += em;
                 if (mode == 2)
                     n_full_entries++;
@@ -2359,6 +2438,21 @@ int build_main(int argc, char **argv)
         }
         if (n_applied == 0)
             die("--byte-runs: probe applied no records");
+        if (census_pages_path) {
+            qsort(census_pages, n_census, sizeof(*census_pages), cmp_u64);
+            FILE *cf = fopen(census_pages_path, "w");
+            if (cf) {
+                uint64_t last = 0;
+                for (size_t k = 0; k < n_census; k++) {
+                    if (k && census_pages[k] == last)
+                        continue;
+                    fprintf(cf, "%llx\n",
+                            (unsigned long long)census_pages[k]);
+                    last = census_pages[k];
+                }
+                fclose(cf);
+            }
+        }
         /* 分歧探针: 表索引 → syscall.map 行号 映射 (离线对齐用) */
         {
             char rmp[PATH_MAX];
@@ -2372,6 +2466,8 @@ int build_main(int argc, char **argv)
             }
         }
         free(apps);
+        free(census_pages);
+        free(read_set);
         free(pf);
         replay_fmt = 1;
         fprintf(stderr,

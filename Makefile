@@ -24,7 +24,7 @@ SRC     := src
 INC     := include
 STUB_LD := $(SRC)/stub.ld
 
-TOOLS   := $(BUILD)/elftrace
+TOOLS   := $(BUILD)/elftrace $(BUILD)/elftrace-census
 OBJS    := $(BUILD)/main.o $(BUILD)/util.o $(BUILD)/freeze.o $(BUILD)/collect.o \
 	$(BUILD)/build.o $(BUILD)/dump.o $(BUILD)/dwarf.o $(BUILD)/trace.o \
 	$(BUILD)/inject.o $(BUILD)/bundle.o $(BUILD)/bundle_main.o \
@@ -62,8 +62,11 @@ $(BUILD)/%.o: $(SRC)/%.c $(wildcard $(INC)/*.h) | $(BUILD)
 $(BUILD)/inject.o: $(SRC)/inject.c $(wildcard $(INC)/*.h) | $(BUILD)
 	$(CC) -O0 $(CFLAGS) -c $< -o $@
 
-$(TOOLS): $(OBJS)
+$(BUILD)/elftrace: $(OBJS)
 	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) -o $@
+
+$(BUILD)/elftrace-census: $(SRC)/census.c | $(BUILD)
+	$(CC) $(CFLAGS) $< -o $@
 
 clean:
 	rm -rf $(BUILD)

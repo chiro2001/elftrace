@@ -258,6 +258,8 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
             struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
             r->pc = rip - ARCH_SYSCALL_LEN;  /* syscall 指令 */
             r->sysno = 0;       /* EXIT-stop 无 syscall 号 */
+            r->entry_x0 = 0;
+            r->entry_x1 = 0;
             r->count = perf_count_now(tc);
             r->interrupted = 1;
             fprintf(stderr, "trace: interrupted syscall @ %#llx "
@@ -341,10 +343,12 @@ static int collect_interrupt_sc(struct trace_ctx *tc)
                 tc->syscalls = xrealloc(tc->syscalls,
                                         (tc->n_syscalls + 1) *
                                         sizeof(*tc->syscalls));
-                struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
-                r->pc = psi.instruction_pointer - ARCH_SYSCALL_LEN;
-                r->sysno = 0;   /* EXIT-stop 无 syscall 号 */
-                r->count = perf_count_now(tc);
+            struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
+            r->pc = psi.instruction_pointer - ARCH_SYSCALL_LEN;
+            r->sysno = 0;   /* EXIT-stop 无 syscall 号 */
+            r->entry_x0 = 0;
+            r->entry_x1 = 0;
+            r->count = perf_count_now(tc);
                 r->interrupted = 1;
                 fprintf(stderr, "trace: interrupted syscall @ %#llx "
                         "(B - prev boundary, rec %zu)\n",
