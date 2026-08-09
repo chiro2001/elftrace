@@ -38,6 +38,16 @@
 50a878 f9400465
 50a888 f94000a0
 50a87c b9400060
+
+# python3.12 GIL 同步站点 (ThreadingHTTPServer 多线程切片):
+# take_gil 的 gil->locked 读取 (0x58b860 初始检查 + 0x58b9ac 等待循环重读)。
+# 录制中主线程从不 futex_wait (只 futex_wake), take_gil 恒见 locked=0;
+# 但切片因 worker 释放写进 diff 的时序不同会走进 cond_timedwait 自旋
+# (该 futex 站点未记录被 mock 后无限重试)。值回放 locked=0 使切片沿
+# 录制控制流走, 从不进入等待路径。注意 0x58be04/0x58be84 是 drop_gil 的
+# 检查/FORCE_SWITCHING wait, 本负载中主线程不执行 drop_gil, 站点无事件。
+58b860 b9400380
+58b9ac b9400380
 # 迁移/refill 路径 (pool 满↔可用)
 509de0 f8607a81
 509e18 f9400662
