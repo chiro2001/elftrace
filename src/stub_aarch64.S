@@ -1643,9 +1643,11 @@ comp_done:
     mul  x4, x19, x4
     add  x4, x4, x16
     add  x4, x4, #16                /* x4 = 下一条 rec base */
-    /* 栈保护区间: [sp-0x20000, sp+0x2000) */
+    /* 栈保护区间: [sp-0x100000, sp+0x2000) —— Python eval 帧链可能
+       深于 128KB, 早应用的 diff 若含主栈页会覆盖活动 eval 帧
+       (x23=-1 垃圾帧崩溃)。 */
     mov  x8, sp
-    sub  x8, x8, #0x20000
+    sub  x8, x8, #0x100000
     adrp x7, mock_stack_lo
     add  x7, x7, :lo12:mock_stack_lo
     str  x8, [x7]
@@ -1658,11 +1660,21 @@ ck_next_ns:
     cbz  x18, ck_next_d
     ldr  x20, [x19]                 /* vaddr */
     ldr  x21, [x19, #8]             /* filesz */
+    /* 只应用堆页 (worker 启动写入的对象在 pymalloc arena/worker 栈):
+       python BSS/文本 (0x400000-0x100000000) 与主线程栈
+       (>= 0xffff0000000000) 提前写入会覆盖解释器状态/活动帧。 */
+    movz x8, #1, lsl #32
+    cmp  x20, x8
+    b.lo ck_next_ns_skip
+    movz x8, #0xffff, lsl #48
+    cmp  x20, x8
+    b.hs ck_next_ns_skip
     add  x22, x19, #32              /* src */
     mov  x0, x20
     mov  x1, x22
     mov  x2, x21
     bl   copy_blob
+ck_next_ns_skip:
     add  x19, x19, #32
     add  x19, x19, x21
     sub  x18, x18, #1
@@ -1674,6 +1686,13 @@ ck_next_d:
 ck_next_dl:
     cbz  x18, 8f
     ldr  x20, [x19]                 /* dst */
+    /* 只应用堆页 (同上) */
+    movz x8, #1, lsl #32
+    cmp  x20, x8
+    b.lo ck_next_d_skip
+    movz x8, #0xffff, lsl #48
+    cmp  x20, x8
+    b.hs ck_next_d_skip
     /* 栈保护: 跳过主线程活动栈页 */
     adrp x7, mock_stack_lo
     add  x7, x7, :lo12:mock_stack_lo
@@ -1688,12 +1707,29 @@ ck_next_dl:
     add  x19, x19, #8
     sub  x18, x18, #1
     b    ck_next_dl
+ck_next_d_skip:
+    add  x19, x19, #4096
+    add  x19, x19, #8
+    sub  x18, x18, #1
+    b    ck_next_dl
 7:
-    add  x21, x19, #8               /* src */
-    mov  x0, x20
-    mov  x1, x21
-    mov  x2, #4096
-    bl   copy_blob
+    /* 按 8B 粒度只补写与当前内存不同的字节: 早应用时切片当前堆状态
+       应与录制 pre-state 一致 (分配序列已回放), 差异即 worker 启动
+       写入; 整页覆盖会把切片活动分配器/解释器状态写坏。 */
+    add  x8, x19, #8                /* src = 录制页 */
+    mov  x9, x20                    /* dst = 目标页 */
+    mov  x10, #512
+ck_gran:
+    ldr  x11, [x8]
+    ldr  x12, [x9]
+    cmp  x11, x12
+    b.eq ck_gran_next
+    str  x11, [x9]
+ck_gran_next:
+    add  x8, x8, #8
+    add  x9, x9, #8
+    subs x10, x10, #1
+    b.ne ck_gran
     add  x19, x19, #4096
     add  x19, x19, #8
     sub  x18, x18, #1
