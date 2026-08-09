@@ -1433,6 +1433,33 @@ static void blob_patch_u64(uint8_t *blob, uint64_t off, uint64_t val)
  * 返回 1 = 发射, 0 = 预状态与目标一致 (整体跳过)。 */
 static int cmp_u64(const void *a, const void *b);
 
+/* 检查 32B granule: 返回 1=有可发射变化, 0=无变化, -1=含指针保护跳过。
+ * 8B 粒度指针保护: 任一侧是地址值 (>= 0x400000 且
+ * < 0xffff0000000000, 忽略低 3 位 tag) 的 8B 变化不发射。
+ * 原因: 多线程录制下切片堆分配地址会与录制分叉 (worker 并发分配
+ * 扰动 pymalloc 空闲链表), 把录制地址写进切片会破坏切片自洽的
+ * 对象图 (HTTP 切片 Event managed-dict 指向录制 values 数组 →
+ * 崩溃; python 数据段函数指针/静态类型指针被录制值覆盖 → 跳入数据
+ * 段 SIGILL)。标量 (refcnt、flag、GIL locked 等) 照常发射。 */
+static int gran_emitable(const uint8_t *oldp, const uint8_t *newp, size_t len)
+{
+    int has_ok = 0;
+    for (size_t o = 0; o < len; o += 8) {
+        if (memcmp(oldp + o, newp + o, 8) == 0)
+            continue;
+        uint64_t ov, nv;
+        memcpy(&ov, oldp + o, 8);
+        memcpy(&nv, newp + o, 8);
+        if (((ov & ~7ULL) >= 0x400000ULL &&
+             (ov & ~7ULL) < 0xffff0000000000ULL) ||
+            ((nv & ~7ULL) >= 0x400000ULL &&
+             (nv & ~7ULL) < 0xffff0000000000ULL))
+            return -1;
+        has_ok = 1;
+    }
+    return has_ok;
+}
+
 static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
                               const uint8_t *oldp, const uint8_t *newp,
                               size_t n, uint32_t *mode_out,
@@ -1440,20 +1467,27 @@ static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
                               const uint64_t *read_set, size_t n_read_set)
 {
     uint32_t ng = 0, full = 0;
+    int any_ptr = 0;        /* 页内存在"指针保护"granule → 强制 mode 1 */
     for (size_t g = 0; g < n; g += 32) {
         size_t len = n - g < 32 ? n - g : 32;
-        if (memcmp(oldp + g, newp + g, len) != 0) {
-            if (!read_set ||
-                bsearch(&(uint64_t){vaddr | g}, read_set, n_read_set,
-                        sizeof(*read_set), cmp_u64)) {
-                ng++;
-                full += (uint32_t)len;
-            }
+        int em = gran_emitable(oldp + g, newp + g, len);
+        if (em < 0) {
+            any_ptr = 1;
+            continue;       /* 整 32B granule 跳过 (含混合标量) */
         }
+        if (!em)
+            continue;
+        if (read_set &&
+            !bsearch(&(uint64_t){vaddr | g}, read_set, n_read_set,
+                     sizeof(*read_set), cmp_u64))
+            continue;
+        ng++;
+        full += (uint32_t)len;
     }
     if (!ng)
         return 0;
-    uint32_t mode = read_set ? 1 : (full >= 1536 ? 2 : 1);
+    uint32_t mode = read_set ? 1 :
+                    (any_ptr ? 1 : (full >= 1536 ? 2 : 1));
                             /* 读集过滤时只能逐 granule (整段会写回
                                未被读的字节) */
     if (mode_out)
@@ -1474,7 +1508,8 @@ static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
     }
     for (size_t g = 0; g < n; g += 32) {
         size_t len = n - g < 32 ? n - g : 32;
-        if (memcmp(oldp + g, newp + g, len) == 0)
+        int em = gran_emitable(oldp + g, newp + g, len);
+        if (em <= 0)
             continue;
         if (read_set &&
             !bsearch(&(uint64_t){vaddr | g}, read_set, n_read_set,
@@ -2840,6 +2875,21 @@ int build_main(int argc, char **argv)
         }
         memcpy(replay.data, &nrecs, 8);
         memcpy(replay.data + 8, &replay_fmt, 8);
+        /* 早应用标记 (rec.pad): clone3 之后的近邻记录 (worker 启动
+           写入落在其后若干条边界 diff 里) 置 1, 切片在这些记录回放
+           时提前应用下一条记录的堆/BSS 差异。单线程 trace 无 clone3
+           → 全部为 0, 行为与旧版一致 (避免未来标量提前写坏 refcount
+           等主线程中间状态)。 */
+        uint64_t *ea = xcalloc(nrecs ? nrecs : 1, sizeof(*ea));
+        int near_clone = 0;
+        for (size_t i = 0; i < nrecs; i++) {
+            if (recs[i].sysno == 435) {
+                near_clone = 4;         /* 含 clone3 本身 + 其后 3 条 */
+            } else if (near_clone) {
+                near_clone--;
+            }
+            ea[i] = near_clone ? 1 : 0;
+        }
         for (size_t i = 0; i < nrecs; i++) {
             uint8_t *rc = replay.data + rec_off[i];
             uint64_t v;
@@ -2854,7 +2904,9 @@ int build_main(int argc, char **argv)
             v = replay_fmt ? recs[i].n_dirty_run : recs[i].n_dirty;
             memcpy(rc + 56, &v, 8);
             v = dirty_off[i];    memcpy(rc + 64, &v, 8);
+            v = ea[i];           memcpy(rc + 72, &v, 8);
         }
+        free(ea);
         replay_off = blob.size;
         buf_append(&blob, replay.data, replay.size);
         replay_size = replay.size;

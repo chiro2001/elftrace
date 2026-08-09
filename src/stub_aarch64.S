@@ -1468,10 +1468,23 @@ comp_dirty_loop:
     cbz  x18, comp_done
     ldr  x20, [x19]                 /* dst */
     add  x21, x19, #8               /* src */
+    /* 堆页用指针保护应用, 其余 (BSS/rodata/栈/vdso) 保持整页拷贝 */
+    movz x8, #1, lsl #32
+    cmp  x20, x8
+    b.lo comp_dirty_raw
+    movz x8, #0xffff, lsl #48
+    cmp  x20, x8
+    b.hs comp_dirty_raw
+    mov  x0, x20
+    mov  x1, x21
+    bl   apply_dirty_filtered
+    b    comp_dirty_next
+comp_dirty_raw:
     mov  x0, x20
     mov  x1, x21
     mov  x2, #4096
     bl   copy_blob
+comp_dirty_next:
     add  x19, x19, #4096
     add  x19, x19, #8
     sub  x18, x18, #1
@@ -1506,10 +1519,23 @@ comp_probe_d_loop:
     mov  x21, #4096
     bl   probe_dump
     add  x22, x19, #8               /* src (录制页) */
+    /* 堆页用指针保护应用 (同 comp_dirty_loop) */
+    movz x8, #1, lsl #32
+    cmp  x20, x8
+    b.lo comp_probe_d_raw
+    movz x8, #0xffff, lsl #48
+    cmp  x20, x8
+    b.hs comp_probe_d_raw
+    mov  x0, x20
+    mov  x1, x22
+    bl   apply_dirty_filtered
+    b    comp_probe_d_next
+comp_probe_d_raw:
     mov  x0, x20
     mov  x1, x22
     mov  x2, x21
     bl   copy_blob
+comp_probe_d_next:
     add  x19, x19, #4096
     add  x19, x19, #8
     sub  x18, x18, #1
@@ -1538,6 +1564,41 @@ copy_blob:
     subs x3, x3, #1
     b.ne 2b
 3:  ret
+
+/* apply_dirty_filtered(x0=dst, x1=src): 按 8B granule 应用录制页,
+ * 跳过任一侧为地址值 (>= 0x400000 且 < 0xffff0000000000,
+ * 忽略低 3 位 tag) 的 granule。
+ * 原因: 多线程录制下切片堆分配地址会与录制分叉 (worker 并发分配
+ * 扰动 pymalloc 空闲链表), 把录制地址写进切片会破坏切片自洽的
+ * 对象图 (HTTP 切片 Event managed-dict 指向录制 values 数组 →
+ * 崩溃; python 数据段函数指针/静态类型指针被录制值覆盖 → 跳入数据
+ * 段 SIGILL)。标量 (refcnt、flag、GIL locked 等) 照常应用。
+ * 破坏 x0-x1, x10-x15。 */
+apply_dirty_filtered:
+    mov  x10, #512
+1:  ldr  x11, [x1], #8
+    ldr  x12, [x0]
+    cmp  x11, x12
+    beq  2f
+    bic  x13, x11, #7
+    movz x14, #0x40, lsl #16
+    cmp  x13, x14
+    b.hs 2f                     /* 录制值是地址 → 跳过 */
+    movz x14, #0xffff, lsl #48
+    cmp  x13, x14
+    b.hs 2f
+    bic  x13, x12, #7
+    movz x14, #0x40, lsl #16
+    cmp  x13, x14
+    b.hs 2f                     /* 活值是地址 → 跳过 */
+    movz x14, #0xffff, lsl #48
+    cmp  x13, x14
+    b.hs 2f
+    str  x11, [x0]
+2:  add  x0, x0, #8
+    subs x10, x10, #1
+    b.ne 1b
+    ret
 
 /* apply_rec_runs: x25=rec base, x16=replay_abs, x27=完成地址。
  * 应用 newseg + dirty 的 32B granule / span / 整段回放 (纯访存)。
@@ -1625,17 +1686,18 @@ arr_next:
 comp_done:
     ldr  x1, [x23, #16]             /* rec.rax */
     str  x1, [x17, #24]             /* x0 槽 */
-    /* clone3 早应用: 当前回放记录是 clone3 (创建线程) 时, 新线程的
-       启动写入 (如 Thread._started.set、Event 标志) 落在下一条记录的
-       边界 diff 里。录制中主线程在观察这些标志前它们已可见 (从不
-       futex_wait); 切片没有 worker, 若不提前灌入会永远等待
-       (Thread.start → _started.wait → Event.wait → Condition.wait)。
-       此处提前应用下一条记录的内存 diff, 不消费其回放游标 (站点
-       下次命中会再应用, 写幂等)。跳过主线程活动栈页, 避免覆盖
-       切片当前栈帧。 */
-    ldr  x27, [x23, #8]             /* sysno */
-    cmp  x27, #435
-    b.ne 9f
+    /* 早应用: 构建侧标记的记录 (clone3 近邻, rec.pad=1) 回放后,
+       把下一条记录的边界 diff 提前写入,
+       不消费其回放游标 (站点下次命中会再应用, 写幂等)。
+       原因: 多线程录制里 worker 的写入 (Thread._started.set、
+       GIL 释放、锁状态等) 落在主线程下一次 syscall 的 diff 里;
+       切片没有 worker, 若主线程在下一次 syscall 前就读取这些状态
+       (Thread.start → _started.wait、take_gil → cond wait),
+       会永远等待。提前灌入让主线程在读取时看到 worker 已完成。
+       只写堆页 + 8B 粒度差异 + 指针保护 (见 apply_dirty_filtered),
+       跳过主线程活动栈页, 避免覆盖切片当前栈帧/自洽对象图。 */
+    ldr  x27, [x23, #72]            /* rec.pad: 早应用标记 */
+    cbz  x27, 9f
     ldr  x27, [x16]                 /* n_recs */
     cmp  x19, x27
     b.hs 9f                         /* 无下一条记录 */
@@ -1716,20 +1778,9 @@ ck_next_d_skip:
     /* 按 8B 粒度只补写与当前内存不同的字节: 早应用时切片当前堆状态
        应与录制 pre-state 一致 (分配序列已回放), 差异即 worker 启动
        写入; 整页覆盖会把切片活动分配器/解释器状态写坏。 */
-    add  x8, x19, #8                /* src = 录制页 */
-    mov  x9, x20                    /* dst = 目标页 */
-    mov  x10, #512
-ck_gran:
-    ldr  x11, [x8]
-    ldr  x12, [x9]
-    cmp  x11, x12
-    b.eq ck_gran_next
-    str  x11, [x9]
-ck_gran_next:
-    add  x8, x8, #8
-    add  x9, x9, #8
-    subs x10, x10, #1
-    b.ne ck_gran
+    mov  x0, x20                    /* dst = 目标页 */
+    add  x1, x19, #8                /* src = 录制页 */
+    bl   apply_dirty_filtered       /* 含指针保护 */
     add  x19, x19, #4096
     add  x19, x19, #8
     sub  x18, x18, #1
@@ -1760,19 +1811,82 @@ comp_mock:
     str  x0, [x5, #0x1020]          /* 调试: mock 命中计数 */
     ldr  x2, [x17, #(24 + 8*8)]     /* 目标 x8 = syscall 号 */
     str  x2, [x5, #0x1010]          /* 调试: 记录最近 mock sysno */
-    /* mock 自旋检测: 同一 mock 站点连续命中超过阈值 (中间无真实回放)
-       说明切片在 Python 级等待循环里空转 (等待并发线程设置的共享标志,
-       普通字段读取无法按站点 patch)。fail-closed: 不再提前应用未来
-       diff (时序错位会覆盖活动栈/桩状态), 以退出码 66 终止, 由外部
-       报告哪个站点在自旋。 */
+    ldr  x21, [x17, #(24 + 0*8)]    /* 目标 x0 = futex uaddr (前瞻用) */
+    /* mock 自旋检测 + 前瞻回放: 同一 mock 站点连续命中说明切片在
+       等待循环里空转 (等 worker 写入, 如 GIL 释放、锁状态, 落在后续
+       记录的边界 diff 里)。每次自旋把 next_pending 记录 (尚未被任何
+       站点消费的下一条) 的堆/BSS 8B 差异提前应用, 相当于时间推进到
+       该边界; 主线程重查等待谓词时就能看到 worker 已完成。逐条推进
+       避免一次跳到窗口末尾 (末尾 GIL 可能又被后续 worker 持有)。
+       全部记录应用完仍空转 → fail-closed 退出码 66。 */
     adrp x5, mock_spin_cnt
     add  x5, x5, :lo12:mock_spin_cnt
-    ldr  x3, [x5]
+    ldr  w3, [x5]                   /* 32 位: 计数被外部写坏成 64 位
+                                       地址值时, 无符号比较仍能触发
+                                       fail-closed 退出 */
     add  x3, x3, #1
-    str  x3, [x5]
-    cmp  x3, #256
-    b.lt mock_dispatch
-    str  xzr, [x5]
+    str  w3, [x5]
+    /* 每次自旋: 应用 next_pending 记录的 dirty 页中低地址数据/BSS
+       页 (vaddr < 0xc00000, 含 PyRuntime/GIL 状态; 堆页的 malloc
+       元数据/对象标量提前应用会破坏切片自己的分配器, 已实测
+       PyMem_RawCalloc 失败 → abort), 再推进索引 */
+    cbz  x16, mock_dispatch         /* 无回放表 (纯 mock) → 无前瞻 */
+    adrp x5, next_pending
+    add  x5, x5, :lo12:next_pending
+    ldr  x19, [x5]
+    ldr  x18, [x16]                 /* n_recs */
+    cmp  x19, x18
+    b.hs mock_dispatch
+    lsl  x0, x19, #4
+    lsl  x1, x0, #2
+    add  x0, x0, x1
+    add  x0, x16, x0
+    add  x0, x0, #16                /* rec base */
+    ldr  x18, [x0, #56]             /* n_dirty */
+    ldr  x19, [x0, #64]
+    add  x19, x19, x16
+mock_la_dl:
+    cbz  x18, mock_la_done
+    ldr  x20, [x19]                 /* dst */
+    movz x8, #0xc0, lsl #16
+    cmp  x20, x8
+    b.hs mock_la_futex
+    mov  x0, x20                    /* dst */
+    add  x1, x19, #8                /* src */
+    bl   apply_dirty_filtered
+mock_la_futex:
+    /* futex 等待前瞻: 若本页包含主线程等待的 uaddr (x21), 把录制
+       的 int32 (sem 计数/锁字) 应用过去 — worker 的 sem_post/释放
+       写入在后续记录里, 逐步应用后等待谓词解除。指针形值跳过。 */
+    cbz  x21, mock_la_skip
+    sub  x9, x21, x20
+    cmp  x9, #4096
+    b.hs mock_la_skip
+    add  x10, x19, #8
+    ldr  w12, [x10, x9]
+    ldr  w13, [x20, x9]
+    cmp  w12, w13
+    beq  mock_la_skip
+    movz w14, #0x40, lsl #16
+    cmp  w12, w14
+    b.hs mock_la_skip
+    str  w12, [x20, x9]
+mock_la_skip:
+    add  x19, x19, #4096
+    add  x19, x19, #8
+    sub  x18, x18, #1
+    b    mock_la_dl
+mock_la_done:
+    adrp x5, next_pending
+    add  x5, x5, :lo12:next_pending
+    ldr  x19, [x5]
+    add  x19, x19, #1
+    str  x19, [x5]
+    cmp  w3, #256
+    b.lo mock_dispatch
+    adrp x5, mock_spin_cnt
+    add  x5, x5, :lo12:mock_spin_cnt
+    str  wzr, [x5]
     mov  x0, #66                    /* 看门狗退出码 */
     b    mock_watchdog_exit
 mock_dispatch:
