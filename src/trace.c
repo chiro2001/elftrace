@@ -313,7 +313,7 @@ static int collect_interrupt_sc(struct trace_ctx *tc)
         /* 带超时的 waitpid: 目标可能在检查点竞争窗口内崩溃/退出,
            阻塞等待会让 tracer 永久挂起 (condvar 复现)。 */
         int got = 0;
-        for (int w = 0; w < 200; w++) {
+        for (int w = 0; w < 25000; w++) {
             pid_t wr = waitpid(pid, &st, WNOHANG);
             if (wr == pid) {
                 got = 1;
@@ -321,7 +321,9 @@ static int collect_interrupt_sc(struct trace_ctx *tc)
             }
             if (wr < 0)
                 return -1;
-            usleep(5000);
+            usleep(200);    /* 细粒度: 粗轮询会拉长主线程停止时间,
+                               多线程目标 (HTTP server) 的 worker 抢不到
+                               GIL → 请求超时 */
         }
         if (!got)
             return -1;

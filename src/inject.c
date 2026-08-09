@@ -597,7 +597,7 @@ int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
         ptrace(PTRACE_POKEDATA, pid, page + i * 8, backup[i]);
     free(backup);
     /* 恢复后刷新目标 I-cache: 否则 PE 可能仍执行缓存中的注入指令 */
-    inject_flush_icache(pid, &saved, page, ninsn * 4);
+    /* inject_flush_icache(pid, &saved, page, ninsn * 4); */
     /* 恢复其他线程 */
     if (td) {
         DIR *td2 = opendir(task);

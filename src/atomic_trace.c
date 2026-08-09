@@ -940,7 +940,7 @@ int atomic_trace_finish(struct atomic_trace_ctx *ctx)
         }
         int st;
         int got = 0;
-        for (int w = 0; w < 200; w++) {
+        for (int w = 0; w < 25000; w++) {
             pid_t wr = waitpid(pid, &st, WNOHANG);
             if (wr == pid) {
                 got = 1;
@@ -948,7 +948,7 @@ int atomic_trace_finish(struct atomic_trace_ctx *ctx)
             }
             if (wr < 0)
                 break;
-            usleep(5000);
+            usleep(200);
         }
         if (!got || !WIFSTOPPED(st))
             break;
