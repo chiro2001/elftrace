@@ -2044,6 +2044,9 @@ comp_mock_brk:
     str  x2, [x17, #272]
     mov  x1, x2
 1:
+    b    comp_mock_set              /* 否则落进 comp_mock_clock,
+                                       把 brk 调用的 x1 当 ts 缓冲写 →
+                                       sbrk 失败路径崩溃 (bareheap) */
 comp_mock_clock:
     /* clock_gettime(id, ts): 伪单调时钟 = 0x40000000 + 调用计数 (秒)。
        恢复内存里的 deadline 是录制时的真实时间 (~30871s), 大基数让
