@@ -161,6 +161,7 @@ struct atomic_build {
     uint64_t r_num, r_den;      /* 采集补偿系数 r = measured/orig */
     uint64_t *ck_measured;      /* 逐检查点 measured (Run 2 精确账本) */
     uint64_t *ck_orig;          /* 逐检查点原始指令数 */
+    uint64_t *ck_count;         /* 逐检查点 manifest 计数 (原始空间) */
     size_t n_ck;
     struct ab_site *sites;
     size_t n_sites;
@@ -193,15 +194,22 @@ static void atomic_comp_load(const char *dir, struct atomic_build *ab)
                                        (ab->n_ck + 1) * sizeof(uint64_t));
             ab->ck_orig = xrealloc(ab->ck_orig,
                                    (ab->n_ck + 1) * sizeof(uint64_t));
+            ab->ck_count = xrealloc(ab->ck_count,
+                                    (ab->n_ck + 1) * sizeof(uint64_t));
             ab->ck_measured[ab->n_ck] = m;
             ab->ck_orig[ab->n_ck] = o;
+            ab->ck_count[ab->n_ck] = 0;   /* 由 manifest 解析回填 */
             ab->n_ck++;
         }
     }
     fclose(cf);
 }
 
-/* measured 计数 → 原始计数: 逐检查点线性插值; 无账本时退化为单 r */
+/* measured 计数 → 原始计数: 逐检查点线性插值。
+ * y 轴优先用 manifest 计数 (ck_count, 原始空间, 每检查点 k*every);
+ * 旧逻辑用 ck_orig (measured−overhead, 与 manifest 同空间仅在计数器
+ * 零基线时成立 — HTTP pool 的 Run2 计数器带 9.4e9 基线时窗口映射与
+ * syscall 过滤全部错位)。无账本时退化为单 r。 */
 static uint64_t atomic_orig_at(const struct atomic_build *ab,
                                uint64_t measured)
 {
@@ -211,12 +219,16 @@ static uint64_t atomic_orig_at(const struct atomic_build *ab,
                               ab->r_num);
         return measured;
     }
+    int use_manifest = ab->ck_count && ab->n_ck >= 2 &&
+                       ab->ck_count[1] != 0;
     for (size_t i = 0; i + 1 < ab->n_ck; i++) {
         if (measured <= ab->ck_measured[i + 1]) {
             uint64_t m0 = ab->ck_measured[i];
             uint64_t m1 = ab->ck_measured[i + 1];
-            uint64_t o0 = ab->ck_orig[i];
-            uint64_t o1 = ab->ck_orig[i + 1];
+            uint64_t o0 = use_manifest ? ab->ck_count[i]
+                                       : ab->ck_orig[i];
+            uint64_t o1 = use_manifest ? ab->ck_count[i + 1]
+                                       : ab->ck_orig[i + 1];
             if (m1 == m0)
                 return o1;
             return o0 + (uint64_t)(((__uint128_t)(measured - m0) *
@@ -226,13 +238,16 @@ static uint64_t atomic_orig_at(const struct atomic_build *ab,
     if (ab->n_ck >= 2) {
         uint64_t m0 = ab->ck_measured[ab->n_ck - 2];
         uint64_t m1 = ab->ck_measured[ab->n_ck - 1];
-        uint64_t o0 = ab->ck_orig[ab->n_ck - 2];
-        uint64_t o1 = ab->ck_orig[ab->n_ck - 1];
+        uint64_t o0 = use_manifest ? ab->ck_count[ab->n_ck - 2]
+                                   : ab->ck_orig[ab->n_ck - 2];
+        uint64_t o1 = use_manifest ? ab->ck_count[ab->n_ck - 1]
+                                   : ab->ck_orig[ab->n_ck - 1];
         if (m1 > m0 && measured > m1)
             return o1 + (uint64_t)(((__uint128_t)(measured - m1) *
                                     (o1 - o0)) / (m1 - m0));
     }
-    return ab->ck_orig[ab->n_ck - 1];
+    return use_manifest ? ab->ck_count[ab->n_ck - 1]
+                        : ab->ck_orig[ab->n_ck - 1];
 }
 
 static uint64_t rd_u64(const uint8_t **p)
@@ -1927,9 +1942,12 @@ int build_main(int argc, char **argv)
                     continue;
                 uint64_t ck_val = c2;
 #if defined(__aarch64__)
-                /* Run 2 精确账本: 用逐检查点 orig 替代 manifest 名义计数 */
+                /* manifest 计数即原始空间 (每检查点 k*every); 同时回填
+                   atomic_orig_at 的插值 y 轴。不能用 ck_orig (measured−
+                   overhead): 计数器带基线时 (HTTP pool Run2 9.4e9)
+                   窗口映射/过滤全部错位。 */
                 if (ab.n_ck && idx2 < (long)ab.n_ck)
-                    ck_val = ab.ck_orig[idx2];
+                    ab.ck_count[idx2] = c2;
 #endif
                 if (have_from_count && f_idx < 0 && ck_val >= from_count)
                     f_idx = idx2;
@@ -1969,6 +1987,10 @@ int build_main(int argc, char **argv)
                 ckpt_pcs = xrealloc(ckpt_pcs, ckpt_cap * sizeof(*ckpt_pcs));
             }
             ckpt_pcs[nckpt_pcs++] = ip;
+#if defined(__aarch64__)
+            if (ab.n_ck && idx < (long)ab.n_ck)
+                ab.ck_count[idx] = cnt;   /* 原始空间计数 (atomic_orig_at) */
+#endif
             if (idx == from_ckpt) {
                 snprintf(path, sizeof(path), "%s/%s", ckpts, file);
                 in = xstrdup(path);
@@ -2236,6 +2258,25 @@ int build_main(int argc, char **argv)
 #if defined(__aarch64__)
     if (mode_baremetal && bm_strict && ckpts && to_ckpt >= 0)
         atomic_load(ckpts, from_ckpt, to_ckpt, &ab);
+    /* atomic_load 内部 memset 重建 ab, 需重新回填 manifest 原始计数
+       (atomic_orig_at 的插值 y 轴; 计数器带基线时不能用 ck_orig) */
+    if (ab.have && ab.n_ck) {
+        char mp[PATH_MAX];
+        snprintf(mp, sizeof(mp), "%s/manifest.txt", ckpts);
+        FILE *mf = fopen(mp, "r");
+        if (mf) {
+            char ml[1024];
+            long mi = 0;
+            while (fgets(ml, sizeof(ml), mf)) {
+                uint64_t c2 = 0;
+                if (sscanf(ml, "%llu", &c2) == 1 &&
+                    mi < (long)ab.n_ck)
+                    ab.ck_count[mi] = c2;
+                mi++;
+            }
+            fclose(mf);
+        }
+    }
 #endif
     replay_off = 0;
     replay_size = 0;
