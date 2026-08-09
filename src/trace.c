@@ -76,6 +76,7 @@ struct trace_ctx {
         uint64_t count;             /* 捕获时的 perf 指令计数 (窗口过滤用) */
         int interrupted;            /* INTERRUPT 打断的在途 syscall (A=近似) */
         uint64_t entry_x0, entry_x1;/* ENTRY-stop 的目标 x0/x1 (分歧探针) */
+        uint64_t exit_ret;          /* EXIT-stop 的返回值 (检查点边界判别) */
     } *syscalls;
     size_t n_syscalls;
     uint64_t pend_pc, pend_sysno;
@@ -260,6 +261,7 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
             r->sysno = 0;       /* EXIT-stop 无 syscall 号 */
             r->entry_x0 = 0;
             r->entry_x1 = 0;
+            r->exit_ret = REG_RET(b.regs);
             r->count = perf_count_now(tc);
             r->interrupted = 1;
             fprintf(stderr, "trace: interrupted syscall @ %#llx "
@@ -283,6 +285,7 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
         r->sysno = tc->pend_sysno;
         r->entry_x0 = tc->pend_x0;
         r->entry_x1 = tc->pend_x1;
+        r->exit_ret = REG_RET(sn.regs);
         r->count = perf_count_now(tc);
         tc->have_pending = 0;
         fprintf(stderr, "trace: syscall %llu @ %#llx (rec %zu)\n",
@@ -348,6 +351,7 @@ static int collect_interrupt_sc(struct trace_ctx *tc)
             r->sysno = 0;   /* EXIT-stop 无 syscall 号 */
             r->entry_x0 = 0;
             r->entry_x1 = 0;
+            r->exit_ret = REG_RET(b.regs);
             r->count = perf_count_now(tc);
                 r->interrupted = 1;
                 fprintf(stderr, "trace: interrupted syscall @ %#llx "
@@ -417,22 +421,46 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
 #if defined(__aarch64__)
     {
         uint64_t cpc = REG_PC(sn.regs);
+        uint64_t now = perf_count_now(tc);
+        size_t best_k = SIZE_MAX;
+        uint64_t best_count = 0;
+        int keep_after_svc = 0;
         for (size_t k = 0; k < tc->n_syscalls; k++) {
             /* 普通记录 pc = svc+4, 打断记录 pc = svc; 检查点可能停在
-               两者之一, 都回退到 svc */
+               两者之一。取该站点最后一条记录:
+               - 已记录 (EXIT-stop 已处理, 检查点 regs 是返回后状态,
+                 exit_ret == REG_RET) → 保持 pc = svc+4, 切片从
+                 syscall 之后继续; 基座内存已含该记录 diff, build 按
+                 nsys 边界把记录排除在回放表外;
+               - 未记录 (在途) → 回退到 svc, 切片重执行该 syscall,
+                 记录稍后创建且落在窗口内。 */
             if (tc->syscalls[k].pc == cpc ||
                 tc->syscalls[k].pc + ARCH_SYSCALL_LEN == cpc) {
-                REG_SET_PC(sn.regs, cpc - ARCH_SYSCALL_LEN);
-                fprintf(stderr, "trace: ckpt %zu at syscall boundary "
-                        "pc %#llx, rewind to svc\n",
-                        tc->ckpt_no, (unsigned long long)cpc);
-                break;
+                if (best_k == SIZE_MAX ||
+                    tc->syscalls[k].count > best_count) {
+                    best_k = k;
+                    best_count = tc->syscalls[k].count;
+                }
             }
+        }
+        if (best_k != SIZE_MAX &&
+            tc->syscalls[best_k].exit_ret == REG_RET(sn.regs) &&
+            best_count + tc->every_eff / 2 >= now) {
+            keep_after_svc = 1;
+            fprintf(stderr, "trace: ckpt %zu at recorded syscall boundary "
+                    "pc %#llx (ret %#llx), keep after-svc\n",
+                    tc->ckpt_no, (unsigned long long)cpc,
+                    (unsigned long long)REG_RET(sn.regs));
+        } else if (best_k != SIZE_MAX) {
+            REG_SET_PC(sn.regs, cpc - ARCH_SYSCALL_LEN);
+            fprintf(stderr, "trace: ckpt %zu at syscall boundary "
+                    "pc %#llx, rewind to svc\n",
+                    tc->ckpt_no, (unsigned long long)cpc);
         }
         /* 在途 syscall (记录尚未创建) 的边界: 直接检查 pc-4 是否 svc,
            是则回退到 svc, 切片由引擎重放 (该记录在检查点后创建,
            窗口内可用) */
-        if (REG_PC(sn.regs) == cpc && cpc >= 4) {
+        if (!keep_after_svc && REG_PC(sn.regs) == cpc && cpc >= 4) {
             uint32_t w;
             struct iovec li = {.iov_base = &w, .iov_len = sizeof(w)};
             struct iovec ri = {

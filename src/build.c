@@ -2153,7 +2153,15 @@ int build_main(int argc, char **argv)
                         rc = atomic_orig_at(&ab, rc);
 #endif
                     orig_rc = rc;
-                    if (rc < ckpt_count0 ||
+                    /* 基座检查点边界已消费的记录排除:
+                       base 检查点冻结在 syscall 边界时, 该记录的
+                       diff 已计入基座内存 (nsys 边界), 但 measured
+                       计数经 orig 换算后仍可能落在 [ckpt_count0, ...)
+                       内 (书签 count 滞后于实际 perf 位置), 若不排除
+                       切片会重放一条已应用的记录, 使同 pc 站点的
+                       游标整体错位 (HTTP 轮询负载确定性崩)。 */
+                    if (map_idx < syscall_start ||
+                        rc < ckpt_count0 ||
                         rc >= ckpt_count_to) {
                         map_idx++;
                         continue;
