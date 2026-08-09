@@ -1466,16 +1466,26 @@ comp_dirty:
     ldr  x18, [x23, #56]            /* n_dirty */
     ldr  x19, [x23, #64]
     add  x19, x19, x16
+    /* 堆上界 = 录制 [stack] 段起点 (RST_DESC_STACK_VADDR)。不能用
+       魔法边界 0xffff0000000000: 本内核栈在 0xfffff1f86000 (< 该值),
+       栈页会被误判为堆页走指针过滤, 而 read 回放的 "AAABBB" 数据
+       恰好像地址值被跳过 → verify 失败。 */
+    adr  x24, comp_engine
+    movz x25, #(STUB_STRICT_COMP_OFF & 0xffff)
+    movk x25, #(STUB_STRICT_COMP_OFF >> 16), lsl #16
+    sub  x24, x24, x25              /* blob base */
+    ldr  x25, [x24, #RST_DESC_STACK_VADDR]
+    b    comp_dirty_loop
 comp_dirty_loop:
     cbz  x18, comp_done
     ldr  x20, [x19]                 /* dst */
     add  x21, x19, #8               /* src */
-    /* 堆页用指针保护应用, 其余 (BSS/rodata/栈/vdso) 保持整页拷贝 */
+    /* 堆页 [0x100000000, stack_vaddr) 用指针保护应用,
+       其余 (BSS/rodata/栈/vdso) 保持整页拷贝 */
     movz x8, #1, lsl #32
     cmp  x20, x8
     b.lo comp_dirty_raw
-    movz x8, #0xffff, lsl #48
-    cmp  x20, x8
+    cmp  x20, x25
     b.hs comp_dirty_raw
     mov  x0, x20
     mov  x1, x21
@@ -1515,18 +1525,19 @@ comp_probe_dirty:
     ldr  x18, [x23, #56]            /* n_dirty */
     ldr  x19, [x23, #64]
     add  x19, x19, x16
+    ldr  x25, [x24, #RST_DESC_STACK_VADDR]  /* x24 = blob base (probe) */
+    b    comp_probe_d_loop
 comp_probe_d_loop:
     cbz  x18, comp_done
     ldr  x20, [x19]                 /* dst (预状态) */
     mov  x21, #4096
     bl   probe_dump
     add  x22, x19, #8               /* src (录制页) */
-    /* 堆页用指针保护应用 (同 comp_dirty_loop) */
+    /* 堆页 [0x100000000, stack_vaddr) 用指针保护应用 (同 comp_dirty_loop) */
     movz x8, #1, lsl #32
     cmp  x20, x8
     b.lo comp_probe_d_raw
-    movz x8, #0xffff, lsl #48
-    cmp  x20, x8
+    cmp  x20, x25
     b.hs comp_probe_d_raw
     mov  x0, x20
     mov  x1, x22
@@ -1555,8 +1566,13 @@ comp_runs:
 copy_blob:
     lsr  x3, x2, #5
     cbz  x3, 2f
-1:  ldp  x4, x5, [x1], #32
-    stp  x4, x5, [x0], #32
+1:  /* 每 32B 单位两对 16B ldp/stp: 单个 ldp+stp 用 #32 后索引只搬
+       16B 却前进 32B, 会跳过每轮后一半数据 (fd_rw read 缓冲区恰好
+       落在跳过的半区 → verify 失败)。 */
+    ldp  x4, x5, [x1], #16
+    ldp  x6, x7, [x1], #16
+    stp  x4, x5, [x0], #16
+    stp  x6, x7, [x0], #16
     subs x3, x3, #1
     b.ne 1b
 2:  and  x3, x2, #31
@@ -1585,17 +1601,19 @@ apply_dirty_filtered:
     bic  x13, x11, #7
     movz x14, #0x40, lsl #16
     cmp  x13, x14
-    b.hs 2f                     /* 录制值是地址 → 跳过 */
+    b.lo 3f                      /* 低于地址区: 可应用 */
     movz x14, #0xffff, lsl #48
     cmp  x13, x14
-    b.hs 2f
+    b.lo 2f                      /* [0x400000, 0xffff...) 地址 → 跳过 */
+3:
     bic  x13, x12, #7
     movz x14, #0x40, lsl #16
     cmp  x13, x14
-    b.hs 2f                     /* 活值是地址 → 跳过 */
+    b.lo 4f                      /* 低于地址区: 可应用 */
     movz x14, #0xffff, lsl #48
     cmp  x13, x14
-    b.hs 2f
+    b.lo 2f                      /* 活值是地址 → 跳过 */
+4:
     str  x11, [x0]
 2:  add  x0, x0, #8
     subs x10, x10, #1
@@ -1700,6 +1718,10 @@ comp_done:
        跳过主线程活动栈页, 避免覆盖切片当前栈帧/自洽对象图。 */
     ldr  x27, [x23, #72]            /* rec.pad: 早应用标记 */
     cbz  x27, 9f
+    ldr  x0, [x16, #8]              /* 回放表 fmt */
+    cbnz x0, 9f                     /* fmt=1 (byte-runs) 为变长格式,
+                                       前瞻按整页解析会误读; 禁用直到
+                                       实现格式感知前瞻 */
     ldr  x27, [x16]                 /* n_recs */
     cmp  x19, x27
     b.hs 9f                         /* 无下一条记录 */
@@ -1747,6 +1769,13 @@ ck_next_d:
     ldr  x18, [x4, #56]             /* n_dirty */
     ldr  x19, [x4, #64]
     add  x19, x19, x16
+    /* 堆上界 = 栈段起点 (同 comp_dirty_loop, 避免栈页被误判) */
+    adr  x24, comp_engine
+    movz x25, #(STUB_STRICT_COMP_OFF & 0xffff)
+    movk x25, #(STUB_STRICT_COMP_OFF >> 16), lsl #16
+    sub  x24, x24, x25
+    ldr  x25, [x24, #RST_DESC_STACK_VADDR]
+    b    ck_next_dl
 ck_next_dl:
     cbz  x18, 8f
     ldr  x20, [x19]                 /* dst */
@@ -1754,8 +1783,7 @@ ck_next_dl:
     movz x8, #1, lsl #32
     cmp  x20, x8
     b.lo ck_next_d_skip
-    movz x8, #0xffff, lsl #48
-    cmp  x20, x8
+    cmp  x20, x25
     b.hs ck_next_d_skip
     /* 栈保护: 跳过主线程活动栈页 */
     adrp x7, mock_stack_lo
@@ -1845,6 +1873,8 @@ comp_mock:
        元数据/对象标量提前应用会破坏切片自己的分配器, 已实测
        PyMem_RawCalloc 失败 → abort), 再推进索引 */
     cbz  x16, mock_dispatch         /* 无回放表 (纯 mock) → 无前瞻 */
+    ldr  x0, [x16, #8]              /* 回放表 fmt */
+    cbnz x0, mock_dispatch          /* fmt=1 变长格式: 前瞻禁用 */
     adrp x5, next_pending
     add  x5, x5, :lo12:next_pending
     ldr  x19, [x5]
