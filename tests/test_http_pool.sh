@@ -81,7 +81,7 @@ run_trace() {  # <输出目录> [补偿文件]
     fi
     start_server || { echo "FAIL: server 未就绪"; return 1; }
     send_requests 3 || { echo "FAIL: warm 请求失败"; return 1; }
-    timeout 600 "$ELFTRACE" trace "$HTTP_PID" --every 200000 \
+    timeout 600 "$ELFTRACE" trace "$HTTP_PID" --every 100000 \
         --out "$out" --atomic-replay "${vr[@]}" "${extra[@]}" \
         > "$TF_TMP/http_pool_trace.log" 2>&1 &
     local TPID=$!
@@ -108,10 +108,14 @@ NCK=$(wc -l < "$TF_TMP/http_pool_r2/manifest.txt")
 [ "$NCK" -ge 6 ] || { echo "FAIL: Run2 只有 $NCK 检查点"; exit 1; }
 echo "  Run2: $NCK ckpts, $(wc -l < "$TF_TMP/http_pool_r2/syscalls/syscall.map") syscalls"
 
-# 中间窗口 (600K..1M), probe → byte-run
+# 中间窗口 (Run2 总计数的 40%~60%), probe → byte-run
+TOT=$(awk 'END{print $1}' "$TF_TMP/http_pool_r2/manifest.txt")
+FROM=$((TOT * 2 / 5))
+TO=$((TOT * 3 / 5))
+[ "$TO" -gt "$FROM" ] || { echo "FAIL: 窗口过窄"; exit 1; }
 tf_build /dev/null "$TF_TMP/http_pool_probe.elf" --mode baremetal --bm-strict \
     --checkpoints "$TF_TMP/http_pool_r2" \
-    --from-count 600000 --to-count 1000000 \
+    --from-count "$FROM" --to-count "$TO" \
     --stack-reserve 67108864 \
     --probe-dump "$TF_TMP/http_pool_probe.bin" > "$TF_TMP/http_pool_build.log" 2>&1 \
     || { echo "FAIL: probe build"; tail -5 "$TF_TMP/http_pool_build.log"; exit 1; }
@@ -121,7 +125,7 @@ PRC=$?
 [ -s "$TF_TMP/http_pool_probe.bin" ] || { echo "FAIL: 无 probe.bin"; exit 1; }
 tf_build /dev/null "$TF_TMP/http_pool_slice.elf" --mode baremetal --bm-strict \
     --checkpoints "$TF_TMP/http_pool_r2" \
-    --from-count 600000 --to-count 1000000 \
+    --from-count "$FROM" --to-count "$TO" \
     --stack-reserve 67108864 \
     --byte-runs "$TF_TMP/http_pool_probe.bin" \
     --newseg-big-skip 1048576 > "$TF_TMP/http_pool_build2.log" 2>&1 \
@@ -144,7 +148,7 @@ timeout 120 perf stat -e instructions "$TF_TMP/http_pool_slice.elf" \
     > /dev/null 2> "$TF_TMP/http_pool_slice.perf"
 INS=$(grep "instructions" "$TF_TMP/http_pool_slice.perf" \
     | grep -oE "[0-9,]+" | head -1 | tr -d ",")
-echo "  slice instructions: ${INS:-?} (window 400000 + replay 数据应用)"
+echo "  slice instructions: ${INS:-?} (window $((TO - FROM)) + replay 数据应用)"
 
 tf_pass "http.server+pool strict 支持层 (rc=0, zero target syscalls, ${INS:-?} insns)"
 tf_finish
