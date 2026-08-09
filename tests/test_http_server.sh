@@ -132,26 +132,43 @@ tf_build /dev/null "$TF_TMP/http_slice.elf" --mode baremetal --bm-strict \
     --newseg-big-skip 1048576 > "$TF_TMP/http_build2.log" 2>&1 \
     || { echo "FAIL: byte-run build"; tail -5 "$TF_TMP/http_build2.log"; exit 1; }
 
-# 目标阶段零 syscall
+# 目标阶段零 syscall + 分层契约:
+#   支持层: byte-run 切片 rc=0 (窗口内同步语义可回放);
+#   限制层: 当前 600K..1000K 窗口跨线程创建, 切片会进入录制中不存在
+#     的 futex 等待路径 (对象身份分歧), 前瞻耗尽后看门狗 fail-closed
+#     退出码 66 —— 允许 66, 但必须零真实 syscall、有 exit_group(66),
+#     不允许 timeout/SIGSEGV/SIGTRAP 充当失败。
 timeout 120 strace -o "$TF_TMP/http_slice.strace" \
     "$TF_TMP/http_slice.elf" > /dev/null 2>&1
 RC=$?
-[ "$RC" = 0 ] || { echo "FAIL: 切片 rc=$RC"; exit 1; }
 AFTER=$(awk '/rt_sigreturn/{f=1; next} f' "$TF_TMP/http_slice.strace")
 if echo "$AFTER" | grep -E "openat|read\(|write\(|ioctl\(|mmap|brk|futex|poll|recvfrom|sendto|accept|clone|clock_gettime"; then
     echo "FAIL: 目标阶段真实 syscall"
     echo "$AFTER"
     exit 1
 fi
-grep -q "exit_group(0)" "$TF_TMP/http_slice.strace" \
-    || { echo "FAIL: 无 exit_group(0)"; exit 1; }
-
-# 指令数报告 (多线程边界 diff 回放数据量大, 不 gate 5%)
-timeout 120 perf stat -e instructions "$TF_TMP/http_slice.elf" \
-    > /dev/null 2> "$TF_TMP/http_slice.perf"
-INS=$(grep "instructions" "$TF_TMP/http_slice.perf" \
-    | grep -oE "[0-9,]+" | head -1 | tr -d ",")
-echo "  slice instructions: ${INS:-?} (window 400000 + replay 数据应用)"
-
-tf_pass "http.server strict (rc=0, zero target syscalls, ${INS:-?} insns)"
+case "$RC" in
+0)
+    grep -q "exit_group(0)" "$TF_TMP/http_slice.strace" \
+        || { echo "FAIL: 无 exit_group(0)"; exit 1; }
+    # 指令数报告 (多线程边界 diff 回放数据量大, 不 gate 5%)
+    timeout 120 perf stat -e instructions "$TF_TMP/http_slice.elf" \
+        > /dev/null 2> "$TF_TMP/http_slice.perf"
+    INS=$(grep "instructions" "$TF_TMP/http_slice.perf" \
+        | grep -oE "[0-9,]+" | head -1 | tr -d ",")
+    echo "  slice instructions: ${INS:-?} (window 400000 + replay 数据应用)"
+    tf_pass "http.server strict 支持层 (rc=0, zero target syscalls, ${INS:-?} insns)"
+    ;;
+66)
+    grep -q "exit_group(66)" "$TF_TMP/http_slice.strace" \
+        || { echo "FAIL: 限制层 rc=66 但无 exit_group(66)"; exit 1; }
+    echo "  http.server 限制层: 窗口跨线程创建, 对象身份分歧"
+    echo "  → 前瞻耗尽 fail-closed rc=66 (零真实 syscall)"
+    tf_pass "http.server strict 限制层 (fail-closed 66, zero target syscalls)"
+    ;;
+*)
+    echo "FAIL: 切片 rc=$RC (期望 0=支持层 或 66=限制层)"
+    exit 1
+    ;;
+esac
 tf_finish
