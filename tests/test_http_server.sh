@@ -96,15 +96,29 @@ run_trace() {  # <输出目录> [补偿文件]
     return 0
 }
 
+run_trace_retry() {  # <输出目录> [补偿文件]
+    for a in 1 2; do
+        if run_trace "$@"; then
+            return 0
+        fi
+        echo "  trace 负载失败 (attempt $a), 清理重试"
+        kill -9 "$HTTP_PID" 2>/dev/null
+        pkill -9 -f '/build/elftrace trace ' 2>/dev/null
+        pkill -9 -x python3 2>/dev/null
+        sleep 1
+    done
+    return 1
+}
+
 rm -rf "$TF_TMP/http_r1" "$TF_TMP/http_r2"
-run_trace "$TF_TMP/http_r1" || { echo "FAIL: Run1"; tail -3 "$TF_TMP/http_trace.log"; exit 1; }
+run_trace_retry "$TF_TMP/http_r1" || { echo "FAIL: Run1"; tail -3 "$TF_TMP/http_trace.log"; exit 1; }
 COMP="$TF_TMP/http_r1/atomics/compensation.txt"
 [ -f "$COMP" ] || { echo "FAIL: Run1 无 compensation.txt"; exit 1; }
 NCK=$(wc -l < "$TF_TMP/http_r1/manifest.txt")
 [ "$NCK" -ge 6 ] || { echo "FAIL: Run1 只有 $NCK 检查点"; exit 1; }
 echo "  Run1: $NCK ckpts, $(wc -l < "$TF_TMP/http_r1/syscalls/syscall.map") syscalls"
 
-run_trace "$TF_TMP/http_r2" "$COMP" || { echo "FAIL: Run2"; tail -3 "$TF_TMP/http_trace.log"; exit 1; }
+run_trace_retry "$TF_TMP/http_r2" "$COMP" || { echo "FAIL: Run2"; tail -3 "$TF_TMP/http_trace.log"; exit 1; }
 [ -f "$TF_TMP/http_r2/atomics/events.bin" ] || { echo "FAIL: Run2 无 events.bin"; exit 1; }
 NCK=$(wc -l < "$TF_TMP/http_r2/manifest.txt")
 [ "$NCK" -ge 6 ] || { echo "FAIL: Run2 只有 $NCK 检查点"; exit 1; }
