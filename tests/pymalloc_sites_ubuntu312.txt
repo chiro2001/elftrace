@@ -48,10 +48,15 @@
 # 检查/FORCE_SWITCHING wait, 本负载中主线程不执行 drop_gil, 站点无事件。
 58b860 b9400380
 58b9ac b9400380
+# drop_gil (PyEval_SaveThread 内联) 的 gil->locked 检查读: 录制主线程
+# drop 时值=1, 切片若不回放此读, 会被边界 diff 写成的 0 触发
+# "drop_gil: GIL is not locked" abort (rc=133)。值回放 1 让切片沿录制
+# 控制流走; drop 的 str wzr 仍真实执行写 0, 与录制一致。
+58bc78 b94002e0
 # drop_gil FORCE_SWITCHING 的 gil_drop_request 读取 (ceval+4)。
-# 录制中主线程从不执行 drop_gil, 站点无事件 → 合成首段回放检查点
-# 值 (0), 使切片永不进入 FORCE_SWITCHING cond_wait (该等待的 futex
-# 未记录, mock 后无限自旋)。
+# 本负载录制主线程执行 drop_gil 时读到 0 (无强制切换请求), 回放同样
+# 返回 0 → 不进入 FORCE_SWITCHING cond_wait (该等待的 futex 未记录,
+# mock 后无限自旋)。
 58be50 b9400260
 # 迁移/refill 路径 (pool 满↔可用)
 509de0 f8607a81
