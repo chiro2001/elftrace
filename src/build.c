@@ -1369,8 +1369,14 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
 }
 #endif /* __aarch64__ */
 
-/* 找出放置 blob 的空闲 gap */
-static uint64_t pick_base(const struct snap *s, uint64_t blob_size)
+/* 找出放置 blob 的空闲 gap。
+ * min_above: 录制运行期可能出现的映射 (窗口内 newseg/dirty 页) 的最大
+ * 结束地址 —— blob 必须放在它之上, 否则 diff 回放会把录制期新建的
+ * pymalloc arena / 堆页写进 blob (覆盖 stub BSS / 回放表), 造成
+ * 垃圾 pc 崩溃。高于 VA_CAP 的范围 (如 worker 栈) 与 blob 不可能冲突,
+ * 不计入。 */
+static uint64_t pick_base(const struct snap *s, uint64_t blob_size,
+                          uint64_t min_above)
 {
     const uint64_t VA_MIN = 0x10000;
     const uint64_t VA_CAP = 0x7fe00000000ULL;   /* 初始栈可能出现的区域之上 */
@@ -1394,6 +1400,7 @@ static uint64_t pick_base(const struct snap *s, uint64_t blob_size)
         uint64_t gap_start = prev_end;
         uint64_t gap_end = segs[i].vaddr;
         if (gap_end >= gap_start && gap_end - gap_start >= blob_size &&
+            gap_start >= min_above &&
             gap_start + blob_size <= VA_CAP) {
             base = gap_start;
             break;
@@ -1402,7 +1409,7 @@ static uint64_t pick_base(const struct snap *s, uint64_t blob_size)
         prev_end = (end + 0xfff) & ~0xfffULL;
     }
     if (!base) {
-        if (prev_end + blob_size <= VA_CAP)
+        if (prev_end >= min_above && prev_end + blob_size <= VA_CAP)
             base = prev_end;
     }
     if (!base)
@@ -2103,10 +2110,13 @@ int build_main(int argc, char **argv)
 
     blob_total = blob.size;
 
-    /* 3. 选 base */
-    base = pick_base(&s, blob_total);
-    fprintf(stderr, "build: blob %llu bytes at base %#llx\n",
-            (unsigned long long)blob_total, (unsigned long long)base);
+    /* 3. 选 base (strict 模式在解析完 syscall 记录后重选, 避开录制
+       运行期新建映射; 见 3.54) */
+    if (!(mode_baremetal && bm_strict && ckpts)) {
+        base = pick_base(&s, blob_total, 0);
+        fprintf(stderr, "build: blob %llu bytes at base %#llx\n",
+                (unsigned long long)blob_total, (unsigned long long)base);
+    }
 
     /* 3.5 baremetal: 段表加载后确定 brk 边界与退出地址的 blob 位置
        (strict 模式由 build_strict 统一处理, 跳过 brk 替换) */
@@ -2297,6 +2307,91 @@ int build_main(int argc, char **argv)
                         nrecs, (unsigned long long)syscall_start,
                         (unsigned long long)syscall_end);
         }
+    }
+
+    /* 3.54 strict: 重选 blob base —— 窗口内 newseg/dirty 页是录制运行期
+       新建/改写的内存 (pymalloc arena、堆、线程栈等), 若落在 blob
+       范围, diff 回放会覆盖 stub BSS/回放表。取低于 VA_CAP 的最大
+       运行期映射结束地址, blob 必须在其上。 */
+    if (mode_baremetal && bm_strict && ckpts && nrecs) {
+        uint64_t min_above = 0;
+        /* syscall 记录内的 newseg/dirty */
+        for (size_t k = 0; k < nrecs; k++) {
+            const uint8_t *nd = recs[k].newseg.data;
+            for (uint64_t j = 0; j < recs[k].n_newseg; j++) {
+                uint64_t vv, fs;
+                memcpy(&vv, nd, 8);
+                memcpy(&fs, nd + 8, 8);
+                nd += 32 + fs;
+                if (vv + fs < 0x7fe00000000ULL &&
+                    vv + fs > min_above)
+                    min_above = vv + fs;
+            }
+            const uint8_t *dp = recs[k].dirty.data;
+            for (uint64_t j = 0; j < recs[k].n_dirty; j++) {
+                uint64_t vv;
+                memcpy(&vv, dp, 8);
+                dp += 8 + 4096;
+                if (vv + 4096 < 0x7fe00000000ULL &&
+                    vv + 4096 > min_above)
+                    min_above = vv + 4096;
+            }
+        }
+        /* 检查点 diff (ckpt_from+1 .. ckpt_to) 内的 newseg/dirty:
+           运行期映射也可能在两次 syscall 之间创建, 只扫 syscall 记录
+           会漏 (HTTP 实测 arena 页在 ckpt diff 里)。 */
+        for (long ci = from_ckpt + 1; ci <= to_ckpt; ci++) {
+            char cpath[600];
+            snprintf(cpath, sizeof(cpath), "%s/ckpt_%06ld.elftrace",
+                     ckpts, ci);
+            FILE *cf = fopen(cpath, "rb");
+            if (!cf)
+                continue;
+            uint8_t hdr[64];
+            if (fread(hdr, 1, sizeof(hdr), cf) == sizeof(hdr)) {
+                uint64_t ss, nu, nn, nd;
+                memcpy(&ss, hdr + 8, 8);
+                memcpy(&nu, hdr + 16, 8);
+                memcpy(&nn, hdr + 24, 8);
+                memcpy(&nd, hdr + 32, 8);
+                if (ss >= 0x60) {
+                    uint64_t body = 40 + ss + nu * 8;
+                    if (fseek(cf, (long)body, SEEK_SET) == 0) {
+                        for (uint64_t k = 0; k < nn; k++) {
+                            uint8_t e[32];
+                            if (fread(e, 1, sizeof(e), cf) != sizeof(e))
+                                break;
+                            uint64_t vv, fs;
+                            memcpy(&vv, e, 8);
+                            memcpy(&fs, e + 8, 8);
+                            if (vv + fs < 0x7fe00000000ULL &&
+                                vv + fs > min_above)
+                                min_above = vv + fs;
+                            if (fseek(cf, (long)fs, SEEK_CUR) != 0)
+                                break;
+                        }
+                        for (uint64_t k = 0; k < nd; k++) {
+                            uint8_t vv8[8];
+                            if (fread(vv8, 1, 8, cf) != 8)
+                                break;
+                            uint64_t vv;
+                            memcpy(&vv, vv8, 8);
+                            if (vv + 4096 < 0x7fe00000000ULL &&
+                                vv + 4096 > min_above)
+                                min_above = vv + 4096;
+                            if (fseek(cf, 4096, SEEK_CUR) != 0)
+                                break;
+                        }
+                    }
+                }
+            }
+            fclose(cf);
+        }
+        base = pick_base(&s, blob_total, min_above);
+        fprintf(stderr, "build: blob %llu bytes at base %#llx "
+                "(above runtime maps < %#llx)\n",
+                (unsigned long long)blob_total, (unsigned long long)base,
+                (unsigned long long)min_above);
     }
 
     /* syscall 密集窗口判定: 窗口内最后一个 syscall 距窗口终点很近

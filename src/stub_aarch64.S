@@ -1647,9 +1647,9 @@ comp_mock:
     str  x2, [x5, #0x1010]          /* 调试: 记录最近 mock sysno */
     /* mock 自旋检测: 同一 mock 站点连续命中超过阈值 (中间无真实回放)
        说明切片在 Python 级等待循环里空转 (等待并发线程设置的共享标志,
-       普通字段读取无法按站点 patch)。此时按顺序提前应用下一条待回放
-       记录的边界 diff, 把并发线程的写入补进内存, 让等待循环看到
-       标志变化; 记录耗尽则直接严格退出 (rc=0)。 */
+       普通字段读取无法按站点 patch)。fail-closed: 不再提前应用未来
+       diff (时序错位会覆盖活动栈/桩状态), 以退出码 66 终止, 由外部
+       报告哪个站点在自旋。 */
     adrp x5, mock_spin_cnt
     add  x5, x5, :lo12:mock_spin_cnt
     ldr  x3, [x5]
@@ -1658,104 +1658,8 @@ comp_mock:
     cmp  x3, #256
     b.lt mock_dispatch
     str  xzr, [x5]
-    /* spin-apply 栈保护: 记录当前目标 sp 附近的区间, 应用 diff 时
-       跳过落入该区间的页 (worker 的 diff 可能含主线程栈页, 提前
-       灌入会覆盖切片活动栈帧 → 垃圾 pc) */
-    mov  x8, sp
-    sub  x8, x8, #0x20000
-    adrp x7, mock_stack_lo
-    add  x7, x7, :lo12:mock_stack_lo
-    str  x8, [x7]
-    add  x8, sp, #0x2000
-    str  x8, [x7, #8]
-    adrp x6, next_pending
-    add  x6, x6, :lo12:next_pending
-    ldr  x3, [x6]
-    ldr  x4, [x16]                  /* n_recs */
-    cmp  x3, x4
-    b.hs mock_exhausted_exit
-    /* 应用记录 x3 的边界 diff (newseg + dirty, 纯访存) */
-    mov  x4, #80
-    mul  x4, x3, x4
-    add  x4, x4, x16
-    add  x4, x4, #16                /* x4 = rec base (跳过 n_recs+fmt) */
-    /* probe: 记录本次提前应用的 rec 索引 (标记流) */
-    adr  x24, comp_engine
-    movz x25, #(STUB_STRICT_COMP_OFF & 0xffff)
-    movk x25, #(STUB_STRICT_COMP_OFF >> 16), lsl #16
-    sub  x24, x24, x25
-    ldr  x0, [x24, #RST_DESC_PROBE_ENABLED]
-    cbz  x0, mock_fb_no_probe
-    mov  x0, x3
-    bl   probe_marker
-mock_fb_no_probe:
-    ldr  x0, [x16, #8]              /* fmt: 1 → 字节 run 应用 */
-    cbz  x0, mock_legacy_apply
-    mov  x25, x4
-    adr  x27, mock_applied
-    b    apply_rec_runs
-mock_legacy_apply:
-    ldr  x18, [x4, #40]             /* n_newseg */
-    ldr  x19, [x4, #48]
-    add  x19, x19, x16
-mock_ns_loop:
-    cbz  x18, mock_dirty
-    ldr  x20, [x19]                 /* vaddr */
-    ldr  x21, [x19, #8]             /* filesz */
-    add  x22, x19, #32              /* src */
-    mov  x0, x20
-    mov  x1, x22
-    mov  x2, x21
-    bl   copy_blob                /* 目标阶段: 不碰 NEON */
-    add  x19, x19, #32
-    add  x19, x19, x21
-    sub  x18, x18, #1
-    b    mock_ns_loop
-mock_dirty:
-    ldr  x18, [x4, #56]             /* n_dirty */
-    ldr  x19, [x4, #64]
-    add  x19, x19, x16
-mock_dirty_loop:
-    cbz  x18, mock_applied
-    ldr  x20, [x19]                 /* dst */
-    /* 栈保护: 跳过主线程活动栈页 */
-    adrp x7, mock_stack_lo
-    add  x7, x7, :lo12:mock_stack_lo
-    ldr  x8, [x7]
-    cbz  x8, 2f
-    cmp  x20, x8
-    b.lo 2f
-    ldr  x8, [x7, #8]
-    cmp  x20, x8
-    b.hs 2f
-    add  x19, x19, #4096
-    add  x19, x19, #8
-    sub  x18, x18, #1
-    b    mock_dirty_loop
-2:
-    add  x21, x19, #8               /* src */
-    mov  x0, x20
-    mov  x1, x21
-    mov  x2, #4096
-    bl   copy_blob
-    add  x19, x19, #4096
-    add  x19, x19, #8
-    sub  x18, x18, #1
-    b    mock_dirty_loop
-mock_applied:
-    /* 清除栈保护 (下次 spin-apply 重新设置) */
-    adrp x7, mock_stack_lo
-    add  x7, x7, :lo12:mock_stack_lo
-    str  xzr, [x7]
-    str  xzr, [x7, #8]
-    adrp x7, debug_ring
-    add  x7, x7, :lo12:debug_ring
-    ldr  x5, [x7, #0x1018]
-    add  x5, x5, #1
-    str  x5, [x7, #0x1018]          /* 调试: 自旋应用次数 */
-    add  x3, x3, #1
-    str  x3, [x6]                   /* next_pending 前进 (顺序应用) */
-    ldr  x2, [x17, #(24 + 8*8)]     /* 重新装载 sysno */
+    mov  x0, #66                    /* 看门狗退出码 */
+    b    mock_watchdog_exit
 mock_dispatch:
     cmp  x2, #94
     beq  comp_mock_exit
@@ -1836,6 +1740,12 @@ mock_exhausted_exit:
     movz x6, #(STUB_STRICT_EXIT_OFF & 0xffff)
     add  x5, x5, x6
     br   x5
+mock_watchdog_exit:
+    /* mock 看门狗: 同一 mock 站点连续命中 256 次 (自旋), fail-closed
+       以退出码 66 终止 (不提前应用未来 diff, 避免覆盖活动栈/桩状态) */
+    mov  x8, #94                    /* exit_group */
+    svc  #0
+    b    .
 comp_mock_write:
     ldr  x1, [x17, #(24 + 2*8)]     /* 目标 x2 = len */
     b    comp_mock_set
