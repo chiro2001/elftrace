@@ -137,8 +137,9 @@ int a64_is_ldar_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
 #define A64_ATB_STATE_LAST_VAL  8
 #define A64_ATB_STATE_LAST_ADDR 16
 
-/* 事件 (32B) */
-#define A64_ATB_EVENT_SIZE      32
+/* 事件 (40B): {site_id, ord, addr, value, caller}
+   caller 仅 record-all 诊断模式由普通 load 跳板填写 (原子跳板留空) */
+#define A64_ATB_EVENT_SIZE      40
 
 /* ---- 侧车文件魔数 (trace 输出 atomics/) ---- */
 #define A64_AT_SITES_MAGIC  0x53495445ULL   /* "ETIS" */

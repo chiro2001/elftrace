@@ -382,7 +382,7 @@ static void atomic_load(const char *dir, long from, long to,
                     rd_u64(&ep) == 1) {
                     uint64_t n_ev = rd_u64(&ep);
                     rd_u64(&ep);            /* bytes */
-                    if (ee - ep >= (long)(n_ev * 32)) {
+                    if (ee - ep >= (long)(n_ev * A64_ATB_EVENT_SIZE)) {
                         ab->runs = xmalloc((n_ev ? n_ev : 1) *
                                            sizeof(*ab->runs));
                         size_t nr = 0;
@@ -391,6 +391,7 @@ static void atomic_load(const char *dir, long from, long to,
                             uint64_t ord = rd_u64(&ep);
                             uint64_t addr = rd_u64(&ep);
                             uint64_t value = rd_u64(&ep);
+                            rd_u64(&ep);            /* caller (诊断) */
                             if (site_id >= n_sites)
                                 continue;
                             if (ord <= ab->sites[site_id].from_ord ||
@@ -432,11 +433,13 @@ static void atomic_load(const char *dir, long from, long to,
                     uint64_t n_ev = rd_u64(&ep);
                     rd_u64(&ep);            /* bytes */
                     size_t total = 0;
-                    for (uint64_t k = 0; k < n_ev && ee - ep >= 32; k++) {
+                    for (uint64_t k = 0; k < n_ev &&
+                                      ee - ep >= A64_ATB_EVENT_SIZE; k++) {
                         uint64_t site_id = rd_u64(&ep);
                         uint64_t ord = rd_u64(&ep);
                         rd_u64(&ep);            /* addr */
                         rd_u64(&ep);            /* value */
+                        rd_u64(&ep);            /* caller */
                         if (site_id >= n_sites)
                             continue;
                         if (ord <= ab->sites[site_id].from_ord ||
@@ -472,11 +475,13 @@ static void atomic_load(const char *dir, long from, long to,
                         ab->n_runs++;
                     }
                     ep = eb + 32;
-                    for (uint64_t k = 0; k < n_ev && ee - ep >= 32; k++) {
+                    for (uint64_t k = 0; k < n_ev &&
+                                      ee - ep >= A64_ATB_EVENT_SIZE; k++) {
                         uint64_t site_id = rd_u64(&ep);
                         uint64_t ord = rd_u64(&ep);
                         uint64_t addr = rd_u64(&ep);
                         uint64_t value = rd_u64(&ep);
+                        rd_u64(&ep);            /* caller */
                         if (site_id >= n_sites)
                             continue;
                         if (ord <= ab->sites[site_id].from_ord ||

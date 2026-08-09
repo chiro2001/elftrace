@@ -673,6 +673,8 @@ size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
     put32(&p, str_x_imm(21, 19, 8));    /* [event+8] = ordinal */
     put32(&p, str_x_imm(21, 12, 16));   /* [event+16] = addr */
     put32(&p, str_x_imm(21, 13, 24));   /* [event+24] = value */
+    if (record_all)
+        put32(&p, str_x_imm(21, 30, 32));   /* [event+32] = caller */
     put32(&p, str_x_imm(18, 22, 0));    /* hdr.event_ptr = event+32 */
     uint8_t *skip_b = p;
     put32(&p, 0x14000000U);     /* b done (占位, 无条件) */
