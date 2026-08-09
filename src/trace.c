@@ -257,6 +257,7 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
                                     (tc->n_syscalls + 1) *
                                     sizeof(*tc->syscalls));
             struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
+            memset(r, 0, sizeof(*r));   /* interrupted 等字段必须清零 */
             r->pc = rip - ARCH_SYSCALL_LEN;  /* syscall 指令 */
             r->sysno = 0;       /* EXIT-stop 无 syscall 号 */
             r->entry_x0 = 0;
@@ -281,6 +282,7 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
                                 (tc->n_syscalls + 1) *
                                 sizeof(*tc->syscalls));
         struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
+        memset(r, 0, sizeof(*r));       /* interrupted 等字段必须清零 */
         r->pc = tc->pend_pc;
         r->sysno = tc->pend_sysno;
         r->entry_x0 = tc->pend_x0;
@@ -308,7 +310,20 @@ static int collect_interrupt_sc(struct trace_ctx *tc)
         if (ptrace(PTRACE_INTERRUPT, pid, 0, 0) < 0)
             return -1;
         int st;
-        if (waitpid(pid, &st, 0) < 0)
+        /* 带超时的 waitpid: 目标可能在检查点竞争窗口内崩溃/退出,
+           阻塞等待会让 tracer 永久挂起 (condvar 复现)。 */
+        int got = 0;
+        for (int w = 0; w < 200; w++) {
+            pid_t wr = waitpid(pid, &st, WNOHANG);
+            if (wr == pid) {
+                got = 1;
+                break;
+            }
+            if (wr < 0)
+                return -1;
+            usleep(5000);
+        }
+        if (!got)
             return -1;
         if (!WIFSTOPPED(st))
             return -1;
@@ -347,6 +362,7 @@ static int collect_interrupt_sc(struct trace_ctx *tc)
                                         (tc->n_syscalls + 1) *
                                         sizeof(*tc->syscalls));
             struct syscall_rec *r = &tc->syscalls[tc->n_syscalls++];
+            memset(r, 0, sizeof(*r));
             r->pc = psi.instruction_pointer - ARCH_SYSCALL_LEN;
             r->sysno = 0;   /* EXIT-stop 无 syscall 号 */
             r->entry_x0 = 0;
@@ -666,8 +682,30 @@ int trace_main(int argc, char **argv)
             pid_t wr = waitpid(pid, &wst, WNOHANG);
             if (wr != pid)
                 break;
-            if (WIFEXITED(wst) || WIFSIGNALED(wst))
+            if (WIFEXITED(wst) || WIFSIGNALED(wst)) {
+#if defined(__aarch64__)
+                if (WIFSIGNALED(wst)) {
+                    /* 崩溃诊断: 目标被信号终止时打印 PC/关键寄存器 */
+                    struct user_regs_struct rr;
+                    struct iovec io = {.iov_base = &rr,
+                                       .iov_len = sizeof(rr)};
+                    if (ptrace(PTRACE_GETREGSET, pid,
+                               (void *)NT_PRSTATUS, &io) == 0)
+                        fprintf(stderr,
+                                "trace: target killed by signal %d "
+                                "(pc %#llx x0 %#llx x30 %#llx sp %#llx)\n",
+                                WTERMSIG(wst),
+                                (unsigned long long)rr.pc,
+                                (unsigned long long)rr.regs[0],
+                                (unsigned long long)rr.regs[30],
+                                (unsigned long long)rr.sp);
+                    else
+                        fprintf(stderr, "trace: target killed by signal %d\n",
+                                WTERMSIG(wst));
+                }
+#endif
                 goto main_done;
+            }
             if (!WIFSTOPPED(wst))
                 continue;
             int si = WSTOPSIG(wst);
@@ -689,8 +727,23 @@ int trace_main(int argc, char **argv)
             } else if (si == SIGTRAP) {
                 ptrace(PTRACE_SYSCALL, pid, 0, 0);
             } else {
-                fprintf(stderr, "trace: target signal %d (delivered)\n",
-                        si);
+#if defined(__aarch64__)
+                struct user_regs_struct rr;
+                struct iovec io = {.iov_base = &rr, .iov_len = sizeof(rr)};
+                if (si == SIGSEGV || si == SIGBUS || si == SIGILL ||
+                    si == SIGFPE || si == SIGTRAP) {
+                    if (ptrace(PTRACE_GETREGSET, pid,
+                               (void *)NT_PRSTATUS, &io) == 0)
+                        fprintf(stderr,
+                                "trace: target fault signal %d pc %#llx "
+                                "x0 %#llx x30 %#llx sp %#llx\n",
+                                si, (unsigned long long)rr.pc,
+                                (unsigned long long)rr.regs[0],
+                                (unsigned long long)rr.regs[30],
+                                (unsigned long long)rr.sp);
+                }
+#endif
+                fprintf(stderr, "trace: target signal %d (delivered)\n", si);
                 ptrace(PTRACE_SYSCALL, pid, 0, si);
             }
         }

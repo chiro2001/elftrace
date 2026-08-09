@@ -448,6 +448,78 @@ static unsigned long find_stage1_page_a64(pid_t pid, unsigned long pc)
     return best;
 }
 
+/* 在 scratch 页执行 dc cvau / ic ivau 片段, 刷新 [page, page+len) 的
+ * I-cache。执行后恢复页原始字节 (该范围已被 ic ivau 失效, 目标下次
+ * 执行会重新取指)。 */
+static void inject_flush_icache(pid_t pid,
+                                const struct user_regs_struct *regs,
+                                unsigned long page, size_t len)
+{
+    uint32_t code[32];
+    size_t n = 0;
+    uint64_t start = page, end = page + len;
+    uint64_t v = start;
+    code[n++] = 0xD2800000U | ((uint32_t)(v & 0xffff) << 5) | 16U;
+    if (v & 0xFFFF0000ULL)
+        code[n++] = 0xF2800000U | (1U << 21) |
+                    ((uint32_t)((v >> 16) & 0xffff) << 5) | 16U;
+    if (v & 0xFFFFFFFF0000ULL)
+        code[n++] = 0xF2800000U | (2U << 21) |
+                    ((uint32_t)((v >> 32) & 0xffff) << 5) | 16U;
+    if (v & 0xFFFFFFFFFFFF0000ULL)
+        code[n++] = 0xF2800000U | (3U << 21) |
+                    ((uint32_t)((v >> 48) & 0xffff) << 5) | 16U;
+    v = end;
+    code[n++] = 0xD2800000U | ((uint32_t)(v & 0xffff) << 5) | 17U;
+    if (v & 0xFFFF0000ULL)
+        code[n++] = 0xF2800000U | (1U << 21) |
+                    ((uint32_t)((v >> 16) & 0xffff) << 5) | 17U;
+    if (v & 0xFFFFFFFF0000ULL)
+        code[n++] = 0xF2800000U | (2U << 21) |
+                    ((uint32_t)((v >> 32) & 0xffff) << 5) | 17U;
+    if (v & 0xFFFFFFFFFFFF0000ULL)
+        code[n++] = 0xF2800000U | (3U << 21) |
+                    ((uint32_t)((v >> 48) & 0xffff) << 5) | 17U;
+    code[n++] = 0xD50B7B30U;             /* dc cvau, x16 */
+    code[n++] = 0xD50B7530U;             /* ic ivau, x16 */
+    code[n++] = 0x91010210U;             /* add x16, x16, #64 */
+    code[n++] = 0xEB11021F;              /* cmp x16, x17 */
+    code[n++] = 0x54FFFFF83U;            /* b.lo loop (imm19=-4) */
+    code[n++] = 0xD5033B9FU;             /* dsb ish */
+    code[n++] = 0xD5033FDFU;             /* isb */
+    code[n++] = 0xD4200000U;             /* brk #0 */
+    /* 备份片段覆盖区 → 写片段 → 执行 → 恢复 */
+    size_t nwords = (n * 4 + 7) / 8;
+    unsigned long *backup = xmalloc(nwords * sizeof(*backup));
+    for (size_t i = 0; i < nwords; i++)
+        backup[i] = ptrace(PTRACE_PEEKDATA, pid, page + i * 8, 0);
+    for (size_t i = 0; i < n; i += 2) {
+        unsigned long w = 0;
+        size_t m = n - i;
+        memcpy(&w, code + i, m >= 2 ? 8 : 4);
+        ptrace(PTRACE_POKEDATA, pid, page + i, w);
+    }
+    struct user_regs_struct r = *regs;
+    struct iovec io = {.iov_base = &r, .iov_len = sizeof(r)};
+    int st;
+    r.pc = page;
+    if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io) == 0 &&
+        ptrace(PTRACE_CONT, pid, 0, 0) == 0) {
+        if (waitpid(pid, &st, 0) > 0 && WIFSTOPPED(st)) {
+            if (WSTOPSIG(st) == SIGSTOP) {
+                ptrace(PTRACE_CONT, pid, 0, SIGCONT);
+                waitpid(pid, &st, 0);
+            }
+        }
+    }
+    struct iovec io_orig = {.iov_base = (void *)regs,
+                            .iov_len = sizeof(*regs)};
+    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io_orig);
+    for (size_t i = 0; i < nwords; i++)
+        ptrace(PTRACE_POKEDATA, pid, page + i * 8, backup[i]);
+    free(backup);
+}
+
 /* 执行 ninsn 条指令的片段 (写入冷页, 要求 brk #0 结束)。
  * ret0: 结束时 x0。成功返回 0, 失败 -1 (页字节/寄存器已恢复)。 */
 int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
@@ -457,19 +529,6 @@ int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
     int st;
     if (!page || ninsn == 0 || ninsn * 4 > 4096)
         return -1;
-
-    unsigned long backup[2];
-    for (size_t i = 0; i < ninsn; i += 2) {
-        unsigned long w = 0;
-        size_t n = ninsn - i;
-        memcpy(&w, code + i, n >= 2 ? 8 : 4);
-        if (i / 2 == 0)
-            backup[0] = ptrace(PTRACE_PEEKDATA, pid, page, 0);
-        if (ninsn > 2 && i == 2)
-            backup[1] = ptrace(PTRACE_PEEKDATA, pid, page + 8, 0);
-        if (ptrace(PTRACE_POKEDATA, pid, page + i, w) < 0)
-            return -1;
-    }
 
     /* 停住其他线程: PTRACE_CONT 会恢复全部线程, waitpid 可能等到
        worker 线程的 stop (信号/断点), 读到的 x0 是垃圾 (实测 mmap
@@ -488,6 +547,24 @@ int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
         }
         closedir(td);
         usleep(1000);   /* 让 SIGSTOP 生效 */
+    }
+
+    /* 备份全部覆盖字节 (按 ptrace 8B word 取整): 长片段 (cache flush
+       等) 可达数十条指令, 旧代码只备份 2 个 word, 执行后 0x10 之后
+       的注入指令永久残留在目标代码页 → 目标随后执行到该页即 SIGSEGV
+       (condvar Run1/Run2 稳定崩溃)。 */
+    size_t nwords = (ninsn * 4 + 7) / 8;
+    unsigned long *backup = xmalloc(nwords * sizeof(*backup));
+    for (size_t i = 0; i < nwords; i++)
+        backup[i] = ptrace(PTRACE_PEEKDATA, pid, page + i * 8, 0);
+    for (size_t i = 0; i < ninsn; i += 2) {
+        unsigned long w = 0;
+        size_t n = ninsn - i;
+        memcpy(&w, code + i, n >= 2 ? 8 : 4);
+        if (ptrace(PTRACE_POKEDATA, pid, page + i, w) < 0) {
+            free(backup);
+            return -1;
+        }
     }
 
     struct user_regs_struct r = *regs, saved = *regs;
@@ -516,9 +593,11 @@ int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
     }
     io.iov_base = &saved;
     ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io);
-    ptrace(PTRACE_POKEDATA, pid, page, backup[0]);
-    if (ninsn > 2)
-        ptrace(PTRACE_POKEDATA, pid, page + 8, backup[1]);
+    for (size_t i = 0; i < nwords; i++)
+        ptrace(PTRACE_POKEDATA, pid, page + i * 8, backup[i]);
+    free(backup);
+    /* 恢复后刷新目标 I-cache: 否则 PE 可能仍执行缓存中的注入指令 */
+    inject_flush_icache(pid, &saved, page, ninsn * 4);
     /* 恢复其他线程 */
     if (td) {
         DIR *td2 = opendir(task);
