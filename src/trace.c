@@ -510,6 +510,7 @@ int trace_main(int argc, char **argv)
 #if defined(__aarch64__)
     const char *comp_path = NULL;
     const char *value_sites = NULL;
+    int vr_record_all = 0;
 #endif
 
     tc.every = TRACE_DEFAULT_EVERY;
@@ -536,6 +537,8 @@ int trace_main(int argc, char **argv)
         } else if (strcmp(argv[i], "--value-replay-sites") == 0 &&
                    i + 1 < argc) {
             value_sites = argv[++i];
+        } else if (strcmp(argv[i], "--value-replay-record-all") == 0) {
+            vr_record_all = 1;
 #endif
         } else if (argv[i][0] >= '0' && argv[i][0] <= '9') {
             pid = atoi(argv[i]);
@@ -612,7 +615,8 @@ int trace_main(int argc, char **argv)
             if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
                        &io) == 0) {
                 if (atomic_trace_arm(&tc.atomic, pid, &rr, tc.out,
-                                     tc.atomic_buf_size, value_sites) < 0)
+                                     tc.atomic_buf_size, value_sites,
+                                     vr_record_all) < 0)
                     warn("trace: atomic replay unavailable, continuing "
                          "without it");
             }

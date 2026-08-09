@@ -15,7 +15,8 @@ struct atomic_trace_ctx;
  * 未修改 (尽力), 调用方继续普通 trace。 */
 int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
                      const void *regs, const char *out,
-                     uint64_t buf_size, const char *value_sites);
+                     uint64_t buf_size, const char *value_sites,
+                     int record_all);
 
 /* 检查点前调用: 若 pc 落在记录页内, 单步到记录跳板结束。
  * 返回 0 = 已离开记录页; -1 = 单步失败/超时 (调用方应放弃该检查点)。 */

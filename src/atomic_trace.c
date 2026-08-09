@@ -63,6 +63,7 @@ struct atomic_trace_ctx {
     uint64_t dump_event_ptr;    /* 已转储事件游标 (绝对地址) */
     uint64_t total_events;      /* 已转储事件数 (补偿模型) */
     unsigned base_insns, append_insns;
+    int record_all;             /* 诊断: 全量记录普通 load 访问 */
     /* 补偿: 每检查点 {measured, overhead, orig} */
     uint64_t *ckpt_measured;
     uint64_t *ckpt_overhead;
@@ -431,7 +432,7 @@ static int atomic_flush_ranges(pid_t pid,
 
 int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
                      const void *regs, const char *out, uint64_t buf_size,
-                     const char *value_sites)
+                     const char *value_sites, int record_all)
 {
     struct atomic_trace_ctx *ctx = xcalloc(1, sizeof(*ctx));
     struct asite *sites = NULL;
@@ -446,6 +447,7 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
     ctx->pid = pid;
     ctx->regs = *(const struct user_regs_struct *)regs;
     ctx->tls = collect_get_tls();
+    ctx->record_all = record_all;
     if (!ctx->tls) {
         warn("atomic: no TPIDR_EL0 for target, atomic replay disabled");
         free(ctx);
@@ -562,7 +564,7 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
                     state_abs, ctx->abuf_addr + A64_ATB_OFF_EVENT_PTR,
                     ctx->abuf_addr + A64_ATB_OFF_EVENTS_END,
                     ctx->abuf_addr + A64_ATB_OFF_OVERFLOW,
-                    sites[i].pc + 4, &cnt);
+                    sites[i].pc + 4, &cnt, ctx->record_all);
             } else {
                 bl = a64_atomic_record_block(
                     blk, block_abs, sites[i].orig_insn, ctx->tls, i,
@@ -974,10 +976,11 @@ int atomic_trace_finish(struct atomic_trace_ctx *ctx)
 
 int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
                      const void *regs, const char *out, uint64_t buf_size,
-                     const char *value_sites)
+                     const char *value_sites, int record_all)
 {
     (void)ctx_out; (void)pid; (void)regs; (void)out; (void)buf_size;
     (void)value_sites;
+    (void)record_all;
     return -1;
 }
 int atomic_trace_step_out(struct atomic_trace_ctx *ctx)

@@ -55,3 +55,12 @@
 50aaa0 b9400041
 50ad64 f9400462
 50ad70 b9400061
+# selectmodule poll 结果循环 (窄读: revents/fd 决定结果 list/tuple 的
+# 分配序列 — 首分配分歧的上游)
+6ae070 79c00c00
+6ae0ac b8b96800
+6ae0c4 79400c00
+# PyList_New/PyList_Free 自由链表 (numfree 是 worker 共享计数器,
+# 陈旧值会让切片跳过 list 分配 → 分配序列整体前移一位)
+4d82a8 b9428020
+4d82b4 f860d833

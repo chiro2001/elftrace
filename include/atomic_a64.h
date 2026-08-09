@@ -34,6 +34,8 @@ struct a64_ld_addr {
     unsigned rn, rm;
     int64_t imm;
     int shift;              /* mode 1: 0, 2 (w) 或 3 (x) */
+    int ldr_kind;           /* 0=ldr w/x, 1=ldrb, 2=ldrh, 3=ldrsw,
+                               4=ldrsb(w), 5=ldrsh(w) */
 };
 
 /* ---- 块/页布局 ---- */
@@ -81,7 +83,8 @@ size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
                              uint64_t events_end_addr,
                              uint64_t overflow_addr,
                              uint64_t ret_addr,
-                             struct a64_atom_counts *counts);
+                             struct a64_atom_counts *counts,
+                             int record_all);
 
 /* ---- 回放跳板块 ----
  * 入口: stp x16,x17; nop; ldr x16,[pc,#8]; br x16; .quad block_abs。

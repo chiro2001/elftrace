@@ -300,40 +300,75 @@ int a64_is_load_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
 int a64_is_plain_load(uint32_t w, int *size, unsigned *rt, unsigned *rn,
                       int *kind, struct a64_ld_addr *ad)
 {
-    /* 立即数: ldr w/x, [Xn, #imm] (imm = 未缩放字节偏移) */
-    if ((w & 0xFFC00000U) == 0xF9400000U ||
-        (w & 0xFFC00000U) == 0xB9400000U) {
-        int s = (w & 0x40000000U) ? 8 : 4;
-        if (size) *size = s;
-        if (rt) *rt = w & 0x1FU;
-        if (rn) *rn = (w >> 5) & 0x1FU;
-        if (kind) *kind = 2;
-        if (ad) {
-            ad->mode = 0;
-            ad->rn = (w >> 5) & 0x1FU;
-            ad->rm = 0;
-            ad->imm = (int64_t)((w >> 10) & 0xFFFU) << (s == 8 ? 3 : 2);
-            ad->shift = 0;
+    /* 立即数形式: 按编码基区分 ldr w/x, ldrb, ldrh, ldrsw, ldrsb, ldrsh */
+    static const struct {
+        uint32_t base;          /* & 0xFFC00000 */
+        int ldr_kind;
+        int s;                  /* 加载宽度 */
+        int shift;              /* imm 缩放 */
+    } imm_forms[] = {
+        {0xF9400000U, 0, 8, 3},
+        {0xB9400000U, 0, 4, 2},
+        {0x39400000U, 1, 1, 0},
+        {0x79400000U, 2, 2, 1},
+        {0xB9800000U, 3, 8, 2},
+        {0x39C00000U, 4, 1, 0},   /* ldrsb w (零扩展进 w) */
+        {0x79C00000U, 5, 2, 1},   /* ldrsh w */
+    };
+    for (size_t i = 0; i < sizeof(imm_forms) / sizeof(imm_forms[0]); i++) {
+        if ((w & 0xFFC00000U) == imm_forms[i].base) {
+            if (size) *size = imm_forms[i].s;
+            if (rt) *rt = w & 0x1FU;
+            if (rn) *rn = (w >> 5) & 0x1FU;
+            if (kind) *kind = 2;
+            if (ad) {
+                ad->mode = 0;
+                ad->rn = (w >> 5) & 0x1FU;
+                ad->rm = 0;
+                ad->imm = (int64_t)((w >> 10) & 0xFFFU) <<
+                          imm_forms[i].shift;
+                ad->shift = 0;
+                ad->ldr_kind = imm_forms[i].ldr_kind;
+            }
+            return 1;
         }
-        return 1;
     }
-    /* 寄存器偏移: ldr w/x, [Xn, Xm{, lsl #s}] (option=011 LSL) */
-    if ((w & 0xFFE0E000U) == 0xF8606000U ||
-        (w & 0xFFE0E000U) == 0xB8606000U) {
-        int s = (w & 0x40000000U) ? 8 : 4;
-        if (size) *size = s;
-        if (rt) *rt = w & 0x1FU;
-        if (rn) *rn = (w >> 5) & 0x1FU;
-        if (kind) *kind = 3;
-        if (ad) {
-            ad->mode = 1;
-            ad->rn = (w >> 5) & 0x1FU;
-            ad->rm = (w >> 16) & 0x1FU;
-            ad->imm = 0;
-            /* S 位: 0 → LSL #0; 1 → LSL #3 (x) / #2 (w) */
-            ad->shift = (w & 0x1000U) ? (s == 8 ? 3 : 2) : 0;
+    /* 寄存器偏移 (option=011 LSL): ldr/ldrb/ldrh/ldrsb/ldrsh/ldrsw */
+    static const struct {
+        uint32_t base;          /* & 0xFFE0E000 */
+        int ldr_kind;
+        int s;
+        int shift;              /* S=1 时的移位 */
+    } reg_forms[] = {
+        {0xF8606000U, 0, 8, 3},
+        {0xB8606000U, 0, 4, 2},
+        {0x38606000U, 1, 1, 0},
+        {0x78606000U, 2, 2, 1},
+        {0xB8A06000U, 3, 8, 2},
+        {0x38E06000U, 4, 1, 0},
+        {0x78E06000U, 5, 2, 1},
+        /* SXTW (option=110): free_list 等按索引取指针
+           (S 位在掩码外, shift 由 S 位决定) */
+        {0xF860C000U, 0, 8, 3},
+        {0xB860C000U, 0, 4, 2},
+        {0xB8A0C000U, 3, 8, 2},
+    };
+    for (size_t i = 0; i < sizeof(reg_forms) / sizeof(reg_forms[0]); i++) {
+        if ((w & 0xFFE0E000U) == reg_forms[i].base) {
+            if (size) *size = reg_forms[i].s;
+            if (rt) *rt = w & 0x1FU;
+            if (rn) *rn = (w >> 5) & 0x1FU;
+            if (kind) *kind = 3;
+            if (ad) {
+                ad->mode = 1;
+                ad->rn = (w >> 5) & 0x1FU;
+                ad->rm = (w >> 16) & 0x1FU;
+                ad->imm = 0;
+                ad->shift = (w & 0x1000U) ? reg_forms[i].shift : 0;
+                ad->ldr_kind = reg_forms[i].ldr_kind;
+            }
+            return 1;
         }
-        return 1;
     }
     return 0;
 }
@@ -350,7 +385,24 @@ static uint32_t a64_ldar_insn(int size, unsigned rn, unsigned rt)
 /* 按加载宽度生成普通 ldr 指令 (自旋回放屏障用, 无排他监视器) */
 static uint32_t a64_ldr_insn(int size, unsigned rn, unsigned rt)
 {
-    uint32_t base = size == 4 ? 0xB9400000U : 0xF9400000U;
+    uint32_t base = size == 1 ? 0x39400000U :
+                    size == 2 ? 0x79400000U :
+                    size == 4 ? 0xB9400000U : 0xF9400000U;
+    return base | (rn << 5) | rt;
+}
+
+/* 按 ldr_kind 生成值加载指令 (记录/回放屏障共用) */
+static uint32_t a64_ldval_insn(int ldr_kind, int size,
+                               unsigned rn, unsigned rt)
+{
+    uint32_t base = ldr_kind == 1 ? 0x39400000U :
+                    ldr_kind == 2 ? 0x79400000U :
+                    ldr_kind == 3 ? 0xB9800000U :
+                    ldr_kind == 4 ? 0x39C00000U :
+                    ldr_kind == 5 ? 0x79C00000U :
+                    (0xF9400000U);
+    if (ldr_kind == 0)
+        return a64_ldr_insn(size, rn, rt);
     return base | (rn << 5) | rt;
 }
 
@@ -371,6 +423,7 @@ static uint32_t a64_ldaxr_insn(int size, unsigned rn, unsigned rt)
 #define REC_EVENTS_END_ADDR_OFF 0x220
 #define REC_OVERFLOW_ADDR_OFF 0x228
 #define REC_RET_ADDR_OFF      0x230
+#define REC_RECORD_ALL_OFF    0x238   /* 诊断: 全量记录 (不游程压缩) */
 
 size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
                                uint32_t orig_insn, uint64_t tls,
@@ -532,7 +585,8 @@ size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
                              uint64_t events_end_addr,
                              uint64_t overflow_addr,
                              uint64_t ret_addr,
-                             struct a64_atom_counts *counts)
+                             struct a64_atom_counts *counts,
+                             int record_all)
 {
     uint8_t *p = out;
     unsigned rn;
@@ -576,8 +630,8 @@ size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
             put32(&p, movz_x(13, 0, 0));
         put32(&p, add_xr_lsl(12, 12, 13, (unsigned)ad->shift));
     }
-    /* 执行原 load (值 → x13, w 零扩展) */
-    put32(&p, a64_ldr_insn(size, 12, 13));
+    /* 执行原 load (值 → x13; 窄读零/符号扩展按 ldr_kind) */
+    put32(&p, a64_ldval_insn(ad->ldr_kind, size, 12, 13));
 
     /* TLS 过滤: 非目标线程只执行原始 load, 不记录 */
     put32(&p, INSN_MRS_X14_TPIDR);
@@ -592,13 +646,16 @@ size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
     put32(&p, add_x(19, 19, 1));
     put32(&p, str_x_imm(17, 19, 0));
 
-    /* 值/地址变化才追加事件 (游程压缩) */
-    put32(&p, ldr_x_imm(17, 20, 8));    /* last_val */
-    put32(&p, ldr_x_imm(17, 21, 16));   /* last_addr */
-    put32(&p, cmp_x(20, 13));
-    put32(&p, ccmp_eq(21, 12));
-    uint8_t *same_b = p;
-    put32(&p, bcond(0, 0));     /* b.eq done (占位) */
+    uint8_t *same_b = NULL;
+    if (!record_all) {
+        /* 值/地址变化才追加事件 (游程压缩) */
+        put32(&p, ldr_x_imm(17, 20, 8));    /* last_val */
+        put32(&p, ldr_x_imm(17, 21, 16));   /* last_addr */
+        put32(&p, cmp_x(20, 13));
+        put32(&p, ccmp_eq(21, 12));
+        same_b = p;
+        put32(&p, bcond(0, 0));     /* b.eq done (占位) */
+    }
     put32(&p, str_x_imm(17, 13, 8));    /* last_val = value */
     put32(&p, str_x_imm(17, 12, 16));   /* last_addr = addr */
 
@@ -634,13 +691,16 @@ size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
 
         /* 回填条件分支 */
         int32_t d1 = (int32_t)(done - tls_bne);
-        int32_t d2 = (int32_t)(done - same_b);
+        int32_t d2 = same_b ? (int32_t)(done - same_b) : 0;
         int32_t d3 = (int32_t)((skip_b + 4) - ovf_b);
         uint32_t w4 = a64_encode_b(block_abs + (uint64_t)(skip_b - out),
                                    block_abs + (uint64_t)(done - out));
         uint32_t w;
         w = bcond(d1, 1);   memcpy(tls_bne, &w, 4);
-        w = bcond(d2, 0);   memcpy(same_b, &w, 4);
+        if (same_b) {
+            w = bcond(d2, 0);
+            memcpy(same_b, &w, 4);
+        }
         w = bcond(d3, 8);   memcpy(ovf_b, &w, 4);
         memcpy(skip_b, &w4, 4);
     }
@@ -664,6 +724,7 @@ size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
     v = events_end_addr;        memcpy(out + REC_EVENTS_END_ADDR_OFF, &v, 8);
     v = overflow_addr;          memcpy(out + REC_OVERFLOW_ADDR_OFF, &v, 8);
     v = ret_addr;               memcpy(out + REC_RET_ADDR_OFF, &v, 8);
+    v = record_all ? 1 : 0;     memcpy(out + REC_RECORD_ALL_OFF, &v, 8);
 
     return A64_ATOM_BLOCK_SIZE;
 }
@@ -775,12 +836,13 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     uint8_t *ne_b = p;
     put32(&p, bcond(0, 1));     /* b.ne use_real (占位) */
     put32(&p, ldr_x_imm(24, 23, 16));   /* run.value */
-    /* 真实屏障: 对原地址执行 ldar/ldaxr/ldr (值丢弃), 保证排序语义;
+    /* 真实屏障: 对原地址执行 ldar/ldaxr/普通 load (值丢弃), 保证排序语义;
        ldaxr 额外设置排他监视器, 使后续真实 stlxr/stxr 成功 (锁获取);
        普通 ldr 自旋站点用普通 ldr 即可 */
-    put32(&p, kind == 1 ? a64_ldaxr_insn(size, 27, 29)
-                        : kind == 2 ? a64_ldr_insn(size, 27, 29)
-                                    : a64_ldar_insn(size, 27, 29));
+    put32(&p, ad ? a64_ldval_insn(ad->ldr_kind, size, 27, 29)
+                 : kind == 1 ? a64_ldaxr_insn(size, 27, 29)
+                             : kind == 2 ? a64_ldr_insn(size, 27, 29)
+                                         : a64_ldar_insn(size, 27, 29));
     uint8_t *set_jmp = p;
     put32(&p, 0x14000000U);     /* b set (占位, 无条件) */
     uint8_t *use_real = p;
@@ -805,9 +867,10 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
         put32(&p, add_xr_lsl(27, 27, 28, (unsigned)ad->shift));
     }
     /* 真实值: 用保存集内的 x29 做加载 (x13 不在最小保存集, 不能破坏) */
-    put32(&p, kind == 1 ? a64_ldaxr_insn(size, 27, 29)
-                        : kind == 2 ? a64_ldr_insn(size, 27, 29)
-                                    : a64_ldar_insn(size, 27, 29));
+    put32(&p, ad ? a64_ldval_insn(ad->ldr_kind, size, 27, 29)
+                 : kind == 1 ? a64_ldaxr_insn(size, 27, 29)
+                             : kind == 2 ? a64_ldr_insn(size, 27, 29)
+                                         : a64_ldar_insn(size, 27, 29));
     put32(&p, mov_x(23, 29));           /* 真实值 → x23 (set 统一写槽) */
     uint8_t *set = p;
     /* 把最终值写入 Rt 的保存槽 (恢复时弹出) */

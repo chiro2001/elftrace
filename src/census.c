@@ -62,8 +62,9 @@ static int parse_elf(const char *path)
 
 static long do_ptrace(enum __ptrace_request req, pid_t pid, void *a, void *b)
 {
+    errno = 0;
     long r = ptrace(req, pid, a, b);
-    if (r < 0 && errno != ESRCH)
+    if (r < 0 && errno != 0 && errno != ESRCH)
         fprintf(stderr, "census: ptrace %d failed: %s\n", req,
                 strerror(errno));
     return r;
@@ -193,6 +194,8 @@ int main(int argc, char **argv)
 
     unsigned long long reads = 0, writes = 0;
     unsigned char *seen = calloc(npages, 1);
+    unsigned long last_pc = 0;
+    int same_pc = 0;
     for (;;) {
         do_ptrace(PTRACE_CONT, pid, 0, 0);
         waitpid(pid, &st, 0);
@@ -201,16 +204,30 @@ int main(int argc, char **argv)
         int sig = WSTOPSIG(st);
         if (sig == (SIGTRAP | 0x80))
             continue;
-        if (sig != SIGSEGV)
+        if (sig != SIGSEGV) {
+            same_pc = 0;
             continue;               /* 其他信号: 放行 */
+        }
         siginfo_t si;
         unsigned long addr = 0;
         if (do_ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0)
             addr = (unsigned long)si.si_addr;
-        if (!addr)
-            continue;
         do_ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &io);
         unsigned long pc = REG_PC(regs);
+        if (pc == last_pc)
+            same_pc++;
+        else
+            same_pc = 0;
+        last_pc = pc;
+        /* 非普查页重复同 pc 故障 = 目标自身真实崩溃 (如 NULL deref):
+           放行会无限循环, 终止普查。 */
+        if (same_pc >= 3 && addr < 0x1000) {
+            fprintf(stderr, "census: target crashed at pc %#lx "
+                    "(addr %#lx), stop\n", pc, addr);
+            break;
+        }
+        if (!addr)
+            continue;
         unsigned long page = addr & ~0xfffUL;
         /* 找到对应页索引 */
         size_t pi = 0;
