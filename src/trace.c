@@ -429,6 +429,25 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
                 break;
             }
         }
+        /* 在途 syscall (记录尚未创建) 的边界: 直接检查 pc-4 是否 svc,
+           是则回退到 svc, 切片由引擎重放 (该记录在检查点后创建,
+           窗口内可用) */
+        if (REG_PC(sn.regs) == cpc && cpc >= 4) {
+            uint32_t w;
+            struct iovec li = {.iov_base = &w, .iov_len = sizeof(w)};
+            struct iovec ri = {
+                .iov_base = (void *)(uintptr_t)(cpc - 4),
+                .iov_len = sizeof(w)
+            };
+            if (process_vm_readv(tc->pid, &li, 1, &ri, 1, 0) ==
+                    (ssize_t)sizeof(w) &&
+                w == 0xd4000001) {
+                REG_SET_PC(sn.regs, cpc - 4);
+                fprintf(stderr, "trace: ckpt %zu at unrecorded svc+4 "
+                        "pc %#llx, rewind to svc\n",
+                        tc->ckpt_no, (unsigned long long)cpc);
+            }
+        }
     }
 #endif
 
