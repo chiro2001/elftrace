@@ -170,7 +170,7 @@ EOF
     tail -5 "$TF_TMP/spsc_build.log"
     exit 1; }
 
-for iter in 1 2 3; do
+for iter in 1 2 3 4 5; do
     EXTRA=()
     [ "$K0" -gt 0 ] && EXTRA=(--bm-exit-count "$K0")
     tf_build /dev/null "$TF_TMP/spsc_slice.elf" --mode baremetal --bm-strict \
@@ -198,7 +198,7 @@ for iter in 1 2 3; do
             break
         fi
     fi
-    if [ "$iter" -lt 3 ] && [ "$K" -gt 0 ] && [ "$A0" -gt 0 ]; then
+    if [ "$iter" -lt 5 ] && [ "$K" -gt 0 ] && [ "$A0" -gt 0 ]; then
         K0=$((K * T / A0))
         [ "$K0" -gt 0 ] || K0=1
     fi
