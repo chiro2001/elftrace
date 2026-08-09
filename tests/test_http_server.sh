@@ -73,10 +73,18 @@ run_trace() {  # <输出目录> [补偿文件]
     local out="$1"; shift
     local extra=()
     [ $# -gt 0 ] && extra=(--atomic-compensate "$1")
+    # 值回放白名单 (分配器关键普通读; 站点地址与目标二进制绑定,
+    # 服务器 Ubuntu python3.12 专用, 手机 musl 另行生成)
+    local vr=()
+    if [ -f "tests/pymalloc_sites_ubuntu312.txt" ]; then
+        cp "tests/pymalloc_sites_ubuntu312.txt" \
+            "$TF_TMP/pymalloc_sites.txt"
+        vr=(--value-replay-sites "$TF_TMP/pymalloc_sites.txt")
+    fi
     start_server || { echo "FAIL: http.server 未就绪"; return 1; }
     send_requests 3 || { echo "FAIL: warm 请求失败"; return 1; }
     timeout 600 "$ELFTRACE" trace "$HTTP_PID" --every 200000 \
-        --out "$out" --atomic-replay "${extra[@]}" \
+        --out "$out" --atomic-replay "${vr[@]}" "${extra[@]}" \
         > "$TF_TMP/http_trace.log" 2>&1 &
     local TPID=$!
     sleep 1
@@ -107,7 +115,8 @@ echo "  Run2: $NCK ckpts, $(wc -l < "$TF_TMP/http_r2/syscalls/syscall.map") sysc
 #   2) byte-run 切片: 用 probe 预状态压缩成 32B granule 回放表,
 #      主线程自身已复现的写入整体跳过, 回放指令数大幅下降
 tf_build /dev/null "$TF_TMP/http_probe.elf" --mode baremetal --bm-strict \
-    --checkpoints "$TF_TMP/http_r2" --from 3 --to 5 \
+    --checkpoints "$TF_TMP/http_r2" \
+    --from-count 600000 --to-count 1000000 \
     --stack-reserve 67108864 \
     --probe-dump "$TF_TMP/http_probe.bin" > "$TF_TMP/http_build.log" 2>&1 \
     || { echo "FAIL: probe build"; tail -5 "$TF_TMP/http_build.log"; exit 1; }
@@ -116,7 +125,8 @@ PRC=$?
 [ "$PRC" = 0 ] || { echo "FAIL: probe slice rc=$PRC"; exit 1; }
 [ -s "$TF_TMP/http_probe.bin" ] || { echo "FAIL: 无 probe.bin"; exit 1; }
 tf_build /dev/null "$TF_TMP/http_slice.elf" --mode baremetal --bm-strict \
-    --checkpoints "$TF_TMP/http_r2" --from 3 --to 5 \
+    --checkpoints "$TF_TMP/http_r2" \
+    --from-count 600000 --to-count 1000000 \
     --stack-reserve 67108864 \
     --byte-runs "$TF_TMP/http_probe.bin" \
     --newseg-big-skip 1048576 > "$TF_TMP/http_build2.log" 2>&1 \

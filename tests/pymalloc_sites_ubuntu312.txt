@@ -1,0 +1,57 @@
+# python3.12 (Ubuntu 24.04 aarch64) pymalloc 关键普通读站点
+# 格式: pc insn
+# 所有分配器 pop 闭包: usedpools 头 / pool->nextpool / freeblock /
+# freeblock->next; 覆盖 PyObject_Malloc/PyMem_Malloc/PyMem_Calloc/
+# PyObject_Realloc 的各副本 + free/迁移路径的 freeblock/refcount 读。
+# PyObject_Malloc 快路径 (主/次)
+509ab0 f8627802
+509ab4 f9400844
+509ac0 f9400440
+509ad0 f9400003
+509c40 f8617802
+509c44 f9400844
+509c50 f9400440
+509c60 f9400001
+# refcount 读 (pool 满/空判定)
+509ac4 b9400043
+509c54 b9400041
+# PyObject_Realloc 快路径
+50a204 f8637843
+50a208 f9400864
+50a214 f9400462
+50a224 f9400040
+50a218 b9400060
+# PyMem_Malloc 快路径
+50a47c f8627802
+50a480 f9400844
+50a48c f9400440
+50a49c f9400003
+50a490 b9400043
+# PyMem_Calloc 副本 1/2
+50a650 f8617803
+50a654 f9400861
+50a660 f9400465
+50a670 f94000a0
+50a664 b9400060
+50a868 f8617803
+50a86c f9400861
+50a878 f9400465
+50a888 f94000a0
+50a87c b9400060
+# 迁移/refill 路径 (pool 满↔可用)
+509de0 f8607a81
+509e18 f9400662
+509e48 f8607a80
+509eac f8607a80
+509ed0 f9400453
+509ed4 f9400260
+509f24 f8607a80
+509f3c f9400453
+509f40 f9400260
+# free 路径 (主线程把块链入 worker 改过的链)
+5093a0 f9400443
+5093ac b9400041
+50aa94 f9400443
+50aaa0 b9400041
+50ad64 f9400462
+50ad70 b9400061

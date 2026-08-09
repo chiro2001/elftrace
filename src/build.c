@@ -148,6 +148,7 @@ struct strict_site {
 struct ab_site {
     uint64_t pc;
     uint32_t orig_insn;
+    int kind;                   /* 0=ldar 族, 2/3=普通 ldr */
     uint64_t from_ord, to_ord;  /* 窗口内序号边界 */
     uint64_t from_val, from_addr;   /* 检查点时刻站点最后读到的值/地址 */
 };
@@ -291,7 +292,8 @@ static void atomic_load(const char *dir, long from, long to,
     for (size_t i = 0; i < n_sites; i++) {
         ab->sites[i].pc = rd_u64(&p);
         memcpy(&ab->sites[i].orig_insn, p, 4);
-        p += 8;                 /* 4B orig + 4B pad: 每条 16B */
+        memcpy(&ab->sites[i].kind, p + 4, 4);
+        p += 8;                 /* 4B orig + 4B kind: 每条 16B */
     }
     free(buf);
 
@@ -481,8 +483,17 @@ static void atomic_load(const char *dir, long from, long to,
                             ord > ab->sites[site_id].to_ord)
                             continue;
                         size_t o = ab->run_off[site_id] + filled[site_id]++;
+                        /* 原子站点: 保留 +1 (合成首段覆盖窗口第一次
+                           读, 首个事件值相对冻结内存超前, 曾致 SPSC
+                           从"队列已满"开始自旋)。普通 load (分配器
+                           链): 必须用 ord-from_ord —— 若 worker 在
+                           检查点与窗口首次读之间改写链头, 首次读的
+                           真实值就是首个事件, 合成旧值会把整个 pop
+                           链错位 (HTTP 确定性崩)。 */
                         ab->runs[o].start = ord -
-                                            ab->sites[site_id].from_ord + 1;
+                            ab->sites[site_id].from_ord +
+                            (ab->sites[site_id].kind == 2 ||
+                             ab->sites[site_id].kind == 3 ? 0 : 1);
                         ab->runs[o].addr = addr;
                         ab->runs[o].value = value;
                     }
@@ -1247,8 +1258,18 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 int size;
                 unsigned rt, rn;
                 int kind;
-                if (!a64_is_load_any(ab->sites[st->ab_id].orig_insn,
-                                     &size, &rt, &rn, &kind))
+                struct a64_ld_addr ad, *adp = NULL;
+                if (ab->sites[st->ab_id].kind == 2 ||
+                    ab->sites[st->ab_id].kind == 3) {
+                    if (!a64_is_plain_load(
+                            ab->sites[st->ab_id].orig_insn,
+                            &size, &rt, &rn, &kind, &ad))
+                        die("atomic: bad plain load at %#llx",
+                            (unsigned long long)st->pc);
+                    adp = &ad;
+                } else if (!a64_is_load_any(
+                               ab->sites[st->ab_id].orig_insn,
+                               &size, &rt, &rn, &kind))
                     die("atomic: bad orig insn at %#llx",
                         (unsigned long long)st->pc);
                 size_t bl = a64_atomic_replay_block(
@@ -1256,7 +1277,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                     ab->run_cnt[st->ab_id] + 1, size, rt, rn, st->pc + 4,
                     ab->sites[st->ab_id].to_ord -
                         ab->sites[st->ab_id].from_ord,
-                    base + STUB_STRICT_EXIT_OFF, kind);
+                    base + STUB_STRICT_EXIT_OFF, kind, adp);
                 if (!bl)
                     die("atomic: cannot generate replay block at %#llx",
                         (unsigned long long)st->pc);

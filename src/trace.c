@@ -509,6 +509,7 @@ int trace_main(int argc, char **argv)
     pid_t pid = 0;
 #if defined(__aarch64__)
     const char *comp_path = NULL;
+    const char *value_sites = NULL;
 #endif
 
     tc.every = TRACE_DEFAULT_EVERY;
@@ -532,6 +533,9 @@ int trace_main(int argc, char **argv)
         } else if (strcmp(argv[i], "--atomic-compensate") == 0 &&
                    i + 1 < argc) {
             comp_path = argv[++i];
+        } else if (strcmp(argv[i], "--value-replay-sites") == 0 &&
+                   i + 1 < argc) {
+            value_sites = argv[++i];
 #endif
         } else if (argv[i][0] >= '0' && argv[i][0] <= '9') {
             pid = atoi(argv[i]);
@@ -539,6 +543,7 @@ int trace_main(int argc, char **argv)
             die("usage: elftrace trace <pid> [--every N] [--out DIR]"
 #if defined(__aarch64__)
                 " [--atomic-replay] [--atomic-buf-size N]"
+                " [--value-replay-sites FILE]"
 #endif
                 );
         }
@@ -607,7 +612,7 @@ int trace_main(int argc, char **argv)
             if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
                        &io) == 0) {
                 if (atomic_trace_arm(&tc.atomic, pid, &rr, tc.out,
-                                     tc.atomic_buf_size) < 0)
+                                     tc.atomic_buf_size, value_sites) < 0)
                     warn("trace: atomic replay unavailable, continuing "
                          "without it");
             }

@@ -41,6 +41,8 @@
 struct asite {
     uint64_t pc;
     uint32_t orig_insn;
+    int kind;                   /* 0=ldar 族, 2=普通 ldr 立即数,
+                                   3=普通 ldr 寄存器偏移 */
     size_t seg;                 /* 所属可执行段索引 */
     uint64_t page;              /* 记录页地址 */
     uint32_t page_off;          /* 块偏移 */
@@ -238,7 +240,8 @@ static int is_spin_ldr(const uint8_t *buf, size_t got, uint64_t off,
 
 /* 扫描目标可执行段中的原子/自旋 load 站点 */
 static int atomic_scan(pid_t pid, struct asite **out, size_t *n_out,
-                       struct seginfo **segs_out, size_t *nsegs_out)
+                       struct seginfo **segs_out, size_t *nsegs_out,
+                       const char *value_sites)
 {
     struct seginfo *maps = NULL;
     size_t nmaps = 0;
@@ -290,10 +293,66 @@ static int atomic_scan(pid_t pid, struct asite **out, size_t *n_out,
             }
             sites[n].pc = sg->start + off;
             sites[n].orig_insn = w;
+            sites[n].kind = kind;
             sites[n].seg = i;
             n++;
         }
         free(buf);
+    }
+    /* 值回放白名单: 每行 "pc insn" (hex)。验证 pc 在可执行段内且
+       指令字匹配, 防止库版本/PIE 偏移变化后静默 patch 错站点。 */
+    if (value_sites) {
+        FILE *vf = fopen(value_sites, "r");
+        if (!vf)
+            die("cannot open value-replay sites %s", value_sites);
+        char line[256];
+        while (fgets(line, sizeof(line), vf)) {
+            uint64_t pc = 0;
+            uint32_t insn = 0;
+            if (sscanf(line, "%llx %x", (unsigned long long *)&pc,
+                       &insn) != 2)
+                continue;
+            int found = -1;
+            for (size_t k = 0; k < nmaps; k++) {
+                if (maps[k].exec &&
+                    pc >= maps[k].start && pc + 4 <= maps[k].end) {
+                    found = (int)k;
+                    break;
+                }
+            }
+            if (found < 0) {
+                warn("value-replay site %#llx not in executable segment",
+                     (unsigned long long)pc);
+                continue;
+            }
+            int size;
+            unsigned rt, rn;
+            int kind = -1;
+            struct a64_ld_addr ad;
+            if (!a64_is_plain_load(insn, &size, &rt, &rn, &kind, &ad)) {
+                warn("value-replay site %#llx: not plain ldr w/x (%#x)",
+                     (unsigned long long)pc, insn);
+                continue;
+            }
+            /* 验证目标内存中的指令字 */
+            uint32_t real = 0;
+            ssize_t got = pread(mfd, &real, 4, (off_t)pc);
+            if (got != 4 || real != insn) {
+                warn("value-replay site %#llx insn mismatch "
+                     "(%#x vs %#x)", (unsigned long long)pc, real, insn);
+                continue;
+            }
+            if (n == cap) {
+                cap = cap ? cap * 2 : 64;
+                sites = xrealloc(sites, cap * sizeof(*sites));
+            }
+            sites[n].pc = pc;
+            sites[n].orig_insn = insn;
+            sites[n].kind = kind;
+            sites[n].seg = (size_t)found;
+            n++;
+        }
+        fclose(vf);
     }
     close(mfd);
     *out = sites;
@@ -371,7 +430,8 @@ static int atomic_flush_ranges(pid_t pid,
 }
 
 int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
-                     const void *regs, const char *out, uint64_t buf_size)
+                     const void *regs, const char *out, uint64_t buf_size,
+                     const char *value_sites)
 {
     struct atomic_trace_ctx *ctx = xcalloc(1, sizeof(*ctx));
     struct asite *sites = NULL;
@@ -391,7 +451,8 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
         free(ctx);
         return -1;
     }
-    if (atomic_scan(pid, &sites, &n_sites, &maps, &nmaps) < 0) {
+    if (atomic_scan(pid, &sites, &n_sites, &maps, &nmaps,
+                    value_sites) < 0) {
         warn("atomic: cannot scan target memory");
         free(ctx);
         return -1;
@@ -487,12 +548,29 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
                                  i * A64_ATB_STATE_SIZE;
             uint8_t blk[A64_ATOM_BLOCK_SIZE];
             struct a64_atom_counts cnt;
-            size_t bl = a64_atomic_record_block(
-                blk, block_abs, sites[i].orig_insn, ctx->tls, i,
-                state_abs, ctx->abuf_addr + A64_ATB_OFF_EVENT_PTR,
-                ctx->abuf_addr + A64_ATB_OFF_EVENTS_END,
-                ctx->abuf_addr + A64_ATB_OFF_OVERFLOW,
-                sites[i].pc + 4, &cnt);
+            size_t bl;
+            if (sites[i].kind == 2 || sites[i].kind == 3) {
+                int size;
+                unsigned rt, rn;
+                int kind;
+                struct a64_ld_addr ad;
+                if (!a64_is_plain_load(sites[i].orig_insn, &size, &rt,
+                                       &rn, &kind, &ad))
+                    continue;
+                bl = a64_load_record_block(
+                    blk, block_abs, &ad, size, rt, ctx->tls, i,
+                    state_abs, ctx->abuf_addr + A64_ATB_OFF_EVENT_PTR,
+                    ctx->abuf_addr + A64_ATB_OFF_EVENTS_END,
+                    ctx->abuf_addr + A64_ATB_OFF_OVERFLOW,
+                    sites[i].pc + 4, &cnt);
+            } else {
+                bl = a64_atomic_record_block(
+                    blk, block_abs, sites[i].orig_insn, ctx->tls, i,
+                    state_abs, ctx->abuf_addr + A64_ATB_OFF_EVENT_PTR,
+                    ctx->abuf_addr + A64_ATB_OFF_EVENTS_END,
+                    ctx->abuf_addr + A64_ATB_OFF_OVERFLOW,
+                    sites[i].pc + 4, &cnt);
+            }
             if (!bl) {
                 warn("atomic: cannot generate block for %#llx",
                      (unsigned long long)sites[i].pc);
@@ -592,6 +670,7 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
         for (size_t i = 0; i < ctx->n_sites; i++) {
             write_u64(&p, ctx->sites[i].pc);
             memcpy(p, &ctx->sites[i].orig_insn, 4);
+            memcpy(p + 4, &ctx->sites[i].kind, 4);
             p += 8;                 /* 4B orig + 4B pad: 每条 16B */
         }
         FILE *f = fopen(path, "wb");
@@ -894,9 +973,11 @@ int atomic_trace_finish(struct atomic_trace_ctx *ctx)
 #else /* !__aarch64__ */
 
 int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
-                     const void *regs, const char *out, uint64_t buf_size)
+                     const void *regs, const char *out, uint64_t buf_size,
+                     const char *value_sites)
 {
     (void)ctx_out; (void)pid; (void)regs; (void)out; (void)buf_size;
+    (void)value_sites;
     return -1;
 }
 int atomic_trace_step_out(struct atomic_trace_ctx *ctx)

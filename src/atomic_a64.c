@@ -65,6 +65,12 @@ static uint32_t add_xr(unsigned rd, unsigned rn, unsigned rm)
 {
     return 0x8B000000U | (rm << 16) | (rn << 5) | rd;
 }
+static uint32_t add_xr_lsl(unsigned rd, unsigned rn, unsigned rm,
+                           unsigned shift)
+{
+    return 0x8B000000U | ((shift & 7) << 10) | (rm << 16) |
+           (rn << 5) | rd;
+}
 static uint32_t cmp_x(unsigned rn, unsigned rm)
 {
     return 0xEB00001FU | (rm << 16) | (rn << 5);
@@ -115,7 +121,8 @@ static uint32_t ldp_post_64(unsigned rt1, unsigned rt2, unsigned rn)
 }
 
 static void plan_save(struct save_plan *pl, const unsigned *base,
-                      size_t n_base, unsigned rt, unsigned rn)
+                      size_t n_base, unsigned rt, unsigned rn,
+                      unsigned rm)
 {
     unsigned regs[32];
     size_t n = 0;
@@ -146,6 +153,14 @@ static void plan_save(struct save_plan *pl, const unsigned *base,
                 dup = 1;
         if (!dup)
             regs[n++] = rn;
+    }
+    if (rm < 31) {
+        int dup = 0;
+        for (size_t j = 0; j < n; j++)
+            if (regs[j] == rm)
+                dup = 1;
+        if (!dup)
+            regs[n++] = rm;
     }
     /* 升序 */
     for (size_t i = 1; i < n; i++)
@@ -281,6 +296,48 @@ int a64_is_load_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
     return 1;
 }
 
+/* 普通 ldr w/x: 立即数偏移 (kind=2) 或寄存器偏移 LSL (kind=3) */
+int a64_is_plain_load(uint32_t w, int *size, unsigned *rt, unsigned *rn,
+                      int *kind, struct a64_ld_addr *ad)
+{
+    /* 立即数: ldr w/x, [Xn, #imm] (imm = 未缩放字节偏移) */
+    if ((w & 0xFFC00000U) == 0xF9400000U ||
+        (w & 0xFFC00000U) == 0xB9400000U) {
+        int s = (w & 0x40000000U) ? 8 : 4;
+        if (size) *size = s;
+        if (rt) *rt = w & 0x1FU;
+        if (rn) *rn = (w >> 5) & 0x1FU;
+        if (kind) *kind = 2;
+        if (ad) {
+            ad->mode = 0;
+            ad->rn = (w >> 5) & 0x1FU;
+            ad->rm = 0;
+            ad->imm = (int64_t)((w >> 10) & 0xFFFU) << (s == 8 ? 3 : 2);
+            ad->shift = 0;
+        }
+        return 1;
+    }
+    /* 寄存器偏移: ldr w/x, [Xn, Xm{, lsl #s}] (option=011 LSL) */
+    if ((w & 0xFFE0E000U) == 0xF8606000U ||
+        (w & 0xFFE0E000U) == 0xB8606000U) {
+        int s = (w & 0x40000000U) ? 8 : 4;
+        if (size) *size = s;
+        if (rt) *rt = w & 0x1FU;
+        if (rn) *rn = (w >> 5) & 0x1FU;
+        if (kind) *kind = 3;
+        if (ad) {
+            ad->mode = 1;
+            ad->rn = (w >> 5) & 0x1FU;
+            ad->rm = (w >> 16) & 0x1FU;
+            ad->imm = 0;
+            /* S 位: 0 → LSL #0; 1 → LSL #3 (x) / #2 (w) */
+            ad->shift = (w & 0x1000U) ? (s == 8 ? 3 : 2) : 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 /* 按加载宽度生成 ldar/ldarb/ldarh 指令 (回放屏障用) */
 static uint32_t a64_ldar_insn(int size, unsigned rn, unsigned rt)
 {
@@ -354,7 +411,7 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
                            20, 21, 22, 23};
     struct save_plan pl;
     plan_save(&pl, base_rec, sizeof(base_rec) / sizeof(base_rec[0]),
-              rt, rn);
+              rt, rn, 31);
     emit_plan_save(&p, &pl);
 
     /* 值 → x13 */
@@ -467,6 +524,150 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
     return A64_ATOM_BLOCK_SIZE;
 }
 
+size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
+                             const struct a64_ld_addr *ad, int size,
+                             unsigned rt, uint64_t tls,
+                             uint64_t site_id, uint64_t state_abs,
+                             uint64_t event_ptr_addr,
+                             uint64_t events_end_addr,
+                             uint64_t overflow_addr,
+                             uint64_t ret_addr,
+                             struct a64_atom_counts *counts)
+{
+    uint8_t *p = out;
+    unsigned rn;
+
+    if (!ad || rt == 31)
+        return 0;
+    rn = ad->rn;
+    if (ad->mode == 1 && ad->rm == rt && ad->rm == rn)
+        return 0;               /* 地址完全依赖被破坏的 rt: 不支持 */
+
+    memset(out, 0, A64_ATOM_BLOCK_SIZE);
+
+    /* 入口 (4 指令 + 8B 字面量 = 0x18 字节, 代码从 0x18 开始) */
+    put32(&p, 0xA9BF47F0U);     /* stp x16,x17,[sp,#-16]! */
+    put32(&p, INSN_NOP);
+    put32(&p, ldr_lit(16, 8));
+    put32(&p, INSN_BR_X16);
+    put64(&p, block_abs + 0x18);
+    /* p == out + 0x18 */
+
+    put32(&p, 0xD1006210U);     /* sub x16, x16, #0x18 */
+    unsigned base_rec[] = {12, 13, 14, 15, 16, 17, 18, 19,
+                           20, 21, 22, 23};
+    struct save_plan pl;
+    plan_save(&pl, base_rec, sizeof(base_rec) / sizeof(base_rec[0]),
+              rt, rn, ad->mode == 1 ? ad->rm : 31);
+    emit_plan_save(&p, &pl);
+
+    /* 重建有效地址 → x12 */
+    if (rn == 31)
+        put32(&p, add_x(12, 31, (unsigned)pl.save_size));
+    else
+        put32(&p, ldr_x_imm(31, 12, (unsigned)pl.off[rn]));
+    if (ad->mode == 0) {
+        if (ad->imm != 0)
+            put32(&p, add_x(12, 12, (unsigned)ad->imm));
+    } else {
+        if (ad->rm < 31)
+            put32(&p, ldr_x_imm(31, 13, (unsigned)pl.off[ad->rm]));
+        else
+            put32(&p, movz_x(13, 0, 0));
+        put32(&p, add_xr_lsl(12, 12, 13, (unsigned)ad->shift));
+    }
+    /* 执行原 load (值 → x13, w 零扩展) */
+    put32(&p, a64_ldr_insn(size, 12, 13));
+
+    /* TLS 过滤: 非目标线程只执行原始 load, 不记录 */
+    put32(&p, INSN_MRS_X14_TPIDR);
+    put32(&p, ldr_x16_imm(15, REC_TLS_OFF));
+    put32(&p, cmp_x(14, 15));
+    uint8_t *tls_bne = p;
+    put32(&p, bcond(0, 1));     /* b.ne done (占位, 尾部回填) */
+
+    /* 序号 = ++state.ordinal */
+    put32(&p, ldr_x16_imm(17, REC_STATE_ABS_OFF));  /* x17 = state_abs */
+    put32(&p, ldr_x_imm(17, 19, 0));                /* ordinal */
+    put32(&p, add_x(19, 19, 1));
+    put32(&p, str_x_imm(17, 19, 0));
+
+    /* 值/地址变化才追加事件 (游程压缩) */
+    put32(&p, ldr_x_imm(17, 20, 8));    /* last_val */
+    put32(&p, ldr_x_imm(17, 21, 16));   /* last_addr */
+    put32(&p, cmp_x(20, 13));
+    put32(&p, ccmp_eq(21, 12));
+    uint8_t *same_b = p;
+    put32(&p, bcond(0, 0));     /* b.eq done (占位) */
+    put32(&p, str_x_imm(17, 13, 8));    /* last_val = value */
+    put32(&p, str_x_imm(17, 12, 16));   /* last_addr = addr */
+
+    /* 追加事件 {site_id, ordinal, addr, value} */
+    put32(&p, ldr_x16_imm(18, REC_EVENT_PTR_ADDR_OFF)); /* &hdr.event_ptr */
+    put32(&p, ldr_x_imm(18, 21, 0));    /* event_ptr */
+    put32(&p, add_x(22, 21, A64_ATB_EVENT_SIZE));
+    put32(&p, ldr_x16_imm(23, REC_EVENTS_END_ADDR_OFF)); /* &hdr.events_end */
+    put32(&p, ldr_x_imm(23, 23, 0));    /* events_end */
+    put32(&p, cmp_x(22, 23));
+    uint8_t *ovf_b = p;
+    put32(&p, bcond(0, 8));     /* b.hi overflow (占位) */
+    put32(&p, ldr_x16_imm(20, REC_SITE_ID_OFF));
+    put32(&p, str_x_imm(21, 20, 0));    /* [event+0] = site_id */
+    put32(&p, str_x_imm(21, 19, 8));    /* [event+8] = ordinal */
+    put32(&p, str_x_imm(21, 12, 16));   /* [event+16] = addr */
+    put32(&p, str_x_imm(21, 13, 24));   /* [event+24] = value */
+    put32(&p, str_x_imm(18, 22, 0));    /* hdr.event_ptr = event+32 */
+    uint8_t *skip_b = p;
+    put32(&p, 0x14000000U);     /* b done (占位, 无条件) */
+    put32(&p, ldr_x16_imm(20, REC_OVERFLOW_ADDR_OFF)); /* &hdr.overflow */
+    put32(&p, movz_x(21, 1, 0));
+    put32(&p, str_x_imm(20, 21, 0));    /* hdr.overflow = 1 */
+
+    /* done: 把加载值写回 Rt 的保存槽, 恢复现场 + 跳回站点下一条 */
+    {
+        int rt_off = pl.off[rt];
+        if (rt_off < 0)
+            return 0;
+        uint8_t *done = p;
+        put32(&p, str_x_imm(31, 13, (unsigned)rt_off));
+        emit_plan_restore(&p, &pl);
+
+        /* 回填条件分支 */
+        int32_t d1 = (int32_t)(done - tls_bne);
+        int32_t d2 = (int32_t)(done - same_b);
+        int32_t d3 = (int32_t)((skip_b + 4) - ovf_b);
+        uint32_t w4 = a64_encode_b(block_abs + (uint64_t)(skip_b - out),
+                                   block_abs + (uint64_t)(done - out));
+        uint32_t w;
+        w = bcond(d1, 1);   memcpy(tls_bne, &w, 4);
+        w = bcond(d2, 0);   memcpy(same_b, &w, 4);
+        w = bcond(d3, 8);   memcpy(ovf_b, &w, 4);
+        memcpy(skip_b, &w4, 4);
+    }
+    uint64_t b_off = (uint64_t)(p - out);
+    put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
+
+    /* 路径指令数 (与原子版同口径) */
+    if (counts) {
+        size_t code_n = (size_t)(p - out) / 4;
+        unsigned steady = (unsigned)code_n - 14 - 3;
+        counts->base = steady + 1;          /* +1 = 站点处 b */
+        counts->append = 14;
+        counts->skip = steady - 8 + 1;
+    }
+
+    /* 数据区 */
+    uint64_t v = tls;           memcpy(out + REC_TLS_OFF, &v, 8);
+    v = site_id;                memcpy(out + REC_SITE_ID_OFF, &v, 8);
+    v = state_abs;              memcpy(out + REC_STATE_ABS_OFF, &v, 8);
+    v = event_ptr_addr;         memcpy(out + REC_EVENT_PTR_ADDR_OFF, &v, 8);
+    v = events_end_addr;        memcpy(out + REC_EVENTS_END_ADDR_OFF, &v, 8);
+    v = overflow_addr;          memcpy(out + REC_OVERFLOW_ADDR_OFF, &v, 8);
+    v = ret_addr;               memcpy(out + REC_RET_ADDR_OFF, &v, 8);
+
+    return A64_ATOM_BLOCK_SIZE;
+}
+
 /* ---- 回放跳板 ---- */
 #define REP_ORD_OFF   0x200
 #define REP_CURSOR_OFF 0x208
@@ -474,20 +675,22 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
 #define REP_NRUNS_OFF 0x218
 #define REP_LOAD_LIMIT_OFF 0x220
 #define REP_EXIT_ABS_OFF 0x228
+#define REP_MISS_OFF 0x230      /* 普通 load: 回退真实读计数 (诊断) */
 
 size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                uint64_t runs_abs, uint64_t n_runs,
                                int size, unsigned rt, unsigned rn,
                                uint64_t ret_addr,
                                uint64_t load_limit, uint64_t exit_abs,
-                               int kind)
+                               int kind,
+                               const struct a64_ld_addr *ad)
 {
     uint8_t *p = out;
     unsigned base_rep[] = {16, 17, 18, 19, 20, 21, 22, 23,
                            24, 25, 26, 27, 28, 29};
     struct save_plan pl;
     plan_save(&pl, base_rep, sizeof(base_rep) / sizeof(base_rep[0]),
-              rt, rn);
+              rt, rn, ad ? (ad->mode == 1 ? ad->rm : 31) : 31);
     int rt_off = pl.off[rt];
     if (rt_off < 0 || rt == 31)
         return 0;
@@ -557,6 +760,16 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
         put32(&p, add_x(27, 31, (unsigned)pl.save_size));
     else
         put32(&p, ldr_x_imm(31, 27, (unsigned)pl.off[rn]));
+    if (ad && ad->mode == 0) {
+        if (ad->imm != 0)
+            put32(&p, add_x(27, 27, (unsigned)ad->imm));
+    } else if (ad && ad->mode == 1) {
+        if (ad->rm < 31)
+            put32(&p, ldr_x_imm(31, 28, (unsigned)pl.off[ad->rm]));
+        else
+            put32(&p, movz_x(28, 0, 0));
+        put32(&p, add_xr_lsl(27, 27, 28, (unsigned)ad->shift));
+    }
     put32(&p, ldr_x_imm(24, 28, 8));    /* run.addr */
     put32(&p, cmp_x(27, 28));
     uint8_t *ne_b = p;
@@ -571,10 +784,26 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     uint8_t *set_jmp = p;
     put32(&p, 0x14000000U);     /* b set (占位, 无条件) */
     uint8_t *use_real = p;
+    /* 诊断: 普通 load 回退到真实读时计数 (值回放 miss) */
+    if (ad) {
+        put32(&p, ldr_x16_imm(18, REP_MISS_OFF));
+        put32(&p, add_x(18, 18, 1));
+        put32(&p, str_x16_imm(18, REP_MISS_OFF));
+    }
     if (rn == 31)
         put32(&p, add_x(27, 31, (unsigned)pl.save_size));
     else
         put32(&p, ldr_x_imm(31, 27, (unsigned)pl.off[rn]));
+    if (ad && ad->mode == 0) {
+        if (ad->imm != 0)
+            put32(&p, add_x(27, 27, (unsigned)ad->imm));
+    } else if (ad && ad->mode == 1) {
+        if (ad->rm < 31)
+            put32(&p, ldr_x_imm(31, 28, (unsigned)pl.off[ad->rm]));
+        else
+            put32(&p, movz_x(28, 0, 0));
+        put32(&p, add_xr_lsl(27, 27, 28, (unsigned)ad->shift));
+    }
     /* 真实值: 用保存集内的 x29 做加载 (x13 不在最小保存集, 不能破坏) */
     put32(&p, kind == 1 ? a64_ldaxr_insn(size, 27, 29)
                         : kind == 2 ? a64_ldr_insn(size, 27, 29)
@@ -620,6 +849,7 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
         v = n_runs;             memcpy(out + REP_NRUNS_OFF, &v, 8);
         v = load_limit;         memcpy(out + REP_LOAD_LIMIT_OFF, &v, 8);
         v = exit_abs;           memcpy(out + REP_EXIT_ABS_OFF, &v, 8);
+        v = 0;                  memcpy(out + REP_MISS_OFF, &v, 8);
     }
 
     return A64_ATOM_BLOCK_SIZE;

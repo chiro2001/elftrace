@@ -25,6 +25,17 @@
  * size 输出为加载宽度 (1/2/4/8 字节); rt/rn 为寄存器号 (31=sp)。 */
 int a64_is_ldar(uint32_t w, int *size, unsigned *rt, unsigned *rn);
 
+/* ---- 普通 load 地址描述 (值回放 MVP: 分配器等关键读站点) ----
+ * mode 0: [Xn, #imm]   (ldr w/x 立即数偏移, imm 为未缩放字节偏移)
+ * mode 1: [Xn, Xm{, lsl #shift}]  (寄存器偏移, 仅 LSL option)
+ */
+struct a64_ld_addr {
+    int mode;
+    unsigned rn, rm;
+    int64_t imm;
+    int shift;              /* mode 1: 0, 2 (w) 或 3 (x) */
+};
+
 /* ---- 块/页布局 ---- */
 #define A64_ATOM_BLOCK_SIZE  0x240   /* 每站点块 (代码 + 数据区@0x200..0x238) */
 #define A64_ATOM_PAGE_SIZE   0x1000
@@ -57,6 +68,21 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
                                uint64_t ret_addr,
                                struct a64_atom_counts *counts);
 
+/* ---- 普通 load 记录跳板 ----
+ * 与原子版不同: 入口不执行原指令 (地址依赖 rt/rm 时原指令会破坏
+ * 基址), 改为先保存 {rt,rn,rm}, 从保存槽重建有效地址 → x12, 执行
+ * ldr w/x x13,[x12], 再按 {值,地址} 游程记录。其余 (TLS 过滤/序号/
+ * 事件/恢复) 与原子版一致。 */
+size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
+                             const struct a64_ld_addr *ad, int size,
+                             unsigned rt, uint64_t tls,
+                             uint64_t site_id, uint64_t state_abs,
+                             uint64_t event_ptr_addr,
+                             uint64_t events_end_addr,
+                             uint64_t overflow_addr,
+                             uint64_t ret_addr,
+                             struct a64_atom_counts *counts);
+
 /* ---- 回放跳板块 ----
  * 入口: stp x16,x17; nop; ldr x16,[pc,#8]; br x16; .quad block_abs。
  * 数据区 @0x200: ordinal, cursor, runs_abs, n_runs。
@@ -70,12 +96,18 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                int is64, unsigned rt, unsigned rn,
                                uint64_t ret_addr,
                                uint64_t load_limit, uint64_t exit_abs,
-                               int kind);
+                               int kind,
+                               const struct a64_ld_addr *ad);
 
 /* 通用 load 检测: ldar 族 (kind=0), ldaxr 族 (kind=1),
- * 普通 ldr w/x (kind=2, 自旋候选) */
+ * 普通 ldr w/x 立即数 (kind=2), 普通 ldr w/x 寄存器偏移 (kind=3) */
 int a64_is_load_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
                     int *kind);
+
+/* 普通 ldr w/x 识别 (立即数/寄存器偏移), 输出地址描述。
+ * kind 与 a64_is_load_any 一致 (2=立即数, 3=寄存器偏移)。 */
+int a64_is_plain_load(uint32_t w, int *size, unsigned *rt, unsigned *rn,
+                      int *kind, struct a64_ld_addr *ad);
 
 /* 检测 ldar/ldarb/ldarh 与 ldaxr/ldaxrb/ldaxrh; *exclusive 输出
  * ldaxr 族标记 (兼容旧调用) */
