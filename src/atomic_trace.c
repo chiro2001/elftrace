@@ -504,6 +504,10 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
         if (tmem_rw(pid, 1, ctx->abuf_addr, hdr, sizeof(hdr)) < 0) {
             warn("atomic: cannot init event buffer @ %#llx",
                  (unsigned long long)ctx->abuf_addr);
+            fprintf(stderr,
+                    "atomic: buf mmap ret=%#llx size=%llu (target %d)\n",
+                    (unsigned long long)ctx->abuf_addr,
+                    (unsigned long long)buf_size, pid);
             goto fail;
         }
     }

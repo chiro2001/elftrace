@@ -410,7 +410,8 @@ fail:
 #if defined(__aarch64__)
 
 /* 找注入页: 最低的 r-x 匿名/文件页 (exe 冷页), 避开当前 pc 所在页 */
-static unsigned long find_stage1_page_a64(pid_t pid, unsigned long pc)
+static unsigned long find_stage1_page_a64(pid_t pid, unsigned long pc,
+                                          int skip)
 {
     char path[64];
     char line[512];
@@ -441,11 +442,14 @@ static unsigned long find_stage1_page_a64(pid_t pid, unsigned long pc)
         /* 跳过采集排除区 (原子记录注入页, 可能被其他线程执行) */
         if (collect_excluded_range(s, e - s))
             continue;
-        if (!best || s < best)
-            best = (unsigned long)s;
+        if (skip > 0) {
+            skip--;
+            continue;
+        }
+        return (unsigned long)s;
     }
     fclose(f);
-    return best;
+    return 0;
 }
 
 /* 在 scratch 页执行 dc cvau / ic ivau 片段, 刷新 [page, page+len) 的
@@ -525,95 +529,167 @@ void inject_flush_icache(pid_t pid,
 int inject_run_snippet(pid_t pid, const struct user_regs_struct *regs,
                        const uint32_t *code, size_t ninsn, uint64_t *ret0)
 {
-    unsigned long page = find_stage1_page_a64(pid, REG_PC(*regs));
-    int st;
-    if (!page || ninsn == 0 || ninsn * 4 > 4096)
+    if (ninsn == 0 || ninsn * 4 > 4096)
         return -1;
-
-    /* 停住其他线程: PTRACE_CONT 会恢复全部线程, waitpid 可能等到
-       worker 线程的 stop (信号/断点), 读到的 x0 是垃圾 (实测 mmap
-       注入偶发返回 0 → event buffer @ 0 写失败)。 */
-    char task[64];
-    snprintf(task, sizeof task, "/proc/%d/task", pid);
-    DIR *td = opendir(task);
-    if (td) {
-        struct dirent *e;
-        while ((e = readdir(td))) {
-            if (e->d_name[0] == '.')
-                continue;
-            pid_t tid = atoi(e->d_name);
-            if (tid != pid)
-                syscall(SYS_tgkill, pid, tid, SIGSTOP);
-        }
-        closedir(td);
-        usleep(1000);   /* 让 SIGSTOP 生效 */
-    }
-
-    /* 备份全部覆盖字节 (按 ptrace 8B word 取整): 长片段 (cache flush
-       等) 可达数十条指令, 旧代码只备份 2 个 word, 执行后 0x10 之后
-       的注入指令永久残留在目标代码页 → 目标随后执行到该页即 SIGSEGV
-       (condvar Run1/Run2 稳定崩溃)。 */
-    size_t nwords = (ninsn * 4 + 7) / 8;
-    unsigned long *backup = xmalloc(nwords * sizeof(*backup));
-    for (size_t i = 0; i < nwords; i++)
-        backup[i] = ptrace(PTRACE_PEEKDATA, pid, page + i * 8, 0);
-    for (size_t i = 0; i < ninsn; i += 2) {
-        unsigned long w = 0;
-        size_t n = ninsn - i;
-        memcpy(&w, code + i, n >= 2 ? 8 : 4);
-        if (ptrace(PTRACE_POKEDATA, pid, page + i, w) < 0) {
-            free(backup);
+    /* 重试多个候选页: POKEDATA 写代码页后目标 I-cache 可能仍是旧行,
+       片段未真正执行 (svc 被旧指令替代 → mmap 返回 0; 或执行垃圾 →
+       waitpid 挂死)。不同页的缓存状态不同, 重试显著提高成功率。 */
+    for (int attempt = 0; attempt < 4; attempt++) {
+        unsigned long page = find_stage1_page_a64(pid, REG_PC(*regs),
+                                                  attempt);
+        int st;
+        if (!page)
             return -1;
-        }
-    }
 
-    struct user_regs_struct r = *regs, saved = *regs;
-    struct iovec io = {.iov_base = &r, .iov_len = sizeof(r)};
-    int ok = -1;
-    r.pc = page;
-    if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io) == 0 &&
-        ptrace(PTRACE_CONT, pid, 0, 0) == 0) {
-        if (waitpid(pid, &st, 0) > 0 && WIFSTOPPED(st)) {
-            if (WSTOPSIG(st) == SIGSTOP) {
-                /* 组停 (SIGSTOP): CONT 后先停在组停, SIGCONT 放行 */
-                ptrace(PTRACE_CONT, pid, 0, SIGCONT);
-                waitpid(pid, &st, 0);
-            }
-            if (WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP) {
-                struct user_regs_struct r2;
-                struct iovec io2 = {.iov_base = &r2, .iov_len = sizeof(r2)};
-                if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
-                           &io2) == 0) {
-                    if (ret0)
-                        *ret0 = r2.regs[0];
-                    ok = 0;
-                }
-            }
-        }
-    }
-    io.iov_base = &saved;
-    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io);
-    for (size_t i = 0; i < nwords; i++)
-        ptrace(PTRACE_POKEDATA, pid, page + i * 8, backup[i]);
-    free(backup);
-    /* 恢复后刷新目标 I-cache: 否则 PE 可能仍执行缓存中的注入指令 */
-    /* inject_flush_icache(pid, &saved, page, ninsn * 4); */
-    /* 恢复其他线程 */
-    if (td) {
-        DIR *td2 = opendir(task);
-        if (td2) {
+        /* 停住其他线程: PTRACE_CONT 会恢复全部线程, waitpid 可能等到
+           worker 线程的 stop (信号/断点), 读到的 x0 是垃圾 (实测 mmap
+           注入偶发返回 0 → event buffer @ 0 写失败)。 */
+        char task[64];
+        snprintf(task, sizeof task, "/proc/%d/task", pid);
+        DIR *td = opendir(task);
+        if (td) {
             struct dirent *e;
-            while ((e = readdir(td2))) {
+            while ((e = readdir(td))) {
                 if (e->d_name[0] == '.')
                     continue;
                 pid_t tid = atoi(e->d_name);
                 if (tid != pid)
-                    syscall(SYS_tgkill, pid, tid, SIGCONT);
+                    syscall(SYS_tgkill, pid, tid, SIGSTOP);
             }
-            closedir(td2);
+            closedir(td);
+            /* 等待每个 worker 真正进入停止 (State=T): 固定 sleep 不可靠,
+               HTTP server 的活跃 worker 若未停住会并发执行被覆盖的
+               scratch 页, 导致注入的 mmap 返回值被垃圾化。 */
+            for (int w = 0; w < 400; w++) {
+                int all_stopped = 1;
+                DIR *td2 = opendir(task);
+                if (!td2)
+                    break;
+                struct dirent *e2;
+                while ((e2 = readdir(td2))) {
+                    if (e2->d_name[0] == '.')
+                        continue;
+                    pid_t tid = atoi(e2->d_name);
+                    if (tid == pid)
+                        continue;
+                    char sp[64];
+                    snprintf(sp, sizeof sp, "/proc/%d/task/%d/stat",
+                             pid, tid);
+                    FILE *sf = fopen(sp, "r");
+                    if (!sf) {
+                        all_stopped = 0;
+                        continue;
+                    }
+                    char sb[256];
+                    size_t sn2 = fread(sb, 1, sizeof(sb) - 1, sf);
+                    fclose(sf);
+                    sb[sn2] = 0;
+                    char *rp = strrchr(sb, ')');
+                    if (!rp || rp[1] != ' ')
+                        all_stopped = 0;
+                    else if (rp[2] != 'T')
+                        all_stopped = 0;
+                }
+                closedir(td2);
+                if (all_stopped)
+                    break;
+                usleep(5000);
+            }
         }
+
+        /* 备份全部覆盖字节 (按 ptrace 8B word 取整): 长片段 (cache
+           flush 等) 可达数十条指令, 旧代码只备份 2 个 word, 执行后
+           0x10 之后的注入指令永久残留在目标代码页 → 目标随后执行到
+           该页即 SIGSEGV。 */
+        size_t nwords = (ninsn * 4 + 7) / 8;
+        unsigned long *backup = xmalloc(nwords * sizeof(*backup));
+        for (size_t i = 0; i < nwords; i++)
+            backup[i] = ptrace(PTRACE_PEEKDATA, pid, page + i * 8, 0);
+        for (size_t i = 0; i < ninsn; i += 2) {
+            unsigned long w = 0;
+            size_t n = ninsn - i;
+            memcpy(&w, code + i, n >= 2 ? 8 : 4);
+            if (ptrace(PTRACE_POKEDATA, pid, page + i, w) < 0) {
+                free(backup);
+                return -1;
+            }
+        }
+
+        struct user_regs_struct r = *regs, saved = *regs;
+        struct iovec io = {.iov_base = &r, .iov_len = sizeof(r)};
+        int ok = -1;
+        r.pc = page;
+        if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io) == 0 &&
+            ptrace(PTRACE_CONT, pid, 0, 0) == 0) {
+            /* 片段未真正执行 (旧 I-cache) 时目标会跑飞: waitpid 加
+               超时, 超时后恢复页面并换页重试。 */
+            int got = 0;
+            for (int w = 0; w < 4000; w++) {
+                pid_t wr = waitpid(pid, &st, WNOHANG);
+                if (wr == pid) {
+                    got = 1;
+                    break;
+                }
+                if (wr < 0)
+                    break;
+                usleep(500);
+            }
+            if (got && WIFSTOPPED(st)) {
+                if (WSTOPSIG(st) == SIGSTOP) {
+                    /* 组停 (SIGSTOP): CONT 后先停在组停, SIGCONT 放行 */
+                    ptrace(PTRACE_CONT, pid, 0, SIGCONT);
+                    waitpid(pid, &st, 0);
+                }
+                if (WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP) {
+                    struct user_regs_struct r2;
+                    struct iovec io2 = {.iov_base = &r2,
+                                        .iov_len = sizeof(r2)};
+                    if (ptrace(PTRACE_GETREGSET, pid,
+                               (void *)NT_PRSTATUS, &io2) == 0) {
+                        if (ret0)
+                            *ret0 = r2.regs[0];
+                        if (r2.pc != page + (ninsn - 1) * 4) {
+                            fprintf(stderr,
+                                    "inject: snippet stop pc %#llx "
+                                    "!= brk %#llx (page %#lx, "
+                                    "x0 %#llx)\n",
+                                    (unsigned long long)r2.pc,
+                                    (unsigned long long)page +
+                                        (ninsn - 1) * 4,
+                                    page,
+                                    (unsigned long long)r2.regs[0]);
+                            ok = -1;   /* 片段未按预期执行: 换页重试 */
+                        } else {
+                            ok = 0;
+                        }
+                    }
+                }
+            }
+        }
+        io.iov_base = &saved;
+        ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &io);
+        for (size_t i = 0; i < nwords; i++)
+            ptrace(PTRACE_POKEDATA, pid, page + i * 8, backup[i]);
+        free(backup);
+        /* 恢复其他线程 */
+        if (td) {
+            DIR *td2 = opendir(task);
+            if (td2) {
+                struct dirent *e;
+                while ((e = readdir(td2))) {
+                    if (e->d_name[0] == '.')
+                        continue;
+                    pid_t tid = atoi(e->d_name);
+                    if (tid != pid)
+                        syscall(SYS_tgkill, pid, tid, SIGCONT);
+                }
+                closedir(td2);
+            }
+        }
+        if (ok == 0)
+            return 0;
     }
-    return ok;
+    return -1;
 }
 
 /* 在目标内执行一个 syscall (svc #0; brk #0)。
