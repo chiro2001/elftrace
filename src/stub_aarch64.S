@@ -806,6 +806,8 @@ bm_mock_dispatch:
     beq  bm_mock_zero
     cmp  x0, #214                  /* brk */
     beq  bm_mock_brk
+    cmp  x0, #98                   /* futex: 未记录站点 */
+    beq  bm_mock_futex
     cmp  x0, #172                  /* getpid → target_tid */
     beq  bm_mock_getpid
     cmp  x0, #129                  /* kill → 0 */
@@ -851,6 +853,20 @@ bm_mock_brk:
     mov  x1, x0
     str  x1, [x9, #RST_DESC_BRK_BASE]
 6:  str  x1, [x21, #0x08]
+    b    bm_clear_ss
+
+/* futex (未记录站点): WAIT/WAIT_BITSET 返回 -ETIMEDOUT, 打断录制中
+ * 未出现的等待路径 (cond_timedwait 重试循环等, mock 0 会无限自旋);
+ * WAKE 等其他 op 返回 0 (忽略)。 */
+bm_mock_futex:
+    ldr  x1, [x21, #0x10]          /* sc->regs[1] = op */
+    and  x1, x1, #0x7f
+    cmp  x1, #0                    /* FUTEX_WAIT */
+    beq  7f
+    cmp  x1, #9                    /* FUTEX_WAIT_BITSET */
+    bne  bm_mock_zero
+7:  mov  x0, #-110                 /* -ETIMEDOUT */
+    str  x0, [x21, #0x08]
     b    bm_clear_ss
 
 bm_unsupported:
@@ -1881,7 +1897,7 @@ comp_mock:
        PyMem_RawCalloc 失败 → abort), 再推进索引 */
     cbz  x16, mock_dispatch         /* 无回放表 (纯 mock) → 无前瞻 */
     ldr  x0, [x16, #8]              /* 回放表 fmt */
-    cbnz x0, mock_dispatch          /* fmt=1 变长格式: 前瞻禁用 */
+    cbnz x0, mock_la_runs           /* fmt=1: 字节 run 前瞻 */
     ldr  x0, [x16, #16]             /* threaded: 仅多线程前瞻 */
     cbz  x0, mock_dispatch
     adrp x5, next_pending
@@ -1889,7 +1905,7 @@ comp_mock:
     ldr  x19, [x5]
     ldr  x18, [x16]                 /* n_recs */
     cmp  x19, x18
-    b.hs 1f                          /* 无更多记录 → 仍走看门狗阈值 */
+    b.hs mock_wd_thresh              /* 无更多记录 → 仍走看门狗阈值 */
     lsl  x0, x19, #4
     lsl  x1, x0, #2
     add  x0, x0, x1
@@ -1929,13 +1945,14 @@ mock_la_skip:
     add  x19, x19, #8
     sub  x18, x18, #1
     b    mock_la_dl
+
 mock_la_done:
     adrp x5, next_pending
     add  x5, x5, :lo12:next_pending
     ldr  x19, [x5]
     add  x19, x19, #1
     str  x19, [x5]
-1:
+mock_wd_thresh:
     cmp  w3, #256
     b.lo mock_dispatch
     adrp x5, mock_spin_cnt
@@ -2129,6 +2146,105 @@ count_handler:
     br   x16
 1:  add  x16, x16, #16
     br   x16
+
+/* ---- fmt=1 (字节 run) mock 前瞻 ---- *
+ * dirty 每条 entry = {vaddr u64, n_gran u32, mode u32, size u32, pad
+ * u32} + mode=1: {off u32, data[32]}×n_gran / mode=2: data[size]。
+ * 与 fmt=0 前瞻同语义: (1) 任意页内若含 futex uaddr, 应用录制 int32
+ * (sem 计数/锁字), 解除 worker 写入后才满足的等待谓词; (2) 低地址
+ * 数据/BSS 页 (<0xc00000) 的 granule 原样应用 (PyRuntime/GIL 状态)。
+ * mode=2 整段只做 futex 检查 (大段多为 worker 栈/缓冲)。
+ * 放在 count_handler 之后 (0xF970..0xFF00 空区), 由 comp_mock 的
+ * fmt 检查跳转过来, 不占用 0xF000..0xF900 的固定区。 */
+mock_la_runs:
+    ldr  x0, [x16, #16]             /* threaded: 仅多线程前瞻 */
+    cbz  x0, mock_dispatch
+    cmp  x2, #98                    /* 仅 futex 站点的 x0 才是有效
+                                       uaddr; 其他 syscall 的 x0 是
+                                       指针/长度, 误当 uaddr 会越界读 */
+    csel x21, x21, xzr, eq
+    adrp x5, next_pending
+    add  x5, x5, :lo12:next_pending
+    ldr  x19, [x5]
+    ldr  x18, [x16]                 /* n_recs */
+    cmp  x19, x18
+    b.hs mock_wd_thresh             /* 无更多记录 → 看门狗阈值 */
+    lsl  x0, x19, #4
+    lsl  x1, x0, #2
+    add  x0, x0, x1
+    add  x0, x16, x0
+    add  x0, x0, #24                /* rec base (表头 24B) */
+    ldr  x18, [x0, #56]             /* n_dirty_run */
+    ldr  x19, [x0, #64]
+    add  x19, x19, x16              /* dirty entry 流 */
+mlr_entry:
+    cbz  x18, mock_la_done          /* 计数归零 (含回边路径) 即结束 */
+    ldr  x20, [x19]                 /* vaddr */
+    ldr  w22, [x19, #8]             /* n_gran */
+    ldr  w23, [x19, #12]            /* mode */
+    ldr  w24, [x19, #16]            /* size */
+    cmp  w23, #2
+    beq  mlr_full
+    add  x25, x19, #24              /* granule 流 */
+    mov  w26, w22
+mlr_gran:
+    cbz  w26, mlr_next
+    ldr  w27, [x25]                 /* off */
+    add  x10, x20, x27              /* dst */
+    add  x11, x25, #4               /* src */
+    cbz  x21, mlr_gran_low
+    sub  x9, x21, x10
+    cmp  x9, #32
+    b.hs mlr_gran_low
+    ldr  w12, [x11, x9]
+    movz w14, #0x40, lsl #16
+    cmp  w12, w14
+    b.hs mlr_gran_low
+    ldr  w13, [x10, x9]
+    cmp  w12, w13
+    beq  mlr_gran_low
+    str  w12, [x10, x9]
+mlr_gran_low:
+    movz x8, #0xc0, lsl #16
+    cmp  x20, x8
+    b.hs mlr_gran_next
+    ldp  x4, x5, [x11]
+    ldp  x6, x7, [x11, #16]
+    stp  x4, x5, [x10]
+    stp  x6, x7, [x10, #16]
+mlr_gran_next:
+    add  x25, x25, #36
+    sub  w26, w26, #1
+    b    mlr_gran
+mlr_full:
+    cbz  x21, mlr_next
+    sub  x9, x21, x20
+    cmp  x9, x24
+    b.hs mlr_next
+    add  x10, x19, #24
+    ldr  w12, [x10, x9]
+    movz w14, #0x40, lsl #16
+    cmp  w12, w14
+    b.hs mlr_next
+    ldr  w13, [x20, x9]
+    cmp  w12, w13
+    beq  mlr_next
+    str  w12, [x20, x9]
+mlr_next:
+    cmp  w23, #2
+    beq  mlr_next_full
+    add  x19, x19, #24
+    mov  x0, x22
+    mov  x1, #36
+    mul  x0, x0, x1
+    add  x19, x19, x0
+    b    mlr_entry_next
+mlr_next_full:
+    add  x19, x19, #24
+    add  x19, x19, x24
+mlr_entry_next:
+    sub  x18, x18, #1
+    b    mlr_entry
 
 /* ===================== strict: 退出代码 =====================
  * 唯一路径退出/循环结束跳到这里: 真实 exit_group(0)。 */
