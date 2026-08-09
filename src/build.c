@@ -1029,10 +1029,17 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             memcpy(q, &ab->sites[i].orig_insn, 4);
             if (!ab->run_cnt[i] && !ab->synth_only[i])
                 continue;
-            if (exit_override == ab->sites[i].pc)
-                die("atomic: exit point %#llx coincides with atomic "
-                    "replay site; choose a different --to checkpoint",
-                    (unsigned long long)ab->sites[i].pc);
+            if (exit_override == ab->sites[i].pc) {
+                /* 窗口终点指令被替换为退出跳板, 该站点在切片中不会
+                   执行, 无需回放 (原指令已还原)。硬失败会因检查点
+                   pc 落在站点上 (数据相关) 让 http 窗口偶发不可构建;
+                   跳过该站点, 退出优先。 */
+                fprintf(stderr,
+                        "atomic: exit point %#llx coincides with replay "
+                        "site, skip site (exit wins)\n",
+                        (unsigned long long)ab->sites[i].pc);
+                continue;
+            }
             if (nsites == sites_cap) {
                 sites_cap = sites_cap ? sites_cap * 2 : 32;
                 sites = xrealloc(sites, sites_cap * sizeof(*sites));
