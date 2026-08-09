@@ -168,6 +168,7 @@ struct atomic_build {
     size_t n_runs;
     size_t *run_off;            /* 站点 i 的 runs 起始索引 */
     size_t *run_cnt;
+    unsigned char *synth_only;  /* 站点只有合成首段 (窗口内无事件) */
 };
 
 /* 解析 compensation.txt: r_num/r_den + 逐检查点 {idx measured overhead orig} */
@@ -415,6 +416,7 @@ static void atomic_load(const char *dir, long from, long to,
     {
     ab->run_off = xcalloc(n_sites ? n_sites : 1, sizeof(size_t));
         ab->run_cnt = xcalloc(n_sites ? n_sites : 1, sizeof(size_t));
+        ab->synth_only = xcalloc(n_sites ? n_sites : 1, 1);
         /* 先统计每站点窗口事件数 (事件全局有序, 站点内单调) */
         snprintf(path, sizeof(path), "%s/atomics/events.bin", dir);
         FILE *f = fopen(path, "rb");
@@ -455,9 +457,13 @@ static void atomic_load(const char *dir, long from, long to,
                            第 1 次读的值 (事件序号相对检查点快照存在
                            一阶偏移, 首个事件值会超前冻结内存状态,
                            曾导致回放从"队列溢出"开始永远自旋) */
-                        acc += ab->run_cnt[i] + (ab->run_cnt[i] ? 1 : 0);
+                        /* 每个站点都预留 1 个合成段槽 (含窗口内无事件
+                           的站点: 它们同样需要唯一槽位, 否则 run_off
+                           重叠, 后写的站点值覆盖先写的, 回放拿到错误
+                           常量) */
+                        acc += ab->run_cnt[i] + 1;
                     }
-                    ab->runs = xmalloc((total ? total + n_sites : 1) *
+                    ab->runs = xmalloc((total + n_sites) *
                                        sizeof(*ab->runs));
                     ab->n_runs = total;
                     /* 第二遍填内容 (位置由 run_off + 已计数偏移) */
@@ -503,6 +509,28 @@ static void atomic_load(const char *dir, long from, long to,
                         ab->runs[o].value = value;
                     }
                     free(filled);
+                    /* 值回放站点 (普通 load, kind 2/3) 窗口内无事件:
+                       checkpoint 的 last_val/last_addr 即窗口内恒定值。
+                       必须仍生成合成首段并 patch —— 否则切片回退真实读,
+                       而该字段可能被 worker 线程改写 (如 GIL locked:
+                       检查点时 locked=1, 录制中主线程恒读 0), diff 未
+                       到达前真实读会让切片走进录制中不存在的等待路径。
+                       原子自旋站点 (kind 0/1) 保持不 patch: 真实读 +
+                       syscall diff 才能让等待 worker 标志的自旋退出。 */
+                    for (size_t i = 0; i < n_sites; i++) {
+                        if (ab->run_cnt[i] ||
+                            !(ab->sites[i].kind == 2 ||
+                              ab->sites[i].kind == 3) ||
+                            !ab->sites[i].from_addr)
+                            continue;
+                        ab->runs[ab->run_off[i]].start = 1;
+                        ab->runs[ab->run_off[i]].addr =
+                            ab->sites[i].from_addr;
+                        ab->runs[ab->run_off[i]].value =
+                            ab->sites[i].from_val;
+                        ab->synth_only[i] = 1;
+                        ab->n_runs++;
+                    }
                 }
             }
             free(eb);
@@ -979,7 +1007,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             }
             /* 还原原始 ldar (记录跳板分支 → 原指令) */
             memcpy(q, &ab->sites[i].orig_insn, 4);
-            if (!ab->run_cnt[i])
+            if (!ab->run_cnt[i] && !ab->synth_only[i])
                 continue;
             if (exit_override == ab->sites[i].pc)
                 die("atomic: exit point %#llx coincides with atomic "
@@ -1143,7 +1171,9 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 buf_zero(blob, 8 - (blob->size & 7));
             st->ab_run_off = blob->size;
             size_t o = ab->run_off[st->ab_id];
-            size_t cnt = ab->run_cnt[st->ab_id] + 1;   /* 含合成首段 */
+            /* 含合成首段: 有窗口事件 = run_cnt+1; 仅合成 = 1 */
+            size_t cnt = ab->run_cnt[st->ab_id] +
+                (ab->run_cnt[st->ab_id] || ab->synth_only[st->ab_id] ? 1 : 0);
             for (size_t k = 0; k < cnt; k++) {
                 struct ab_run *r = &ab->runs[o + k];
                 buf_append(blob, &r->start, 8);
@@ -1279,7 +1309,10 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                         (unsigned long long)st->pc);
                 size_t bl = a64_atomic_replay_block(
                     page + o, taddr + o, runs_abs,
-                    ab->run_cnt[st->ab_id] + 1, size, rt, rn, st->pc + 4,
+                    ab->run_cnt[st->ab_id] +
+                        (ab->run_cnt[st->ab_id] ||
+                         ab->synth_only[st->ab_id] ? 1 : 0),
+                    size, rt, rn, st->pc + 4,
                     ab->sites[st->ab_id].to_ord -
                         ab->sites[st->ab_id].from_ord,
                     base + STUB_STRICT_EXIT_OFF, kind, adp);

@@ -48,6 +48,11 @@
 # 检查/FORCE_SWITCHING wait, 本负载中主线程不执行 drop_gil, 站点无事件。
 58b860 b9400380
 58b9ac b9400380
+# drop_gil FORCE_SWITCHING 的 gil_drop_request 读取 (ceval+4)。
+# 录制中主线程从不执行 drop_gil, 站点无事件 → 合成首段回放检查点
+# 值 (0), 使切片永不进入 FORCE_SWITCHING cond_wait (该等待的 futex
+# 未记录, mock 后无限自旋)。
+58be50 b9400260
 # 迁移/refill 路径 (pool 满↔可用)
 509de0 f8607a81
 509e18 f9400662
