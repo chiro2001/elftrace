@@ -1625,6 +1625,85 @@ arr_next:
 comp_done:
     ldr  x1, [x23, #16]             /* rec.rax */
     str  x1, [x17, #24]             /* x0 槽 */
+    /* clone3 早应用: 当前回放记录是 clone3 (创建线程) 时, 新线程的
+       启动写入 (如 Thread._started.set、Event 标志) 落在下一条记录的
+       边界 diff 里。录制中主线程在观察这些标志前它们已可见 (从不
+       futex_wait); 切片没有 worker, 若不提前灌入会永远等待
+       (Thread.start → _started.wait → Event.wait → Condition.wait)。
+       此处提前应用下一条记录的内存 diff, 不消费其回放游标 (站点
+       下次命中会再应用, 写幂等)。跳过主线程活动栈页, 避免覆盖
+       切片当前栈帧。 */
+    ldr  x27, [x23, #8]             /* sysno */
+    cmp  x27, #435
+    b.ne 9f
+    ldr  x27, [x16]                 /* n_recs */
+    cmp  x19, x27
+    b.hs 9f                         /* 无下一条记录 */
+    mov  x4, #80
+    mul  x4, x19, x4
+    add  x4, x4, x16
+    add  x4, x4, #16                /* x4 = 下一条 rec base */
+    /* 栈保护区间: [sp-0x20000, sp+0x2000) */
+    mov  x8, sp
+    sub  x8, x8, #0x20000
+    adrp x7, mock_stack_lo
+    add  x7, x7, :lo12:mock_stack_lo
+    str  x8, [x7]
+    add  x8, sp, #0x2000
+    str  x8, [x7, #8]
+    ldr  x18, [x4, #40]             /* n_newseg */
+    ldr  x19, [x4, #48]
+    add  x19, x19, x16
+ck_next_ns:
+    cbz  x18, ck_next_d
+    ldr  x20, [x19]                 /* vaddr */
+    ldr  x21, [x19, #8]             /* filesz */
+    add  x22, x19, #32              /* src */
+    mov  x0, x20
+    mov  x1, x22
+    mov  x2, x21
+    bl   copy_blob
+    add  x19, x19, #32
+    add  x19, x19, x21
+    sub  x18, x18, #1
+    b    ck_next_ns
+ck_next_d:
+    ldr  x18, [x4, #56]             /* n_dirty */
+    ldr  x19, [x4, #64]
+    add  x19, x19, x16
+ck_next_dl:
+    cbz  x18, 8f
+    ldr  x20, [x19]                 /* dst */
+    /* 栈保护: 跳过主线程活动栈页 */
+    adrp x7, mock_stack_lo
+    add  x7, x7, :lo12:mock_stack_lo
+    ldr  x8, [x7]
+    cbz  x8, 7f
+    cmp  x20, x8
+    b.lo 7f
+    ldr  x8, [x7, #8]
+    cmp  x20, x8
+    b.hs 7f
+    add  x19, x19, #4096
+    add  x19, x19, #8
+    sub  x18, x18, #1
+    b    ck_next_dl
+7:
+    add  x21, x19, #8               /* src */
+    mov  x0, x20
+    mov  x1, x21
+    mov  x2, #4096
+    bl   copy_blob
+    add  x19, x19, #4096
+    add  x19, x19, #8
+    sub  x18, x18, #1
+    b    ck_next_dl
+8:
+    adrp x7, mock_stack_lo
+    add  x7, x7, :lo12:mock_stack_lo
+    str  xzr, [x7]
+    str  xzr, [x7, #8]
+9:
     b    comp_restore
 
 comp_exhausted:
