@@ -69,6 +69,39 @@ NCK=$(wc -l < "$TF_TMP/lf_r2/manifest.txt")
 [ -f "$TF_TMP/lf_r2/atomics/events.bin" ] || {
     echo "FAIL: Run2 no events.bin"; exit 1; }
 
+# ---------- 发现主程序段内的 LSE CAS 站点 (显式开启强制成功) ----------
+# force-success 默认关闭 (CPython/libc 有状态 CAS 会被写坏); 本负载
+# 只对无锁队列入队 CAS (cas8_rel 的 casl) 开启。
+CAS_ARGS=$(python3 - "$TF_TMP/lf_r2/ckpt_000000.elftrace" <<'EOF'
+import struct, sys
+f = open(sys.argv[1], "rb").read()
+segs_off, nsegs = struct.unpack_from("<QQ", f, 72)
+strings_off, strings_size = struct.unpack_from("<QQ", f, 112)
+payload_off = struct.unpack_from("<Q", f, 152)[0]
+pcs = []
+for i in range(nsegs):
+    vaddr, filesz, memsz, flags, poff, name_off = \
+        struct.unpack_from("<QQQQQQ", f, segs_off + i * 48)
+    name = b""
+    if 0 < name_off < strings_size:
+        e = f.find(b"\0", strings_off + name_off)
+        name = f[strings_off + name_off:e]
+    if not (flags & 1) or b"prog_lockfree_main" not in name:
+        continue
+    base = payload_off + poff
+    for k in range(0, filesz - 3, 4):
+        w = struct.unpack_from("<I", f, base + k)[0]
+        if (w & 0x08A07C00) == 0x08A07C00:
+            pcs.append(vaddr + k)
+for pc in pcs:
+    print("--atomic-force-cas-pc 0x%x" % pc)
+EOF
+)
+[ -n "$CAS_ARGS" ] || {
+    echo "FAIL: no LSE CAS found in main executable segment"
+    exit 1; }
+echo "atomic: force-cas sites: $(echo $CAS_ARGS | wc -w)"
+
 # ---------- 选窗: 有原子事件且退出点可计数的窗口 ----------
 WIN=$(python3 - "$TF_TMP/lf_r2" <<'EOF'
 import struct, sys
@@ -153,7 +186,7 @@ while read -r FROM_C TO_C; do
         tf_build /dev/null "$TF_TMP/lf_slice.elf" --mode baremetal \
             --bm-strict --checkpoints "$TF_TMP/lf_r2" \
             --from-count "$FROM_C" --to-count "$TO_C" \
-            --stack-reserve 67108864 "${EXTRA[@]}" \
+            --stack-reserve 67108864 $CAS_ARGS "${EXTRA[@]}" \
             > "$TF_TMP/lf_build.log" 2>&1 || continue 2
         grep -q "count target insn" "$TF_TMP/lf_build.log" || continue 2
         K=$(grep -oE "K=[0-9]+" "$TF_TMP/lf_build.log" | head -1 \

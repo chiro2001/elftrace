@@ -28,6 +28,14 @@
 #include "a64.h"
 #include "atomic_a64.h"
 
+/* --atomic-force-cas-pc: 仅对显式列出的 LSE CAS 站点生成强制成功
+ * 跳板。默认不 patch 任何 LSE CAS: 对 CPython GIL/libc 锁这类
+ * 有状态 CAS 无条件 str 会写坏状态/非法地址 (http_server probe
+ * SIGSEGV 回归)。round-16 双模型评审: force-success 只是特定负载
+ * (无锁队列入队 CAS) 的逃生阀, 通用方案是采集侧记录 CAS 结局。 */
+static uint64_t g_force_cas_pcs[256];
+static size_t g_n_force_cas = 0;
+
 /* ---- 生成的 stub blob (按目标架构选择) ---- */
 extern const unsigned char stub_blob_x86_64[];
 extern const unsigned int stub_blob_x86_64_len;
@@ -1384,8 +1392,15 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 uint32_t w;
                 memcpy(&w, segp + k, 4);
                 if (a64_is_lse_cas(w, NULL, NULL, NULL)) {
-                    if (n_cas < 512)
-                        cas_pcs[n_cas++] = segs[gi].vaddr + k;
+                    uint64_t pc = segs[gi].vaddr + k;
+                    int force = 0;
+                    for (size_t f = 0; f < g_n_force_cas; f++)
+                        if (g_force_cas_pcs[f] == pc) {
+                            force = 1;
+                            break;
+                        }
+                    if (force && n_cas < 512)
+                        cas_pcs[n_cas++] = pc;
                     continue;
                 }
                 if (!a64_is_excl_load(w, NULL, NULL, NULL, NULL))
@@ -2089,6 +2104,10 @@ int build_main(int argc, char **argv)
         } else if (strcmp(argv[i], "--atomic-skip-pc") == 0 &&
                    i + 1 < argc && n_skip_pcs < 256) {
             skip_pcs[n_skip_pcs++] = strtoull(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--atomic-force-cas-pc") == 0 &&
+                   i + 1 < argc && g_n_force_cas < 256) {
+            g_force_cas_pcs[g_n_force_cas++] =
+                strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--atomic-no-value-replay") == 0) {
             atomic_no_value_replay = 1;
         } else if (strcmp(argv[i], "--census-pages") == 0 &&
