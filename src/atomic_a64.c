@@ -373,6 +373,62 @@ int a64_is_plain_load(uint32_t w, int *size, unsigned *rt, unsigned *rn,
     return 0;
 }
 
+/* stxr/stlxr 族编码 (ARM ARM):
+ *   size 00=stxrb/stlxrb, 01=stxrh/stlxrh, 10=stxr w/stlxr w,
+ *        11=stxr x/stlxr x
+ *   [31:26] = 000010 (0x08 after masking bits 31-26)
+ *   [15:12] = 0111 (stxr) 或 1111 (stlxr, bit15=release)
+ *   [23:21] = 000? (独占标志)
+ */
+int a64_is_excl_store(uint32_t w, int *size, unsigned *rs,
+                      unsigned *rn, unsigned *rt, int *acquire)
+{
+    uint32_t m = w & 0x3F00FC00U;
+    if (m != 0x0800FC00U && m != 0x08007C00U)
+        return 0;
+    if (size)
+        *size = (int)((w >> 30) & 3U);
+    if (rs)
+        *rs = (w >> 16) & 0x1FU;
+    if (rn)
+        *rn = (w >> 5) & 0x1FU;
+    if (rt)
+        *rt = w & 0x1FU;
+    if (acquire)
+        *acquire = (m == 0x0800FC00U) ? 1 : 0;
+    return 1;
+}
+
+uint32_t a64_excl_store_to_str(int size, unsigned rn, unsigned rt)
+{
+    static const uint32_t bases[4] = {
+        0x39000000U,    /* strb */
+        0x79000000U,    /* strh */
+        0xB9000000U,    /* str w */
+        0xF9000000U,    /* str x */
+    };
+    return bases[size & 3] | (rn << 5) | rt;
+}
+
+size_t a64_excl_store_trampoline(uint8_t *out, uint64_t block_abs,
+                                 uint32_t insn, uint64_t ret_addr)
+{
+    int size;
+    unsigned rs, rn, rt;
+    int acq;
+    if (!a64_is_excl_store(insn, &size, &rs, &rn, &rt, &acq))
+        return 0;
+    memset(out, 0, 0x20);
+    uint8_t *p = out;
+    put32(&p, 0xA9BF47F0U);            /* stp x16,x17,[sp,#-16]! */
+    put32(&p, a64_excl_store_to_str(size, rn, rt));
+    put32(&p, rs < 31 ? (0x52800000U | (rs << 5)) : INSN_NOP);
+    put32(&p, 0xA8C147F0U);            /* ldp x16,x17,[sp],#16 */
+    uint64_t b_off = (uint64_t)(p - out);
+    put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
+    return 0x20;
+}
+
 /* 按加载宽度生成 ldar/ldarb/ldarh 指令 (回放屏障用) */
 static uint32_t a64_ldar_insn(int size, unsigned rn, unsigned rt)
 {

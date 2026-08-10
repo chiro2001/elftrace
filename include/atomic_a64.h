@@ -123,6 +123,28 @@ int a64_is_load_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
 int a64_is_plain_load(uint32_t w, int *size, unsigned *rt, unsigned *rn,
                       int *kind, struct a64_ld_addr *ad);
 
+/* 排他 store 检测: stxr/stlxr 族 (含 b/h/w/x)。size 0-3 (b/h/w/x),
+ * rs=状态寄存器 (0=成功), rn=基址, rt=数据寄存器, acquire=1 为
+ * stlxr 族。用于"强制成功"跳板: 把 stlxr 替换为无条件 str + rs=0,
+ * 消除对排他监视器语义的依赖 (模拟器可能任何 store 清监视器 →
+ * 真实 stlxr 永远失败 → LL/SC 循环死锁)。 */
+int a64_is_excl_store(uint32_t w, int *size, unsigned *rs,
+                      unsigned *rn, unsigned *rt, int *acquire);
+
+/* 排他 store → 等宽无条件 str [Xn] (数据寄存器不变) */
+uint32_t a64_excl_store_to_str(int size, unsigned rn, unsigned rt);
+
+/* 生成排他 store 强制成功跳板 (0x20 字节):
+ *   stp x16,x17,[sp,#-16]!
+ *   str Xt,[Xn]        ; 无条件写入 (不依赖排他监视器)
+ *   mov wRs,#0         ; 状态=成功
+ *   ldp x16,x17,[sp],#16
+ *   b ret_addr
+ * 消除 LL/SC 对监视器语义的依赖 (模拟器可能任何 store 清监视器 →
+ * stlxr 永远失败 → 循环死锁)。 */
+size_t a64_excl_store_trampoline(uint8_t *out, uint64_t block_abs,
+                                 uint32_t insn, uint64_t ret_addr);
+
 /* 检测 ldar/ldarb/ldarh 与 ldaxr/ldaxrb/ldaxrh; *exclusive 输出
  * ldaxr 族标记 (兼容旧调用) */
 int a64_is_ldar_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,

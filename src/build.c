@@ -729,6 +729,14 @@ static int a64_in_exec_ranges(const uint64_t ranges[][2], int nr,
     return 0;
 }
 
+/* aarch64 无条件分支编码 (b imm26, ±128MB) */
+static uint32_t a64_patch_b(uint64_t from, uint64_t to)
+{
+    int64_t d = (int64_t)(to - from);
+    return 0x14000000U |
+           (((uint32_t)((uint64_t)d >> 2)) & 0x03FFFFFFU);
+}
+
 /* strict 模式构建: 收集站点 → 生成跳板/站点块 → patch 指令 →
  * 计算额外 PT_LOAD (跳板页/未来 newseg/栈预留)。
  * 返回 0 成功; 写 *pl_out / *npl_out。 */
@@ -1339,7 +1347,44 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             }
             if (!cnt)
                 continue;
-            uint64_t need = ((cnt * A64_ATOM_BLOCK_SIZE + 0xfff) &
+            /* 配对 stlxr/stxr 强制成功: 从每个 ldaxr 回放站点向前扫描
+               (最多 128B) 找排他 store, 生成无条件 str + rs=0 跳板,
+               消除模拟器排他监视器语义依赖 (任何 store 清监视器 →
+               stlxr 永远失败 → LL/SC 循环死锁)。 */
+            uint64_t stx_pcs[512];
+            size_t n_stx = 0;
+            uint8_t *segp = blob->data + payload_off +
+                            segs[gi].payload_off;
+            for (size_t i = 0; i < nsites; i++) {
+                struct strict_site *st = &sites[i];
+                if (st->kind != 4 ||
+                    st->pc < segs[gi].vaddr ||
+                    st->pc >= segs[gi].vaddr + segs[gi].filesz)
+                    continue;
+                if (ab->sites[st->ab_id].kind != 1)
+                    continue;   /* 仅 ldaxr (排他) 配对 stlxr */
+                size_t off = (size_t)(st->pc - segs[gi].vaddr);
+                for (size_t k = off + 4;
+                     k + 4 <= segs[gi].filesz && k < off + 4 + 128;
+                     k += 4) {
+                    uint32_t w;
+                    memcpy(&w, segp + k, 4);
+                    if (!a64_is_excl_store(w, NULL, NULL, NULL, NULL, NULL))
+                        continue;
+                    uint64_t pc = segs[gi].vaddr + k;
+                    int dup = 0;
+                    for (size_t d = 0; d < n_stx; d++)
+                        if (stx_pcs[d] == pc) {
+                            dup = 1;
+                            break;
+                        }
+                    if (!dup && n_stx < 512)
+                        stx_pcs[n_stx++] = pc;
+                    break;      /* 每个 ldaxr 只配对最近的 stlxr */
+                }
+            }
+            uint64_t need = (((cnt * A64_ATOM_BLOCK_SIZE +
+                               n_stx * 0x20) + 0xfff) &
                              ~0xfffULL);
             uint64_t taddr = find_gap_near(segs, nsegs, pl, npl,
                                            segs[gi].vaddr + segs[gi].filesz,
@@ -1408,6 +1453,25 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                     die("atomic: cannot generate replay block at %#llx",
                         (unsigned long long)st->pc);
                 o += A64_ATOM_BLOCK_SIZE;
+            }
+            /* stlxr/stxr 强制成功跳板 + patch 目标代码 */
+            for (size_t s = 0; s < n_stx; s++) {
+                uint64_t pc = stx_pcs[s];
+                uint32_t w;
+                memcpy(&w, segp + (pc - segs[gi].vaddr), 4);
+                o = (o + 0xf) & ~(size_t)0xf;  /* 16B 对齐 */
+                size_t bl2 = a64_excl_store_trampoline(
+                    page + o, taddr + o, w, pc + 4);
+                if (!bl2)
+                    die("atomic: bad excl store at %#llx",
+                        (unsigned long long)pc);
+                uint32_t bw = a64_patch_b(pc, taddr + o);
+                memcpy(segp + (pc - segs[gi].vaddr), &bw, 4);
+                fprintf(stderr,
+                        "atomic: force-success excl store %#llx "
+                        "(rs=0, unconditional str)\n",
+                        (unsigned long long)pc);
+                o += 0x20;
             }
             for (size_t i = 0; i < npl; i++) {
                 if (pl[i].vaddr == taddr) {
