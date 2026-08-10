@@ -107,53 +107,64 @@ run_trace_retry() {  # <输出目录> [补偿文件]
     return 1
 }
 
-rm -rf "$TF_TMP/http_pool_r1" "$TF_TMP/http_pool_r2"
-run_trace_retry "$TF_TMP/http_pool_r1" || { echo "FAIL: Run1"; tail -3 "$TF_TMP/http_pool_trace.log"; exit 1; }
-COMP="$TF_TMP/http_pool_r1/atomics/compensation.txt"
-[ -f "$COMP" ] || { echo "FAIL: Run1 无 compensation.txt"; exit 1; }
-NCK=$(wc -l < "$TF_TMP/http_pool_r1/manifest.txt")
-[ "$NCK" -ge 6 ] || { echo "FAIL: Run1 只有 $NCK 检查点"; exit 1; }
-echo "  Run1: $NCK ckpts, $(wc -l < "$TF_TMP/http_pool_r1/syscalls/syscall.map") syscalls"
-
-run_trace_retry "$TF_TMP/http_pool_r2" "$COMP" || { echo "FAIL: Run2"; tail -3 "$TF_TMP/http_pool_trace.log"; exit 1; }
-[ -f "$TF_TMP/http_pool_r2/atomics/events.bin" ] || { echo "FAIL: Run2 无 events.bin"; exit 1; }
-NCK=$(wc -l < "$TF_TMP/http_pool_r2/manifest.txt")
-[ "$NCK" -ge 6 ] || { echo "FAIL: Run2 只有 $NCK 检查点"; exit 1; }
-echo "  Run2: $NCK ckpts, $(wc -l < "$TF_TMP/http_pool_r2/syscalls/syscall.map") syscalls"
-
-# 中间窗口 (Run2 总计数的 40%~60%), probe → byte-run
-TOT=$(awk 'END{print $1}' "$TF_TMP/http_pool_r2/manifest.txt")
-FROM=$((TOT * 2 / 5))
-TO=$((TOT * 3 / 5))
-[ "$TO" -gt "$FROM" ] || { echo "FAIL: 窗口过窄"; exit 1; }
-# 预创建线程窗口: 先尝试无值回放路径 (边界 diff 已足够, 探针验证),
-# 探针失败再回退到完整值回放 — 无值回放可省 ~75K 引擎指令
+# 两跑采集 + probe (NVR 优先, 失败回退全值), 整体最多重试 2 次
+# (trace 数据相关分歧会让探针偶发 SIGILL/SIGSEGV, 重采得到干净数据)
 NVR=()
-tf_build /dev/null "$TF_TMP/http_pool_probe.elf" --mode baremetal --bm-strict \
-    --checkpoints "$TF_TMP/http_pool_r2" \
-    --from-count "$FROM" --to-count "$TO" \
-    --stack-reserve 67108864 --atomic-no-value-replay \
-    --probe-dump "$TF_TMP/http_pool_probe.bin" > "$TF_TMP/http_pool_build.log" 2>&1
-if [ $? = 0 ]; then
-    timeout 600 "$TF_TMP/http_pool_probe.elf" > /dev/null 2>&1
-    PRC=$?
-    if [ "$PRC" = 0 ] && [ -s "$TF_TMP/http_pool_probe.bin" ]; then
-        NVR=(--atomic-no-value-replay)
-        echo "  http_pool: 无值回放探针通过 (边界 diff 足够)"
+FROM=0
+TO=0
+trace_and_probe() {
+    NVR=()
+    rm -rf "$TF_TMP/http_pool_r1" "$TF_TMP/http_pool_r2"
+    run_trace_retry "$TF_TMP/http_pool_r1" || { echo "FAIL: Run1"; return 1; }
+    COMP="$TF_TMP/http_pool_r1/atomics/compensation.txt"
+    [ -f "$COMP" ] || { echo "FAIL: Run1 无 compensation.txt"; return 1; }
+    NCK=$(wc -l < "$TF_TMP/http_pool_r1/manifest.txt")
+    [ "$NCK" -ge 6 ] || { echo "FAIL: Run1 只有 $NCK 检查点"; return 1; }
+    echo "  Run1: $NCK ckpts, $(wc -l < "$TF_TMP/http_pool_r1/syscalls/syscall.map") syscalls"
+
+    run_trace_retry "$TF_TMP/http_pool_r2" "$COMP" || { echo "FAIL: Run2"; return 1; }
+    [ -f "$TF_TMP/http_pool_r2/atomics/events.bin" ] || { echo "FAIL: Run2 无 events.bin"; return 1; }
+    NCK=$(wc -l < "$TF_TMP/http_pool_r2/manifest.txt")
+    [ "$NCK" -ge 6 ] || { echo "FAIL: Run2 只有 $NCK 检查点"; return 1; }
+    echo "  Run2: $NCK ckpts, $(wc -l < "$TF_TMP/http_pool_r2/syscalls/syscall.map") syscalls"
+
+    TOT=$(awk 'END{print $1}' "$TF_TMP/http_pool_r2/manifest.txt")
+    FROM=$((TOT * 2 / 5))
+    TO=$((TOT * 3 / 5))
+    [ "$TO" -gt "$FROM" ] || { echo "FAIL: 窗口过窄"; return 1; }
+    # NVR 优先: 探针验证通过则跳过全部值回放 (省 ~75K 引擎指令)
+    tf_build /dev/null "$TF_TMP/http_pool_probe.elf" --mode baremetal --bm-strict \
+        --checkpoints "$TF_TMP/http_pool_r2" \
+        --from-count "$FROM" --to-count "$TO" \
+        --stack-reserve 67108864 --atomic-no-value-replay \
+        --probe-dump "$TF_TMP/http_pool_probe.bin" > "$TF_TMP/http_pool_build.log" 2>&1
+    if [ $? = 0 ]; then
+        timeout 600 "$TF_TMP/http_pool_probe.elf" > /dev/null 2>&1
+        PRC=$?
+        if [ "$PRC" = 0 ] && [ -s "$TF_TMP/http_pool_probe.bin" ]; then
+            NVR=(--atomic-no-value-replay)
+            echo "  http_pool: 无值回放探针通过 (边界 diff 足够)"
+            return 0
+        fi
+        echo "  http_pool: NVR 探针 rc=$PRC, 回退全值回放"
     fi
-fi
-if [ "${#NVR[@]}" = 0 ]; then
     tf_build /dev/null "$TF_TMP/http_pool_probe.elf" --mode baremetal --bm-strict \
         --checkpoints "$TF_TMP/http_pool_r2" \
         --from-count "$FROM" --to-count "$TO" \
         --stack-reserve 67108864 \
         --probe-dump "$TF_TMP/http_pool_probe.bin" > "$TF_TMP/http_pool_build.log" 2>&1 \
-        || { echo "FAIL: probe build"; tail -5 "$TF_TMP/http_pool_build.log"; exit 1; }
+        || { echo "FAIL: probe build"; tail -5 "$TF_TMP/http_pool_build.log"; return 1; }
     timeout 600 "$TF_TMP/http_pool_probe.elf" > /dev/null 2>&1
     PRC=$?
-    [ "$PRC" = 0 ] || { echo "FAIL: probe slice rc=$PRC"; exit 1; }
-    [ -s "$TF_TMP/http_pool_probe.bin" ] || { echo "FAIL: 无 probe.bin"; exit 1; }
-fi
+    if [ "$PRC" != 0 ]; then
+        echo "  http_pool: 全值探针 rc=$PRC (trace 数据分歧), 重采重试"
+        return 1
+    fi
+    [ -s "$TF_TMP/http_pool_probe.bin" ] || { echo "FAIL: 无 probe.bin"; return 1; }
+    return 0
+}
+
+trace_and_probe || trace_and_probe || { tail -3 "$TF_TMP/http_pool_trace.log"; exit 1; }
 tf_build /dev/null "$TF_TMP/http_pool_slice.elf" --mode baremetal --bm-strict \
     --checkpoints "$TF_TMP/http_pool_r2" \
     --from-count "$FROM" --to-count "$TO" \
