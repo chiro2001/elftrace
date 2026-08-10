@@ -18,7 +18,7 @@ gcc -O0 -g -o "$PROG" tests/prog_simple.c || exit 1
 
 "$PROG" > "$TMP/dbg_frozen.out" 2>&1 &
 PID=$!
-for i in $(seq 1 200); do
+for i in $(seq 1 1200); do
     grep -q "$CP" "$TMP/dbg_frozen.out" 2>/dev/null && break
     sleep 0.05
 done

@@ -60,14 +60,16 @@ for TO in $(seq 1 $((NCK - 1))); do
     timeout 60 "$TF_TMP/boundary_slice.elf" \
         > "$TF_TMP/boundary_slice.out" 2>&1
     RC=$?
-    [ "$RC" = 0 ] && break
+    # rc=0=名义窗口结束; rc=67=原子回放负载上限兜底 (预算耗尽,
+    # 同样是“没读到 NEW”的旧数据语义; 67 与正常退出区分是 P0 修复)
+    { [ "$RC" = 0 ] || [ "$RC" = 67 ]; } && break
     # rc=7 说明切片真的读到了 NEW (检查点晚于写 payload): 测试设置问题
     if [ "$RC" = 7 ]; then
         echo "FAIL: slice reproduced NEW (checkpoint after writer?)"
         exit 1
     fi
 done
-[ "$RC" = 0 ] || {
+{ [ "$RC" = 0 ] || [ "$RC" = 67 ]; } || {
     echo "FAIL: slice rc=$RC (ref=7, expected 0 = stale data)"
     exit 1; }
 
@@ -77,6 +79,6 @@ AFTER=$(awk '/rt_sigreturn/{f=1; next} f' "$TF_TMP/boundary_slice.strace")
 echo "$AFTER" | grep -E "openat|read\(|write\(|ioctl\(|mmap|brk|futex|clone" \
     && { echo "FAIL: target-phase real syscalls"; exit 1; }
 
-echo "PASS: acquire boundary documented (ref=NEW rc=7, slice=OLD rc=0, clean)"
+echo "PASS: acquire boundary documented (ref=NEW rc=7, slice=OLD rc=$RC, clean)"
 tf_pass "atomic acquire boundary (documented limitation)"
 tf_finish
