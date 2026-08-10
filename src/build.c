@@ -2038,7 +2038,6 @@ int build_main(int argc, char **argv)
         ckpt_count_to = count_to;
         if (to_ckpt < 0)
             ckpt_count_to = UINT64_MAX;   /* 无 --to: 窗口延伸到末尾 */
-
         /* 增量检查点: 从 base (ckpt_000000 完整) 应用 1..from_ckpt 差异链,
            合成完整快照到临时文件。仅当检查点 1 是 diff 格式时启用;
            旧版完整格式目录直接以 from 检查点文件为 in。 */
@@ -2283,6 +2282,31 @@ int build_main(int argc, char **argv)
             }
             fclose(mf);
         }
+    }
+    /* 指标伴随行: T_nominal=CLI 窗口, T_ref=build 实际实现的
+       manifest 原始计数窗口, T_ledger=账本 orig 差 (计数器空间,
+       仅健康校验), health_x1000=measured 增量/名义增量 (应≈r,
+        偏离 [0.7,1.4] 表示补偿校准或计数器异常, 指标判 INVALID)。
+       由测试解析, 作为补偿比例的分母与健康信号。 */
+    if (ab.have && ab.n_ck && from_ckpt >= 0 &&
+        (size_t)from_ckpt < ab.n_ck &&
+        to_ckpt >= 0 && (size_t)to_ckpt < ab.n_ck) {
+        uint64_t tn = ckpt_count_to != UINT64_MAX
+                          ? ckpt_count_to - ckpt_count0 : 0;
+        uint64_t tr = ab.ck_count[to_ckpt] -
+                      ab.ck_count[from_ckpt];
+        uint64_t tl = ab.ck_orig[to_ckpt] -
+                      ab.ck_orig[from_ckpt];
+        uint64_t md = ab.ck_measured[to_ckpt] -
+                      ab.ck_measured[from_ckpt];
+        uint64_t health = tr ? (md * 1000) / tr : 0;
+        fprintf(stderr,
+                "metrics: T_nominal=%llu T_ref=%llu T_ledger=%llu "
+                "health_x1000=%llu\n",
+                (unsigned long long)tn,
+                (unsigned long long)tr,
+                (unsigned long long)tl,
+                (unsigned long long)health);
     }
 #endif
     replay_off = 0;

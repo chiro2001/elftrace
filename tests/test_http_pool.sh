@@ -164,5 +164,19 @@ INS=$(grep "instructions" "$TF_TMP/http_pool_slice.perf" \
     | grep -oE "[0-9,]+" | head -1 | tr -d ",")
 echo "  slice instructions: ${INS:-?} (window $((TO - FROM)) + replay 数据应用)"
 
+# 指标: T_ref=build 实际窗口 (manifest 原始计数), R_total=(A-T_ref)/A;
+# health=measured/名义, 偏离 [0.7,1.4] 判 INVALID
+MTR=$(grep -oE "metrics: .*" "$TF_TMP/http_pool_build2.log" | tail -1)
+TREF=$(echo "$MTR" | grep -oE "T_ref=[0-9]+" | cut -d= -f2)
+HEALTH=$(echo "$MTR" | grep -oE "health_x1000=[0-9]+" | cut -d= -f2)
+if [ -n "${TREF:-}" ] && [ "${TREF:-0}" -gt 0 ] && [ -n "${INS:-}" ] \
+    && [ "${INS:-0}" -gt 0 ]; then
+    R1000=$(( (INS - TREF) * 1000 / INS ))
+    HFLAG=""
+    [ -n "${HEALTH:-}" ] && [ "$HEALTH" -ge 700 ] && [ "$HEALTH" -le 1400 ] \
+        || HFLAG=" INVALID(health=$HEALTH)"
+    echo "  metrics: T_ref=$TREF A=$INS R_total=$(awk "BEGIN{printf \"%.1f\", $R1000/10}")%$HFLAG"
+fi
+
 tf_pass "http.server+pool strict 支持层 (rc=0, zero target syscalls, ${INS:-?} insns)"
 tf_finish
