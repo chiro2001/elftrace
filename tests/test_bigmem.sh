@@ -26,7 +26,7 @@ echo "ref rc=$REF_RC $(grep '^DONE' "$TMP/bigmem_ref.out" | head -c 60)..."
 # 2. 冻结: 等待 CKPT 2 出现后冻结 (计算循环中)
 "$PROG" > "$TMP/bigmem_frozen.out" 2>&1 &
 PID=$!
-for i in $(seq 1 300); do
+for i in $(seq 1 1200); do
     grep -q "CKPT 2" "$TMP/bigmem_frozen.out" 2>/dev/null && break
     sleep 0.05
 done
