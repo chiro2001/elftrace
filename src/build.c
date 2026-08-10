@@ -1363,6 +1363,17 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             size_t n_stx = 0;
             uint64_t cas_pcs[512];
             size_t n_cas = 0;
+            /* LL/SC CAS 比较强制通过: ldxr → cmp → b.ne → stlxr。
+               记录 (ldxr 偏移, cmp 偏移, b.ne 偏移, mov 目标 rs)。
+               回放时 [Rn] 是检查点陈旧内存, 真实 ldxr 读到旧值 →
+               cmp 不等 → CAS 失败 → 主循环空转 (同 LSE casl 问题)。
+               patch: ldxr→mov rt,rs (期望值), cmp→nop, b.ne→nop。 */
+            struct {
+                uint64_t ldxr_pc, cmp_pc, ne_pc;
+                unsigned rt, rs;
+                int w32;
+            } cf_pcs[512];
+            size_t n_cf = 0;
             uint8_t *segp = blob->data + payload_off +
                             segs[gi].payload_off;
             for (size_t k = 0; k + 4 <= segs[gi].filesz; k += 4) {
@@ -1392,6 +1403,41 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                         }
                     if (!dup && n_stx < 512)
                         stx_pcs[n_stx++] = pc;
+                    /* 比较序列检测: ldxr 之后、stlxr 之前找
+                       cmp <rt>,<rs> 与 b.ne (64/32 位) */
+                    unsigned rt = 0;
+                    a64_is_excl_load(w, NULL, &rt, NULL, NULL);
+                    int cmp_off = -1;
+                    unsigned cmp_rs = 0;
+                    int w32 = 0;
+                    for (size_t kc = k + 4; kc + 4 <= k2; kc += 4) {
+                        uint32_t wc;
+                        memcpy(&wc, segp + kc, 4);
+                        if ((wc & 0xFFC0FC1FU) == 0xEB00001FU ||
+                            (wc & 0xFFC0FC1FU) == 0x6B00001FU) {
+                            if (((wc >> 5) & 0x1FU) == rt) {
+                                cmp_off = (int)kc;
+                                cmp_rs = (wc >> 16) & 0x1FU;
+                                w32 = (wc & 0x80000000U) == 0;
+                            }
+                        } else if (cmp_off >= 0 &&
+                                   (wc & 0xFF00001FU) == 0x54000001U) {
+                            /* b.ne: 强制落到 stlxr (nop) */
+                            if (n_cf < 512) {
+                                cf_pcs[n_cf].ldxr_pc =
+                                    segs[gi].vaddr + k;
+                                cf_pcs[n_cf].cmp_pc =
+                                    segs[gi].vaddr + (uint64_t)cmp_off;
+                                cf_pcs[n_cf].ne_pc =
+                                    segs[gi].vaddr + kc;
+                                cf_pcs[n_cf].rt = rt;
+                                cf_pcs[n_cf].rs = cmp_rs;
+                                cf_pcs[n_cf].w32 = w32;
+                                n_cf++;
+                            }
+                            break;
+                        }
+                    }
                     break;      /* 每个排他 load 只配对最近的 store */
                 }
             }
@@ -1521,6 +1567,26 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                         (unsigned long long)(taddr + o),
                         (long long)(int64_t)(taddr + o - pc));
                 o += 0x20;
+            }
+            /* LL/SC CAS 比较强制通过 (原地 patch, 不占跳板页) */
+            for (size_t s = 0; s < n_cf; s++) {
+                uint32_t movw = 0xAA0003E0U | (cf_pcs[s].rs << 16) |
+                                cf_pcs[s].rt;
+                if (cf_pcs[s].w32)
+                    movw = 0x2A0003E0U | (cf_pcs[s].rs << 16) |
+                           cf_pcs[s].rt;
+                memcpy(segp + (cf_pcs[s].ldxr_pc - segs[gi].vaddr),
+                       &movw, 4);
+                uint32_t nop = 0xD503201FU;
+                memcpy(segp + (cf_pcs[s].cmp_pc - segs[gi].vaddr),
+                       &nop, 4);
+                memcpy(segp + (cf_pcs[s].ne_pc - segs[gi].vaddr),
+                       &nop, 4);
+                fprintf(stderr,
+                        "atomic: force-pass LL/SC compare "
+                        "%#llx (ldxr->mov x%u,x%u, cmp/b.ne nop)\n",
+                        (unsigned long long)cf_pcs[s].ldxr_pc,
+                        cf_pcs[s].rt, cf_pcs[s].rs);
             }
             for (size_t i = 0; i < npl; i++) {
                 if (pl[i].vaddr == taddr) {

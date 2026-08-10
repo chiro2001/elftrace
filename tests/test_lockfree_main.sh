@@ -97,7 +97,7 @@ def ords(k):
 def states(k):
     bb = open("%s/atomics/ckpt_%06d.bin" % (d, k), "rb").read()
     o = 24
-    return [struct.unpack_from("<QQQ", bb, o + i * 24)[0]
+    return [struct.unpack_from("<QQQ", bb, o + i * 24)
             for i in range(n_sites)]
 man = open(d + "/manifest.txt").read().splitlines()
 cnt = [int(l.split()[0]) for l in man]
