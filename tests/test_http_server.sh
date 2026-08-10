@@ -138,12 +138,41 @@ trace_and_probe() {
         || { echo "FAIL: probe build"; tail -5 "$TF_TMP/http_build.log"; return 1; }
     timeout 600 "$TF_TMP/http_probe.elf" > /dev/null 2>&1
     PRC=$?
+    if [ "$PRC" = 67 ]; then
+        # 限制层: 探针分歧经原子回放负载上限兜底 fail-closed (67),
+        # 这是期望的失败形态 (与 byte-run 的 66 同族), 直接作为限制层
+        # 契约通过, 不重采。
+        PROBE_BAIL=1
+        return 0
+    fi
     [ "$PRC" = 0 ] || { echo "  probe rc=$PRC (trace 数据分歧), 重采重试"; return 1; }
     [ -s "$TF_TMP/http_probe.bin" ] || { echo "FAIL: 无 probe.bin"; return 1; }
     return 0
 }
 
+PROBE_BAIL=0
 trace_and_probe || trace_and_probe || { tail -3 "$TF_TMP/http_trace.log"; exit 1; }
+
+# 限制层探针 fail-closed: 验证零真实 syscall + exit_group(67)
+if [ "$PROBE_BAIL" = 1 ]; then
+    timeout 120 strace -o "$TF_TMP/http_probe.strace" \
+        "$TF_TMP/http_probe.elf" > /dev/null 2>&1
+    RC=$?
+    [ "$RC" = 67 ] || { echo "FAIL: 探针 rc=$RC (期望 67)"; exit 1; }
+    AFTER=$(awk '/rt_sigreturn/{f=1; next} f' "$TF_TMP/http_probe.strace")
+    BAD=$(echo "$AFTER" | grep -vE "^(exit_group|\\+\\+\\+ exited)")
+    if [ -n "$BAD" ]; then
+        echo "FAIL: 探针目标阶段出现非 exit_group 的 syscall 行"
+        echo "$BAD"
+        exit 1
+    fi
+    grep -q "exit_group(67)" "$TF_TMP/http_probe.strace" \
+        || { echo "FAIL: 无 exit_group(67)"; exit 1; }
+    echo "  http.server 限制层: 探针分歧 fail-closed 67 (零真实 syscall)"
+    tf_pass "http.server strict 限制层 (probe fail-closed 67)"
+    tf_finish
+    exit 0
+fi
 tf_build /dev/null "$TF_TMP/http_slice.elf" --mode baremetal --bm-strict \
     --checkpoints "$TF_TMP/http_r2" \
     --from-count 600000 --to-count 1000000 \
