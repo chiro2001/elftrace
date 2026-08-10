@@ -74,6 +74,20 @@
 #define STUB_STRICT_EXIT_OFF (STUB_FIXED_SIZE - 0x100)
 #define STUB_STRICT_BAIL_OFF (STUB_FIXED_SIZE - 0x40)
 
+/* strict 遥测区 (blob 固定偏移, 位于 COUNT 与 EXIT 之间的空闲区):
+ *   退出/兜底时 stub 写入 {magic, reason, site_pc, ordinal, limit,
+ *   caller, spare...}, harness 在 exit-stop 前从 /proc/pid/mem 读。
+ * reason: 0=正常退出 1=ordinal 预算兜底 2=地址失配 3=expected 失配
+ *         4=count 目标退出 5=其他 bail */
+#define STUB_TELEMETRY_OFF    0xFB80
+#define STUB_TELEMETRY_SIZE   0x80
+#define TEL_MAGIC             0x4D4C4554ULL   /* "TELM" */
+#define TEL_REASON_OFF        0x08
+#define TEL_SITE_PC_OFF       0x10
+#define TEL_ORDINAL_OFF       0x18
+#define TEL_LIMIT_OFF         0x20
+#define TEL_CALLER_OFF        0x28
+
 /* ---- rst_desc 字段偏移 (256B, 全 u64) ---- */
 #define RST_DESC_MAGIC      0x00
 #define RST_DESC_VERSION    0x08

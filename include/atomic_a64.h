@@ -111,7 +111,8 @@ size_t a64_cas_replay_block(uint8_t *out, uint64_t block_abs,
                             uint64_t runs_abs, uint64_t n_runs,
                             unsigned rs, unsigned rt, unsigned rn,
                             uint64_t ret_addr,
-                            uint64_t load_limit, uint64_t exit_abs);
+                            uint64_t load_limit, uint64_t exit_abs,
+                            uint64_t tel_abs);
 
 /* ---- 回放跳板块 ----
  * 入口: stp x16,x17; nop; ldr x16,[pc,#8]; br x16; .quad block_abs。
@@ -126,6 +127,7 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                int is64, unsigned rt, unsigned rn,
                                uint64_t ret_addr,
                                uint64_t load_limit, uint64_t exit_abs,
+                               uint64_t tel_abs,
                                int kind,
                                const struct a64_ld_addr *ad);
 
@@ -138,6 +140,7 @@ size_t a64_atomic_replay_block_fast(uint8_t *out, uint64_t block_abs,
                                     const struct a64_ld_addr *ad,
                                     uint64_t ret_addr,
                                     uint64_t load_limit, uint64_t exit_abs,
+                                    uint64_t tel_abs,
                                     int kind, uint64_t value, uint64_t addr);
 
 /* 通用 load 检测: ldar 族 (kind=0), ldaxr 族 (kind=1),

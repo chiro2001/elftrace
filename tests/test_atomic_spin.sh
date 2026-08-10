@@ -31,6 +31,7 @@ ELFTRACE="$TF_ELFTRACE"
 echo "== [atomic] SPSC spin strict slice (two-run compensation) =="
 gcc -O2 -g -pthread -o "$TF_TMP/prog_spsc_spin" tests/prog_spsc_spin.c \
     || exit 1
+gcc -O2 -o "$TF_TMP/tel_run" tests/tel_run.c 2>/dev/null || true
 
 # ---------- Run 1: 校准 ----------
 rm -rf "$TF_TMP/spsc_r1" "$TF_TMP/spsc_r2"
@@ -170,7 +171,12 @@ while read -r FROM_C TO_C; do
         timeout 120 perf stat -e instructions "$TF_TMP/spsc_slice.elf" \
             > /dev/null 2> "$TF_TMP/spsc.perf"
         RC=$?
-        [ "$RC" = 0 ] || { echo "FAIL: slice rc=$RC (deadlock?)"; exit 1; }
+        if [ "$RC" != 0 ]; then
+            echo "FAIL: slice rc=$RC (deadlock?)"
+            [ -x "$TF_TMP/tel_run" ] && \
+                "$TF_TMP/tel_run" "$TF_TMP/spsc_slice.elf"
+            exit 1
+        fi
         A=$(grep "instructions" "$TF_TMP/spsc.perf" \
             | grep -oE "[0-9,]+" | head -1 | tr -d ",")
         echo "atomic: iter $iter K=$K A=$A T=$T"

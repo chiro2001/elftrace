@@ -883,6 +883,15 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
     uint64_t loop_abs = base + STUB_STRICT_LOOP_OFF;
     uint64_t count_abs = base + STUB_STRICT_COUNT_OFF;
     uint64_t rabs = base + replay_off;
+    /* 遥测块: 站点块之前预留 0x80, 回放跳板兜底退出时写
+       {magic, reason, site_pc, ordinal, limit, caller} */
+    if (blob->size & 7)
+        buf_zero(blob, 8 - (blob->size & 7));
+    uint64_t tel_abs = base + blob->size;
+    /* 把 tel_abs 存到 desc 0xF8 (普通构建未用该槽; probe 构建后续
+       覆盖为 probe 路径, harness 只在普通切片上读遥测) */
+    memcpy(blob->data + RST_DESC_PROBE_PATH_ABS, &tel_abs, 8);
+    buf_zero(blob, STUB_TELEMETRY_SIZE);
 
     /* 1. syscall 站点: 来自回放记录 (权威); 无记录时扫描 mock */
     for (size_t k = 0; k < nrecs; k++) {
@@ -1666,7 +1675,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                         crs, crt, crn, st->pc + 4,
                         ab->sites[st->ab_id].to_ord -
                             ab->sites[st->ab_id].from_ord,
-                        base + STUB_STRICT_BAIL_OFF);
+                        base + STUB_STRICT_BAIL_OFF, tel_abs);
                         fprintf(stderr,
                                 "atomic: CAS outcome replay site %#llx "
                                 "runs=%zu\n",
@@ -1694,9 +1703,9 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                             st->pc + 4,
                             ab->sites[st->ab_id].to_ord -
                                 ab->sites[st->ab_id].from_ord,
-                            base + STUB_STRICT_BAIL_OFF, kind,
-                            ab->runs[ab->run_off[st->ab_id]].value,
-                            ab->runs[ab->run_off[st->ab_id]].addr);
+                        base + STUB_STRICT_BAIL_OFF, tel_abs, kind,
+                        ab->runs[ab->run_off[st->ab_id]].value,
+                        ab->runs[ab->run_off[st->ab_id]].addr);
                     } else {
                         bl = a64_atomic_replay_block(
                             page + o, taddr + o, runs_abs,
@@ -1706,7 +1715,8 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                             size, rt, rn, st->pc + 4,
                             ab->sites[st->ab_id].to_ord -
                                 ab->sites[st->ab_id].from_ord,
-                            base + STUB_STRICT_BAIL_OFF, kind, adp);
+                            base + STUB_STRICT_BAIL_OFF, tel_abs,
+                            kind, adp);
                     }
                 }
                 if (!bl)

@@ -83,6 +83,10 @@ static uint32_t movz_x(unsigned rd, unsigned imm16, unsigned hw)
 {
     return 0xD2800000U | ((hw & 3) << 21) | ((imm16 & 0xffff) << 5) | rd;
 }
+static uint32_t movk_x(unsigned rd, unsigned imm16, unsigned hw)
+{
+    return 0xF2800000U | ((hw & 3) << 21) | ((imm16 & 0xffff) << 5) | rd;
+}
 static uint32_t ldr_lit(unsigned rt, int32_t off)
 {
     return 0x58000000U | (((uint32_t)(off / 4) & 0x7FFFF) << 5) | rt;
@@ -1038,12 +1042,41 @@ size_t a64_cas_record_block(uint8_t *out, uint64_t block_abs,
 #define CASREP_NRUNS_OFF    0x218
 #define CASREP_LOAD_LIMIT_OFF 0x220
 #define CASREP_EXIT_ABS_OFF 0x228
+#define CASREP_SITE_PC_OFF 0x238
+
+/* 遥测写入 (limit_exit 路径): 进入时 x16=块基址, 退出后 x16=exit_abs。
+ * 破坏 x14/x15。site_pc 从块数据 site_pc_off 读。 */
+static void emit_replay_tel(uint8_t **pp, uint64_t tel_abs,
+                            unsigned site_pc_off)
+{
+    uint8_t *p = *pp;
+    put32(&p, mov_x(15, 16));               /* x15 = block base */
+    uint64_t t = tel_abs;
+    put32(&p, movz_x(16, (uint32_t)t & 0xffff, 0));
+    put32(&p, movk_x(16, ((uint32_t)t >> 16) & 0xffff, 1));
+    put32(&p, movk_x(16, ((uint32_t)t >> 32) & 0xffff, 2));
+    put32(&p, movk_x(16, ((uint32_t)t >> 48) & 0xffff, 3));
+    put32(&p, movz_x(14, 0x4554, 0));       /* "TELM" LE */
+    put32(&p, movk_x(14, 0x4D4C, 1));
+    put32(&p, str_x_imm(16, 14, 0));        /* magic */
+    put32(&p, movz_x(14, 1, 0));            /* reason=1: replay bail */
+    put32(&p, str_x_imm(16, 14, 8));
+    put32(&p, ldr_x_imm(15, 14, site_pc_off));
+    put32(&p, str_x_imm(16, 14, 16));       /* site_pc */
+    put32(&p, str_x_imm(16, 19, 24));       /* ordinal */
+    put32(&p, str_x_imm(16, 17, 32));       /* limit */
+    put32(&p, str_x_imm(16, 30, 40));       /* caller */
+    put32(&p, ldr_x_imm(15, 16, 0x228));    /* exit_abs */
+    put32(&p, INSN_BR_X16);
+    *pp = p;
+}
 
 size_t a64_cas_replay_block(uint8_t *out, uint64_t block_abs,
                             uint64_t runs_abs, uint64_t n_runs,
                             unsigned rs, unsigned rt, unsigned rn,
                             uint64_t ret_addr,
-                            uint64_t load_limit, uint64_t exit_abs)
+                            uint64_t load_limit, uint64_t exit_abs,
+                            uint64_t tel_abs)
 {
     if (rs == 31 || rt == 31 || rn == 31)
         return 0;
@@ -1125,8 +1158,12 @@ size_t a64_cas_replay_block(uint8_t *out, uint64_t block_abs,
 
         /* limit_exit: 兜底退出 (预算耗尽或校验失败) */
         uint8_t *limit_exit = p;
-        put32(&p, ldr_x16_imm(16, CASREP_EXIT_ABS_OFF));
-        put32(&p, INSN_BR_X16);
+        if (tel_abs) {
+            emit_replay_tel(&p, tel_abs, CASREP_SITE_PC_OFF);
+        } else {
+            put32(&p, ldr_x16_imm(16, CASREP_EXIT_ABS_OFF));
+            put32(&p, INSN_BR_X16);
+        }
 
         int32_t d1 = (int32_t)(have - hs_b);
         int32_t d2 = (int32_t)(have - hi_b);
@@ -1147,6 +1184,7 @@ size_t a64_cas_replay_block(uint8_t *out, uint64_t block_abs,
     v = n_runs;             memcpy(out + CASREP_NRUNS_OFF, &v, 8);
     v = load_limit;         memcpy(out + CASREP_LOAD_LIMIT_OFF, &v, 8);
     v = exit_abs;           memcpy(out + CASREP_EXIT_ABS_OFF, &v, 8);
+    v = ret_addr - 4;       memcpy(out + CASREP_SITE_PC_OFF, &v, 8);
 
     return A64_ATOM_BLOCK_SIZE;
 }
@@ -1159,12 +1197,14 @@ size_t a64_cas_replay_block(uint8_t *out, uint64_t block_abs,
 #define REP_LOAD_LIMIT_OFF 0x220
 #define REP_EXIT_ABS_OFF 0x228
 #define REP_MISS_OFF 0x230      /* 普通 load: 回退真实读计数 (诊断) */
+#define REP_SITE_PC_OFF 0x238   /* 站点 pc (遥测) */
 
 size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                uint64_t runs_abs, uint64_t n_runs,
                                int size, unsigned rt, unsigned rn,
                                uint64_t ret_addr,
                                uint64_t load_limit, uint64_t exit_abs,
+                               uint64_t tel_abs,
                                int kind,
                                const struct a64_ld_addr *ad)
 {
@@ -1305,8 +1345,12 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     uint8_t *limit_exit = NULL;
     if (exit_abs) {
         limit_exit = p;
-        put32(&p, ldr_x16_imm(16, REP_EXIT_ABS_OFF));
-        put32(&p, INSN_BR_X16);
+        if (tel_abs) {
+            emit_replay_tel(&p, tel_abs, REP_SITE_PC_OFF);
+        } else {
+            put32(&p, ldr_x16_imm(16, REP_EXIT_ABS_OFF));
+            put32(&p, INSN_BR_X16);
+        }
     }
 
     /* 回填 */
@@ -1338,6 +1382,7 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
         v = load_limit;         memcpy(out + REP_LOAD_LIMIT_OFF, &v, 8);
         v = exit_abs;           memcpy(out + REP_EXIT_ABS_OFF, &v, 8);
         v = 0;                  memcpy(out + REP_MISS_OFF, &v, 8);
+        v = ret_addr - 4;       memcpy(out + REP_SITE_PC_OFF, &v, 8);
     }
 
     return A64_ATOM_BLOCK_SIZE;
@@ -1350,12 +1395,14 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
 #define FAST_VALUE_OFF  0x218
 #define FAST_ADDR_OFF   0x220
 #define FAST_MISS_OFF   0x228
+#define FAST_SITE_PC_OFF 0x238
 
 size_t a64_atomic_replay_block_fast(uint8_t *out, uint64_t block_abs,
                                     int size, unsigned rt, unsigned rn,
                                     const struct a64_ld_addr *ad,
                                     uint64_t ret_addr,
                                     uint64_t load_limit, uint64_t exit_abs,
+                                    uint64_t tel_abs,
                                     int kind, uint64_t value, uint64_t addr)
 {
     if (rt == 31)
@@ -1439,8 +1486,12 @@ size_t a64_atomic_replay_block_fast(uint8_t *out, uint64_t block_abs,
     uint8_t *limit_exit = NULL;
     if (exit_abs && load_limit) {
         limit_exit = p;
-        put32(&p, ldr_x16_imm(16, FAST_EXIT_OFF));
-        put32(&p, INSN_BR_X16);
+        if (tel_abs) {
+            emit_replay_tel(&p, tel_abs, FAST_SITE_PC_OFF);
+        } else {
+            put32(&p, ldr_x16_imm(16, FAST_EXIT_OFF));
+            put32(&p, INSN_BR_X16);
+        }
     }
 
     /* 回填 */
@@ -1464,6 +1515,7 @@ size_t a64_atomic_replay_block_fast(uint8_t *out, uint64_t block_abs,
         v = value;          memcpy(out + FAST_VALUE_OFF, &v, 8);
         v = addr;           memcpy(out + FAST_ADDR_OFF, &v, 8);
         v = 0;              memcpy(out + FAST_MISS_OFF, &v, 8);
+        v = ret_addr - 4;   memcpy(out + FAST_SITE_PC_OFF, &v, 8);
     }
     return A64_ATOM_BLOCK_SIZE;
 }
