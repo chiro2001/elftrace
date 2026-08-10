@@ -747,6 +747,8 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                                 uint64_t stack_reserve,
                                 uint64_t replay_off,
                                 uint64_t heap_end,
+                                const uint64_t *skip_pcs, size_t n_skip_pcs,
+                                int atomic_no_value_replay,
                                 struct strict_pload **pl_out,
                                 size_t *npl_out, uint64_t *replay_abs)
 {
@@ -1027,6 +1029,27 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             }
             /* 还原原始 ldar (记录跳板分支 → 原指令) */
             memcpy(q, &ab->sites[i].orig_insn, 4);
+            int skipme = 0;
+            for (size_t sk = 0; sk < n_skip_pcs; sk++)
+                if (ab->sites[i].pc == skip_pcs[sk]) {
+                    skipme = 1;
+                    break;
+                }
+            if (!skipme && atomic_no_value_replay &&
+                (ab->sites[i].kind == 2 || ab->sites[i].kind == 3)) {
+                skipme = 1;
+                fprintf(stderr,
+                        "atomic: skip value-replay site %#llx "
+                        "(--atomic-no-value-replay)\n",
+                        (unsigned long long)ab->sites[i].pc);
+            }
+            if (skipme) {
+                fprintf(stderr,
+                        "atomic: skip replay site %#llx "
+                        "(--atomic-skip-pc)\n",
+                        (unsigned long long)ab->sites[i].pc);
+                continue;
+            }
             if (!ab->run_cnt[i] && !ab->synth_only[i])
                 continue;
             if (exit_override == ab->sites[i].pc) {
@@ -1359,15 +1382,28 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                                &size, &rt, &rn, &kind))
                     die("atomic: bad orig insn at %#llx",
                         (unsigned long long)st->pc);
-                size_t bl = a64_atomic_replay_block(
-                    page + o, taddr + o, runs_abs,
-                    ab->run_cnt[st->ab_id] +
-                        (ab->run_cnt[st->ab_id] ||
-                         ab->synth_only[st->ab_id] ? 1 : 0),
-                    size, rt, rn, st->pc + 4,
-                    ab->sites[st->ab_id].to_ord -
-                        ab->sites[st->ab_id].from_ord,
-                    base + STUB_STRICT_EXIT_OFF, kind, adp);
+                size_t bl;
+                if (ab->run_cnt[st->ab_id] == 0) {
+                    /* 单段常量站点: 快速回放块 (值内嵌, 无游标/查表) */
+                    bl = a64_atomic_replay_block_fast(
+                        page + o, taddr + o, size, rt, rn, adp,
+                        st->pc + 4,
+                        ab->sites[st->ab_id].to_ord -
+                            ab->sites[st->ab_id].from_ord,
+                        base + STUB_STRICT_EXIT_OFF, kind,
+                        ab->runs[ab->run_off[st->ab_id]].value,
+                        ab->runs[ab->run_off[st->ab_id]].addr);
+                } else {
+                    bl = a64_atomic_replay_block(
+                        page + o, taddr + o, runs_abs,
+                        ab->run_cnt[st->ab_id] +
+                            (ab->run_cnt[st->ab_id] ||
+                             ab->synth_only[st->ab_id] ? 1 : 0),
+                        size, rt, rn, st->pc + 4,
+                        ab->sites[st->ab_id].to_ord -
+                            ab->sites[st->ab_id].from_ord,
+                        base + STUB_STRICT_EXIT_OFF, kind, adp);
+                }
                 if (!bl)
                     die("atomic: cannot generate replay block at %#llx",
                         (unsigned long long)st->pc);
@@ -1808,6 +1844,13 @@ int build_main(int argc, char **argv)
     uint64_t newseg_big_skip = 0;       /* --newseg-big-skip: 跳过 >=N
                                            字节的 newseg 回放 (worker
                                            线程栈等主线程不读的段) */
+    uint64_t skip_pcs[256];             /* --atomic-skip-pc: 不生成回放
+                                           的原子/值回放站点 (最小集合
+                                           实验/诊断用) */
+    size_t n_skip_pcs = 0;
+    int atomic_no_value_replay = 0;     /* --atomic-no-value-replay:
+                                           跳过全部普通 load 值回放
+                                           (kind 2/3), 保留 ldar/ldaxr */
     const char *census_pages_path = NULL; /* --census-pages: 输出脏页表 */
     const char *read_set_path = NULL;     /* --read-set: 只回放被读页 */
     uint64_t replay_fmt = 0;            /* 0=整页, 1=字节 run (表内 u64) */
@@ -1856,6 +1899,11 @@ int build_main(int argc, char **argv)
         } else if (strcmp(argv[i], "--newseg-big-skip") == 0 &&
                    i + 1 < argc) {
             newseg_big_skip = strtoull(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--atomic-skip-pc") == 0 &&
+                   i + 1 < argc && n_skip_pcs < 256) {
+            skip_pcs[n_skip_pcs++] = strtoull(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--atomic-no-value-replay") == 0) {
+            atomic_no_value_replay = 1;
         } else if (strcmp(argv[i], "--census-pages") == 0 &&
                    i + 1 < argc) {
             census_pages_path = argv[++i];
@@ -3062,6 +3110,65 @@ int build_main(int argc, char **argv)
                 "(%llu bytes)\n",
                 (unsigned long long)nrecs,
                 (unsigned long long)replay_size);
+        /* 成本账本 (指标拆层): engine_est=引擎 (comp_engine 入口 +
+           扫描 + 原子/值回放跳板 + stub 启动), data_est=数据应用
+           (dirty granule/newseg 拷贝)。常数为 aarch64 指令数近似,
+           绑定 stub 版本; 测试用 A/T_ref 合并成
+           R_engine/R_data/R_div (残差)。 */
+        uint64_t atomic_hits = 0;
+#if defined(__aarch64__)
+        if (ab.have && ab.n_sites) {
+            for (size_t si = 0; si < ab.n_sites; si++)
+                if (ab.sites[si].to_ord > ab.sites[si].from_ord)
+                    atomic_hits += ab.sites[si].to_ord -
+                                   ab.sites[si].from_ord;
+        }
+#endif
+        uint64_t data_insns = 0, granules_total = 0;
+        for (size_t i = 0; i < nrecs; i++) {
+            if (replay_fmt) {
+                const uint8_t *p = recs[i].dirty_run.data;
+                size_t left = recs[i].dirty_run.size;
+                uint64_t nent = recs[i].n_dirty_run;
+                for (uint64_t e = 0; e < nent && left >= 24; e++) {
+                    uint32_t ng, mode, size;
+                    memcpy(&ng, p + 8, 4);
+                    memcpy(&mode, p + 12, 4);
+                    memcpy(&size, p + 16, 4);
+                    data_insns += 12;
+                    if (mode == 1) {
+                        data_insns += (uint64_t)ng * 16;
+                        granules_total += ng;
+                        p += 24 + (size_t)ng * 36;
+                    } else {
+                        data_insns += (uint64_t)size / 32 * 6;
+                        p += 24 + size;
+                    }
+                    left = recs[i].dirty_run.size -
+                           (size_t)(p - recs[i].dirty_run.data);
+                }
+            } else {
+                data_insns += recs[i].n_dirty *
+                              ((4096 / 32) * 6 + 12);
+                granules_total += recs[i].n_dirty;
+            }
+            data_insns += (uint64_t)(replay_fmt
+                                         ? recs[i].newseg_run.size
+                                         : recs[i].newseg.size) / 32 * 6;
+        }
+        uint64_t comp_hits = nrecs;
+        uint64_t scan_steps = nrecs ? (uint64_t)nrecs * (nrecs + 1) / 2
+                                    : 0;
+        uint64_t engine_insns = comp_hits * 95 + scan_steps * 7 +
+                                atomic_hits * 50 + 1500;
+        fprintf(stderr,
+                "costs: engine_est=%llu data_est=%llu "
+                "comp_hits=%llu atomic_hits=%llu granules=%llu\n",
+                (unsigned long long)engine_insns,
+                (unsigned long long)data_insns,
+                (unsigned long long)comp_hits,
+                (unsigned long long)atomic_hits,
+                (unsigned long long)granules_total);
         free(rec_off);
         free(unmap_off);
         free(newseg_off);
@@ -3092,6 +3199,8 @@ int build_main(int argc, char **argv)
                                  syscall_dense,
                                  stack_reserve, replay_off,
                                  heap_end,
+                                 skip_pcs, n_skip_pcs,
+                                 atomic_no_value_replay,
                                  &sploads, &n_sploads,
                                  &strict_replay_abs) != 0)
             die("strict baremetal build failed");

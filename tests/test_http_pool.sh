@@ -126,22 +126,40 @@ TOT=$(awk 'END{print $1}' "$TF_TMP/http_pool_r2/manifest.txt")
 FROM=$((TOT * 2 / 5))
 TO=$((TOT * 3 / 5))
 [ "$TO" -gt "$FROM" ] || { echo "FAIL: 窗口过窄"; exit 1; }
+# 预创建线程窗口: 先尝试无值回放路径 (边界 diff 已足够, 探针验证),
+# 探针失败再回退到完整值回放 — 无值回放可省 ~75K 引擎指令
+NVR=()
 tf_build /dev/null "$TF_TMP/http_pool_probe.elf" --mode baremetal --bm-strict \
     --checkpoints "$TF_TMP/http_pool_r2" \
     --from-count "$FROM" --to-count "$TO" \
-    --stack-reserve 67108864 \
-    --probe-dump "$TF_TMP/http_pool_probe.bin" > "$TF_TMP/http_pool_build.log" 2>&1 \
-    || { echo "FAIL: probe build"; tail -5 "$TF_TMP/http_pool_build.log"; exit 1; }
-timeout 600 "$TF_TMP/http_pool_probe.elf" > /dev/null 2>&1
-PRC=$?
-[ "$PRC" = 0 ] || { echo "FAIL: probe slice rc=$PRC"; exit 1; }
-[ -s "$TF_TMP/http_pool_probe.bin" ] || { echo "FAIL: 无 probe.bin"; exit 1; }
+    --stack-reserve 67108864 --atomic-no-value-replay \
+    --probe-dump "$TF_TMP/http_pool_probe.bin" > "$TF_TMP/http_pool_build.log" 2>&1
+if [ $? = 0 ]; then
+    timeout 600 "$TF_TMP/http_pool_probe.elf" > /dev/null 2>&1
+    PRC=$?
+    if [ "$PRC" = 0 ] && [ -s "$TF_TMP/http_pool_probe.bin" ]; then
+        NVR=(--atomic-no-value-replay)
+        echo "  http_pool: 无值回放探针通过 (边界 diff 足够)"
+    fi
+fi
+if [ "${#NVR[@]}" = 0 ]; then
+    tf_build /dev/null "$TF_TMP/http_pool_probe.elf" --mode baremetal --bm-strict \
+        --checkpoints "$TF_TMP/http_pool_r2" \
+        --from-count "$FROM" --to-count "$TO" \
+        --stack-reserve 67108864 \
+        --probe-dump "$TF_TMP/http_pool_probe.bin" > "$TF_TMP/http_pool_build.log" 2>&1 \
+        || { echo "FAIL: probe build"; tail -5 "$TF_TMP/http_pool_build.log"; exit 1; }
+    timeout 600 "$TF_TMP/http_pool_probe.elf" > /dev/null 2>&1
+    PRC=$?
+    [ "$PRC" = 0 ] || { echo "FAIL: probe slice rc=$PRC"; exit 1; }
+    [ -s "$TF_TMP/http_pool_probe.bin" ] || { echo "FAIL: 无 probe.bin"; exit 1; }
+fi
 tf_build /dev/null "$TF_TMP/http_pool_slice.elf" --mode baremetal --bm-strict \
     --checkpoints "$TF_TMP/http_pool_r2" \
     --from-count "$FROM" --to-count "$TO" \
     --stack-reserve 67108864 \
     --byte-runs "$TF_TMP/http_pool_probe.bin" \
-    --newseg-big-skip 1048576 > "$TF_TMP/http_pool_build2.log" 2>&1 \
+    --newseg-big-skip 1048576 "${NVR[@]}" > "$TF_TMP/http_pool_build2.log" 2>&1 \
     || { echo "FAIL: byte-run build"; tail -5 "$TF_TMP/http_pool_build2.log"; exit 1; }
 
 timeout 120 strace -o "$TF_TMP/http_pool_slice.strace" \

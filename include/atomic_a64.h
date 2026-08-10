@@ -102,6 +102,17 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                int kind,
                                const struct a64_ld_addr *ad);
 
+/* 单段常量站点的快速回放块: 窗口内值不变 (run_cnt==0, 仅合成首段)。
+ * 不做游标推进/运行段查找/start 比较, 值直接内嵌; 保留命中计数+
+ * 负载上限退出、地址校验 (失配回退真实读 + miss 计数) 与 ldar/ldaxr
+ * 真实屏障 (排他监视器)。路径指令数约为通用块的 55-65%。 */
+size_t a64_atomic_replay_block_fast(uint8_t *out, uint64_t block_abs,
+                                    int size, unsigned rt, unsigned rn,
+                                    const struct a64_ld_addr *ad,
+                                    uint64_t ret_addr,
+                                    uint64_t load_limit, uint64_t exit_abs,
+                                    int kind, uint64_t value, uint64_t addr);
+
 /* 通用 load 检测: ldar 族 (kind=0), ldaxr 族 (kind=1),
  * 普通 ldr w/x 立即数 (kind=2), 普通 ldr w/x 寄存器偏移 (kind=3) */
 int a64_is_load_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
