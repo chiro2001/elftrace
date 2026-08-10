@@ -222,6 +222,13 @@ while read -r FROM_C TO_C; do
         timeout 120 perf stat -e instructions "$TF_TMP/lf_slice.elf" \
             > /dev/null 2> "$TF_TMP/lf.perf"
         RC=$?
+        if [ "$RC" = 67 ]; then
+            echo "atomic: window ends in spin (rc=67), try next candidate"
+            [ -x "$TF_TMP/tel_run" ] && \
+                "$TF_TMP/tel_run" "$TF_TMP/lf_slice.elf"
+            A0=0
+            break
+        fi
         if [ "$RC" != 0 ]; then
             echo "FAIL: slice rc=$RC (deadlock?)"
             [ -x "$TF_TMP/tel_run" ] && \
