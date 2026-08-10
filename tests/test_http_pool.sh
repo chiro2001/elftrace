@@ -202,7 +202,7 @@ if [ -n "${TREF:-}" ] && [ "${TREF:-0}" -gt 0 ] && [ -n "${INS:-}" ] \
     fi
     echo "  metrics: T_ref=$TREF A=$INS R_total=$(awk "BEGIN{printf \"%.1f\", $R1000/10}")%$HFLAG"
     # 支持层契约: 总补偿 <15% (用户目标); 健康异常判无效
-    if [ "$R1000" -gt 1500 ]; then
+    if [ "$R1000" -gt 150 ]; then
         echo "FAIL: 支持层 R_total=$(awk "BEGIN{printf \"%.1f\", $R1000/10}")% > 15%"
         exit 1
     fi
