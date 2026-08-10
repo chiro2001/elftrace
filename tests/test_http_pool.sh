@@ -190,10 +190,23 @@ HEALTH=$(echo "$MTR" | grep -oE "health_x1000=[0-9]+" | cut -d= -f2)
 if [ -n "${TREF:-}" ] && [ "${TREF:-0}" -gt 0 ] && [ -n "${INS:-}" ] \
     && [ "${INS:-0}" -gt 0 ]; then
     R1000=$(( (INS - TREF) * 1000 / INS ))
+    if [ "$R1000" -lt 0 ]; then
+        echo "FAIL: 提前退出 (A=$INS < T_ref=$TREF), 无效测量"
+        exit 1
+    fi
     HFLAG=""
-    [ -n "${HEALTH:-}" ] && [ "$HEALTH" -ge 700 ] && [ "$HEALTH" -le 1400 ] \
-        || HFLAG=" INVALID(health=$HEALTH)"
+    if [ -n "${HEALTH:-}" ] && [ "$HEALTH" -ge 700 ] && [ "$HEALTH" -le 1400 ]; then
+        :
+    else
+        HFLAG=" INVALID(health=$HEALTH)"
+    fi
     echo "  metrics: T_ref=$TREF A=$INS R_total=$(awk "BEGIN{printf \"%.1f\", $R1000/10}")%$HFLAG"
+    # 支持层契约: 总补偿 <15% (用户目标); 健康异常判无效
+    if [ "$R1000" -gt 15000 ]; then
+        echo "FAIL: 支持层 R_total=$(awk "BEGIN{printf \"%.1f\", $R1000/10}")% > 15%"
+        exit 1
+    fi
+    [ -z "$HFLAG" ] || { echo "FAIL: 指标健康异常 (perf 基线/补偿校准)"; exit 1; }
 fi
 
 tf_pass "http.server+pool strict 支持层 (rc=0, zero target syscalls, ${INS:-?} insns)"
