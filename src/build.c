@@ -1666,39 +1666,41 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                             "runs=%zu\n",
                             (unsigned long long)st->pc,
                             ab->cas_run_cnt[st->ab_id]);
-                } else if (ab->sites[st->ab_id].kind == 2 ||
-                    ab->sites[st->ab_id].kind == 3) {
+                } else {
+                    if (ab->sites[st->ab_id].kind == 2 ||
+                        ab->sites[st->ab_id].kind == 3) {
                     if (!a64_is_plain_load(
                             ab->sites[st->ab_id].orig_insn,
                             &size, &rt, &rn, &kind, &ad))
                         die("atomic: bad plain load at %#llx",
                             (unsigned long long)st->pc);
                     adp = &ad;
-                } else if (!a64_is_load_any(
-                               ab->sites[st->ab_id].orig_insn,
-                               &size, &rt, &rn, &kind))
-                    die("atomic: bad orig insn at %#llx",
-                        (unsigned long long)st->pc);
-                else if (ab->run_cnt[st->ab_id] == 0) {
-                    /* 单段常量站点: 快速回放块 (值内嵌, 无游标/查表) */
-                    bl = a64_atomic_replay_block_fast(
-                        page + o, taddr + o, size, rt, rn, adp,
-                        st->pc + 4,
-                        ab->sites[st->ab_id].to_ord -
-                            ab->sites[st->ab_id].from_ord,
-                        base + STUB_STRICT_BAIL_OFF, kind,
-                        ab->runs[ab->run_off[st->ab_id]].value,
-                        ab->runs[ab->run_off[st->ab_id]].addr);
-                } else {
-                    bl = a64_atomic_replay_block(
-                        page + o, taddr + o, runs_abs,
-                        ab->run_cnt[st->ab_id] +
-                            (ab->run_cnt[st->ab_id] ||
-                             ab->synth_only[st->ab_id] ? 1 : 0),
-                        size, rt, rn, st->pc + 4,
-                        ab->sites[st->ab_id].to_ord -
-                            ab->sites[st->ab_id].from_ord,
-                        base + STUB_STRICT_BAIL_OFF, kind, adp);
+                    } else if (!a64_is_load_any(
+                                   ab->sites[st->ab_id].orig_insn,
+                                   &size, &rt, &rn, &kind))
+                        die("atomic: bad orig insn at %#llx",
+                            (unsigned long long)st->pc);
+                    if (ab->run_cnt[st->ab_id] == 0) {
+                        /* 单段常量站点: 快速回放块 (值内嵌) */
+                        bl = a64_atomic_replay_block_fast(
+                            page + o, taddr + o, size, rt, rn, adp,
+                            st->pc + 4,
+                            ab->sites[st->ab_id].to_ord -
+                                ab->sites[st->ab_id].from_ord,
+                            base + STUB_STRICT_BAIL_OFF, kind,
+                            ab->runs[ab->run_off[st->ab_id]].value,
+                            ab->runs[ab->run_off[st->ab_id]].addr);
+                    } else {
+                        bl = a64_atomic_replay_block(
+                            page + o, taddr + o, runs_abs,
+                            ab->run_cnt[st->ab_id] +
+                                (ab->run_cnt[st->ab_id] ||
+                                 ab->synth_only[st->ab_id] ? 1 : 0),
+                            size, rt, rn, st->pc + 4,
+                            ab->sites[st->ab_id].to_ord -
+                                ab->sites[st->ab_id].from_ord,
+                            base + STUB_STRICT_BAIL_OFF, kind, adp);
+                    }
                 }
                 if (!bl)
                     die("atomic: cannot generate replay block at %#llx",
