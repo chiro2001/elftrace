@@ -424,6 +424,20 @@ int a64_is_excl_load(uint32_t w, int *size, unsigned *rt,
     return 1;
 }
 
+int a64_is_lse_cas(uint32_t w, unsigned *rs, unsigned *rt,
+                   unsigned *rn)
+{
+    if ((w & 0x3FE07C00U) != 0x08A07C00U)
+        return 0;
+    if (rs)
+        *rs = (w >> 16) & 0x1FU;
+    if (rt)
+        *rt = w & 0x1FU;
+    if (rn)
+        *rn = (w >> 5) & 0x1FU;
+    return 1;
+}
+
 uint32_t a64_excl_store_to_str(int size, unsigned rn, unsigned rt)
 {
     static const uint32_t bases[4] = {
@@ -451,6 +465,29 @@ size_t a64_excl_store_trampoline(uint8_t *out, uint64_t block_abs,
     put32(&p, 0xA8C147F0U);            /* ldp x16,x17,[sp],#16 */
     uint64_t b_off = (uint64_t)(p - out);
     put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
+    return 0x20;
+}
+
+/* LSE CAS 强制成功跳板: 无条件 str <Rt>,[<Rn>], Rs 保持期望值不动
+ * (CAS 成功时 Rs 返回旧值 == 期望值, 调用方看到"成功")。 */
+size_t a64_lse_cas_trampoline(uint8_t *out, uint64_t block_abs,
+                              uint32_t insn, uint64_t ret_addr)
+{
+    unsigned rs, rt, rn;
+    if (!a64_is_lse_cas(insn, &rs, &rt, &rn))
+        return 0;
+    int size = (int)((insn >> 30) & 3U);
+    uint32_t str_insn = a64_excl_store_to_str(size, rn, rt);
+    memset(out, 0, 0x20);
+    uint8_t *p = out;
+    /* 与 stlxr 强制成功跳板同构: 无条件 str + 保持 Rs (期望值)。
+       ret_addr 与跳板同段 (±128MB), 直接用 b, 无需字面量。 */
+    put32(&p, 0xA9BF47F0U);         /* stp x16,x17,[sp,#-16]! */
+    put32(&p, str_insn);            /* str <Rt>,[<Rn>] */
+    put32(&p, 0xA8C147F0U);         /* ldp x16,x17,[sp],#16 */
+    uint64_t b_off = (uint64_t)(p - out);
+    put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
+    (void)rs;
     return 0x20;
 }
 

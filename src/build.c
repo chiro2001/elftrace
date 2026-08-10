@@ -1290,6 +1290,13 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             die("strict: cannot place trampoline page near %#llx "
                 "(code too dense / >128MB away)",
                 (unsigned long long)segs[gi].vaddr);
+        fprintf(stderr,
+                "strict: tramp[svc] seg=%#llx cnt=%zu need=%#llx "
+                "at=%#llx dist=%+lld\n",
+                (unsigned long long)segs[gi].vaddr, cnt,
+                (unsigned long long)need,
+                (unsigned long long)taddr,
+                (long long)(int64_t)(taddr - segs[gi].vaddr));
         spload_add(&pl, &npl, &pl_cap, taddr, need, PF_R | PF_W | PF_X);
         uint8_t *page = xcalloc(1, need);
         size_t o = 0;
@@ -1354,11 +1361,18 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                (任何 store 清监视器 → stlxr 永远失败 → LL/SC 死锁)。 */
             uint64_t stx_pcs[512];
             size_t n_stx = 0;
+            uint64_t cas_pcs[512];
+            size_t n_cas = 0;
             uint8_t *segp = blob->data + payload_off +
                             segs[gi].payload_off;
             for (size_t k = 0; k + 4 <= segs[gi].filesz; k += 4) {
                 uint32_t w;
                 memcpy(&w, segp + k, 4);
+                if (a64_is_lse_cas(w, NULL, NULL, NULL)) {
+                    if (n_cas < 512)
+                        cas_pcs[n_cas++] = segs[gi].vaddr + k;
+                    continue;
+                }
                 if (!a64_is_excl_load(w, NULL, NULL, NULL, NULL))
                     continue;
                 for (size_t k2 = k + 4;
@@ -1382,7 +1396,8 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 }
             }
             uint64_t need = (((cnt * A64_ATOM_BLOCK_SIZE +
-                               n_stx * 0x20) + 0xfff) &
+                               n_stx * 0x20 +
+                               n_cas * 0x20) + 0xfff) &
                              ~0xfffULL);
             uint64_t taddr = find_gap_near(segs, nsegs, pl, npl,
                                            segs[gi].vaddr + segs[gi].filesz,
@@ -1395,6 +1410,14 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             if (!taddr)
                 die("strict: cannot place atomic trampoline page near "
                     "%#llx", (unsigned long long)segs[gi].vaddr);
+            fprintf(stderr,
+                    "strict: tramp[atom] seg=%#llx cnt=%zu nstx=%zu "
+                    "ncas=%zu need=%#llx at=%#llx dist=%+lld\n",
+                    (unsigned long long)segs[gi].vaddr, cnt, n_stx,
+                    n_cas,
+                    (unsigned long long)need,
+                    (unsigned long long)taddr,
+                    (long long)(int64_t)(taddr - segs[gi].vaddr));
             spload_add(&pl, &npl, &pl_cap, taddr, need,
                        PF_R | PF_W | PF_X);
             uint8_t *page = xcalloc(1, need);
@@ -1466,9 +1489,37 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 uint32_t bw = a64_patch_b(pc, taddr + o);
                 memcpy(segp + (pc - segs[gi].vaddr), &bw, 4);
                 fprintf(stderr,
-                        "atomic: force-success excl store %#llx "
+                        "atomic: force-success excl store %#llx -> %#llx "
+                        "(dist=%+lld) "
                         "(rs=0, unconditional str)\n",
+                        (unsigned long long)pc,
+                        (unsigned long long)(taddr + o),
+                        (long long)(int64_t)(taddr + o - pc));
+                o += 0x20;
+            }
+            /* LSE CAS (cas/casa/casl/casal) 强制成功: 无条件 str +
+               Rs 保持期望值 (调用方判定成功)。覆盖 LSE 原子指令路径:
+               真机 glibc cas8_rel 用 casl, 采集时不插桩; 切片回放时
+               casl 读检查点陈旧内存 (head->next 非空) 会失败 → 主循环
+               空转 → 原子站点 ordinal 提前耗尽。 */
+            for (size_t s = 0; s < n_cas; s++) {
+                uint64_t pc = cas_pcs[s];
+                uint32_t w;
+                memcpy(&w, segp + (pc - segs[gi].vaddr), 4);
+                o = (o + 0xf) & ~(size_t)0xf;  /* 16B 对齐 */
+                size_t bl3 = a64_lse_cas_trampoline(
+                    page + o, taddr + o, w, pc + 4);
+                if (!bl3)
+                    die("atomic: bad LSE CAS at %#llx",
                         (unsigned long long)pc);
+                uint32_t bw = a64_patch_b(pc, taddr + o);
+                memcpy(segp + (pc - segs[gi].vaddr), &bw, 4);
+                fprintf(stderr,
+                        "atomic: force-success LSE CAS %#llx -> %#llx "
+                        "(dist=%+lld)\n",
+                        (unsigned long long)pc,
+                        (unsigned long long)(taddr + o),
+                        (long long)(int64_t)(taddr + o - pc));
                 o += 0x20;
             }
             for (size_t i = 0; i < npl; i++) {

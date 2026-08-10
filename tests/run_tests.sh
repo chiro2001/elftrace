@@ -17,6 +17,8 @@
 #   bareheap 角落9: baremetal brk 边界 (mock 拒绝) + real 模式 brk 恢复
 #   bm_edge  baremetal 边界: 0f 05 立即数误替换回归 + 同 pc 循环 read
 #            dirty 回放 (游标顺序消费/悬空记录丢弃)
+#   lockfree_main  无锁 MS 队列主线程生产者 strict 切片 (LSE casl
+#            强制成功 + ldar 值回放, 补偿比例 ≤ 5%)
 #
 # 需要 kernel.yama.ptrace_scope=0 (或目标允许被跟踪)。
 set -u
@@ -25,7 +27,7 @@ ROOT=$(pwd)
 LOG="$ROOT/tmp/test_run.log"
 mkdir -p "$ROOT/tmp"
 
-TESTS="strict atomic_spin atomic_tramp atomic_boundary basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle baremetal imix bm_edge realworld http_server http_pool threadpool condvar comp_ratio"
+TESTS="strict atomic_spin lockfree_main atomic_tramp atomic_boundary basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle baremetal imix bm_edge realworld http_server http_pool threadpool condvar comp_ratio"
 PASS=0
 FAIL=0
 
@@ -44,7 +46,7 @@ done
 sleep 0.3
 
 # 清理残留测试进程 (避免干扰)
-for p in prog_simple prog_fd prog_fd_rw prog_cpp python3 prog_syscall prog_stack prog_bigmem prog_thread prog_append prog_bareheap prog_bm_imm prog_bm_loopread prog_crc32 prog_lz prog_json prog_sha256 prog_alloc prog_sockpair prog_dir prog_ioctl prog_calib prog_spsc_spin prog_atomic_boundary prog_threadpool; do
+for p in prog_simple prog_fd prog_fd_rw prog_cpp python3 prog_syscall prog_stack prog_bigmem prog_thread prog_append prog_bareheap prog_bm_imm prog_bm_loopread prog_crc32 prog_lz prog_json prog_sha256 prog_alloc prog_sockpair prog_dir prog_ioctl prog_calib prog_spsc_spin prog_atomic_boundary prog_threadpool prog_lockfree_main; do
     pgrep -x "$p" | xargs -r kill -9 2>/dev/null
 done
 sleep 0.3
@@ -58,7 +60,7 @@ for t in $TESTS; do
     # aarch64 真机较慢: baremetal/realworld 需要更长超时
     TIMEOUT=600
     case "$t" in
-        baremetal|realworld|http_server|http_pool|threadpool) [ "$(uname -m)" = "aarch64" ] && TIMEOUT=1800 ;;
+        baremetal|realworld|http_server|http_pool|threadpool|lockfree_main) [ "$(uname -m)" = "aarch64" ] && TIMEOUT=1800 ;;
         condvar) [ "$(uname -m)" = "aarch64" ] && TIMEOUT=3600 ;;
     esac
     if timeout "$TIMEOUT" "$TS" > "$LOG" 2>&1; then

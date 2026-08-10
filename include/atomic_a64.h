@@ -137,6 +137,20 @@ int a64_is_excl_store(uint32_t w, int *size, unsigned *rs,
 int a64_is_excl_load(uint32_t w, int *size, unsigned *rt,
                      unsigned *rn, int *acquire);
 
+/* ---- LSE CAS 族 (cas/casa/casl/casal, 32/64 位) ----
+ * 编码 (ARM ARM):
+ *   [31:30] size (00=w, 11=x)
+ *   [29:24] 001000 (bit27=1, bit22=0)
+ *   [23:21] = 101 (CAS 族)
+ *   [20:16] Rs = 期望值 (CAS 成功后返回旧值)
+ *   [15]    L (acquire), [16] A (release)
+ *   [14:10] 11111
+ *   [9:5]   Rn = 地址
+ *   [4:0]   Rt = 新值
+ * 匹配掩码: (w & 0x3FE07C00) == 0x08A07C00。 */
+int a64_is_lse_cas(uint32_t w, unsigned *rs, unsigned *rt,
+                   unsigned *rn);
+
 /* 排他 store → 等宽无条件 str [Xn] (数据寄存器不变) */
 uint32_t a64_excl_store_to_str(int size, unsigned rn, unsigned rt);
 
@@ -150,6 +164,16 @@ uint32_t a64_excl_store_to_str(int size, unsigned rn, unsigned rt);
  * stlxr 永远失败 → 循环死锁)。 */
 size_t a64_excl_store_trampoline(uint8_t *out, uint64_t block_abs,
                                  uint32_t insn, uint64_t ret_addr);
+
+/* 生成 LSE CAS 强制成功跳板 (0x20 字节):
+ *   stp x16,x17,[sp,#-16]!
+ *   ldr xT,[pc,#8]      ; T=16 或 17 (避开 Rt/Rn)
+ *   str Xt,[Xn]         ; 无条件写入
+ *   .quad ret_addr
+ *   ldr 另一个,[sp,#N]; add sp,sp,#16; br xT
+ * Rs 保持期望值 (CAS 成功语义)。Rt/Rn 同时占用 x16/x17 时返回 0。 */
+size_t a64_lse_cas_trampoline(uint8_t *out, uint64_t block_abs,
+                              uint32_t insn, uint64_t ret_addr);
 
 /* 检测 ldar/ldarb/ldarh 与 ldaxr/ldaxrb/ldaxrh; *exclusive 输出
  * ldaxr 族标记 (兼容旧调用) */
