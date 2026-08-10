@@ -104,7 +104,6 @@ run_trace_retry() {  # <输出目录> [补偿文件]
         echo "  trace 负载失败 (attempt $a), 清理重试"
         kill -9 "$HTTP_PID" 2>/dev/null
         pkill -9 -f '/build/elftrace trace ' 2>/dev/null
-        pkill -9 -x python3 2>/dev/null
         sleep 1
     done
     return 1
@@ -163,9 +162,10 @@ timeout 120 strace -o "$TF_TMP/http_slice.strace" \
     "$TF_TMP/http_slice.elf" > /dev/null 2>&1
 RC=$?
 AFTER=$(awk '/rt_sigreturn/{f=1; next} f' "$TF_TMP/http_slice.strace")
-if echo "$AFTER" | grep -E "openat|read\(|write\(|ioctl\(|mmap|brk|futex|poll|recvfrom|sendto|accept|clone|clock_gettime"; then
-    echo "FAIL: 目标阶段真实 syscall"
-    echo "$AFTER"
+BAD=$(echo "$AFTER" | grep -vE "^(exit_group|\\+\\+\\+ exited)")
+if [ -n "$BAD" ]; then
+    echo "FAIL: 目标阶段出现非 exit_group 的 syscall 行"
+    echo "$BAD"
     exit 1
 fi
 case "$RC" in
