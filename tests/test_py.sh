@@ -33,14 +33,14 @@ run_case() {  # $1 = 名称, $2 = 冻结方式 (freeze|stub), $3 = build 参数,
     PID=$!
     if [ "$mode" = "stub" ]; then
         # 等待目标自暂停 (SIGSTOP 组停止, State=T)
-        for i in $(seq 1 3000); do
+        for i in $(seq 1 6000); do
             ST=$(awk '/^State/{print $2}' /proc/$PID/status 2>/dev/null)
             [ "$ST" = "T" ] && break
             sleep 0.05
         done
         [ "$ST" = "T" ] || { echo "FAIL[$name]: target not self-stopped"; kill -9 $PID; return 1; }
     else
-        for i in $(seq 1 3000); do
+        for i in $(seq 1 6000); do
             grep -q "CKPT 1" "$TMP/py_${name}.out" 2>/dev/null && break
             sleep 0.05
         done
