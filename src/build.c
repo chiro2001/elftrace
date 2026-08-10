@@ -715,16 +715,26 @@ static int range_covered(const elftrace_seg *segs, size_t nsegs,
     return 0;
 }
 
-/* 在 [near, near+128MB) 中找一个能容纳 size 的空闲页对齐区间 */
+/* 在 [near, near+128MB) 中找一个能容纳 size 的空闲页对齐区间。
+ * blob [blob_base, blob_base+blob_size) 视为占用: 跳板页若落在 blob
+ * 内, 运行时 LOAD 覆盖会破坏 stub 的表/载荷 (块大小调整曾让页面
+ * 伸入 blob 尾部 → http_pool 探针跳 0xb1a4b0 的 udf)。 */
 static uint64_t find_gap_near(const elftrace_seg *segs, size_t nsegs,
                               const struct strict_pload *pl, size_t npl,
-                              uint64_t near, uint64_t size)
+                              uint64_t near, uint64_t size,
+                              uint64_t blob_base, uint64_t blob_size)
 {
     uint64_t cur = (near + 0xfff) & ~0xfffULL;
     uint64_t lim = near + (128UL << 20);
     while (cur + size <= lim) {
         uint64_t end = cur + size;
         int busy = 0;
+        if (blob_size &&
+            cur < blob_base + blob_size && end > blob_base) {
+            busy = 1;
+            cur = (blob_base + blob_size + 0xfff) & ~0xfffULL;
+            continue;
+        }
         for (size_t i = 0; i < nsegs; i++) {
             if (cur < segs[i].vaddr + segs[i].memsz &&
                 end > segs[i].vaddr) {
@@ -1408,12 +1418,12 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
         uint64_t need = ((cnt * 32 + 0xfff) & ~0xfffULL);
         uint64_t taddr = find_gap_near(segs, nsegs, pl, npl,
                                        segs[gi].vaddr + segs[gi].filesz,
-                                       need);
+                                       need, base, blob->size);
         if (!taddr)
             taddr = find_gap_near(segs, nsegs, pl, npl,
                                   segs[gi].vaddr > need
                                       ? segs[gi].vaddr - need : 0,
-                                  need);
+                                  need, base, blob->size);
         if (!taddr)
             die("strict: cannot place trampoline page near %#llx "
                 "(code too dense / >128MB away)",
@@ -1583,12 +1593,12 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                              ~0xfffULL);
             uint64_t taddr = find_gap_near(segs, nsegs, pl, npl,
                                            segs[gi].vaddr + segs[gi].filesz,
-                                           need);
+                                           need, base, blob->size);
             if (!taddr)
                 taddr = find_gap_near(segs, nsegs, pl, npl,
                                       segs[gi].vaddr > need
                                           ? segs[gi].vaddr - need : 0,
-                                      need);
+                                      need, base, blob->size);
             if (!taddr)
                 die("strict: cannot place atomic trampoline page near "
                     "%#llx", (unsigned long long)segs[gi].vaddr);
