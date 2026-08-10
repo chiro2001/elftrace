@@ -110,34 +110,41 @@ run_trace_retry() {  # <输出目录> [补偿文件]
     return 1
 }
 
-rm -rf "$TF_TMP/http_r1" "$TF_TMP/http_r2"
-run_trace_retry "$TF_TMP/http_r1" || { echo "FAIL: Run1"; tail -3 "$TF_TMP/http_trace.log"; exit 1; }
-COMP="$TF_TMP/http_r1/atomics/compensation.txt"
-[ -f "$COMP" ] || { echo "FAIL: Run1 无 compensation.txt"; exit 1; }
-NCK=$(wc -l < "$TF_TMP/http_r1/manifest.txt")
-[ "$NCK" -ge 6 ] || { echo "FAIL: Run1 只有 $NCK 检查点"; exit 1; }
-echo "  Run1: $NCK ckpts, $(wc -l < "$TF_TMP/http_r1/syscalls/syscall.map") syscalls"
+# 两跑采集 + probe 切片, 整体最多重试 2 次 (trace 数据相关分歧会让
+# probe 偶发 SIGSEGV, 重采可得到干净数据; 两次都失败才判 FAIL)
+trace_and_probe() {
+    rm -rf "$TF_TMP/http_r1" "$TF_TMP/http_r2"
+    run_trace_retry "$TF_TMP/http_r1" || { echo "FAIL: Run1"; return 1; }
+    COMP="$TF_TMP/http_r1/atomics/compensation.txt"
+    [ -f "$COMP" ] || { echo "FAIL: Run1 无 compensation.txt"; return 1; }
+    NCK=$(wc -l < "$TF_TMP/http_r1/manifest.txt")
+    [ "$NCK" -ge 6 ] || { echo "FAIL: Run1 只有 $NCK 检查点"; return 1; }
+    echo "  Run1: $NCK ckpts, $(wc -l < "$TF_TMP/http_r1/syscalls/syscall.map") syscalls"
 
-run_trace_retry "$TF_TMP/http_r2" "$COMP" || { echo "FAIL: Run2"; tail -3 "$TF_TMP/http_trace.log"; exit 1; }
-[ -f "$TF_TMP/http_r2/atomics/events.bin" ] || { echo "FAIL: Run2 无 events.bin"; exit 1; }
-NCK=$(wc -l < "$TF_TMP/http_r2/manifest.txt")
-[ "$NCK" -ge 6 ] || { echo "FAIL: Run2 只有 $NCK 检查点"; exit 1; }
-echo "  Run2: $NCK ckpts, $(wc -l < "$TF_TMP/http_r2/syscalls/syscall.map") syscalls"
+    run_trace_retry "$TF_TMP/http_r2" "$COMP" || { echo "FAIL: Run2"; return 1; }
+    [ -f "$TF_TMP/http_r2/atomics/events.bin" ] || { echo "FAIL: Run2 无 events.bin"; return 1; }
+    NCK=$(wc -l < "$TF_TMP/http_r2/manifest.txt")
+    [ "$NCK" -ge 6 ] || { echo "FAIL: Run2 只有 $NCK 检查点"; return 1; }
+    echo "  Run2: $NCK ckpts, $(wc -l < "$TF_TMP/http_r2/syscalls/syscall.map") syscalls"
 
-# 中间窗口切片 (600K..1M), 两阶段:
-#   1) probe 切片: 整页回放 + 每个 newseg/dirty 应用前 dump 预状态
-#   2) byte-run 切片: 用 probe 预状态压缩成 32B granule 回放表,
-#      主线程自身已复现的写入整体跳过, 回放指令数大幅下降
-tf_build /dev/null "$TF_TMP/http_probe.elf" --mode baremetal --bm-strict \
-    --checkpoints "$TF_TMP/http_r2" \
-    --from-count 600000 --to-count 1000000 \
-    --stack-reserve 67108864 \
-    --probe-dump "$TF_TMP/http_probe.bin" > "$TF_TMP/http_build.log" 2>&1 \
-    || { echo "FAIL: probe build"; tail -5 "$TF_TMP/http_build.log"; exit 1; }
-timeout 600 "$TF_TMP/http_probe.elf" > /dev/null 2>&1
-PRC=$?
-[ "$PRC" = 0 ] || { echo "FAIL: probe slice rc=$PRC"; exit 1; }
-[ -s "$TF_TMP/http_probe.bin" ] || { echo "FAIL: 无 probe.bin"; exit 1; }
+    # 中间窗口切片 (600K..1M), 两阶段:
+    #   1) probe 切片: 整页回放 + 每个 newseg/dirty 应用前 dump 预状态
+    #   2) byte-run 切片: 用 probe 预状态压缩成 32B granule 回放表,
+    #      主线程自身已复现的写入整体跳过, 回放指令数大幅下降
+    tf_build /dev/null "$TF_TMP/http_probe.elf" --mode baremetal --bm-strict \
+        --checkpoints "$TF_TMP/http_r2" \
+        --from-count 600000 --to-count 1000000 \
+        --stack-reserve 67108864 \
+        --probe-dump "$TF_TMP/http_probe.bin" > "$TF_TMP/http_build.log" 2>&1 \
+        || { echo "FAIL: probe build"; tail -5 "$TF_TMP/http_build.log"; return 1; }
+    timeout 600 "$TF_TMP/http_probe.elf" > /dev/null 2>&1
+    PRC=$?
+    [ "$PRC" = 0 ] || { echo "  probe rc=$PRC (trace 数据分歧), 重采重试"; return 1; }
+    [ -s "$TF_TMP/http_probe.bin" ] || { echo "FAIL: 无 probe.bin"; return 1; }
+    return 0
+}
+
+trace_and_probe || trace_and_probe || { tail -3 "$TF_TMP/http_trace.log"; exit 1; }
 tf_build /dev/null "$TF_TMP/http_slice.elf" --mode baremetal --bm-strict \
     --checkpoints "$TF_TMP/http_r2" \
     --from-count 600000 --to-count 1000000 \
