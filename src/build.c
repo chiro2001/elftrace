@@ -1347,31 +1347,29 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             }
             if (!cnt)
                 continue;
-            /* 配对 stlxr/stxr 强制成功: 从每个 ldaxr 回放站点向前扫描
-               (最多 128B) 找排他 store, 生成无条件 str + rs=0 跳板,
-               消除模拟器排他监视器语义依赖 (任何 store 清监视器 →
-               stlxr 永远失败 → LL/SC 循环死锁)。 */
+            /* 配对 stlxr/stxr 强制成功: 扫描段内所有排他 load
+               (ldxr/ldaxr, 覆盖未插桩的 ldxr — 无锁队列 CAS 用
+               ldxr+stlxr), 向前 256B 找配对排他 store, 生成无条件
+               str + rs=0 跳板, 消除模拟器排他监视器语义依赖
+               (任何 store 清监视器 → stlxr 永远失败 → LL/SC 死锁)。 */
             uint64_t stx_pcs[512];
             size_t n_stx = 0;
             uint8_t *segp = blob->data + payload_off +
                             segs[gi].payload_off;
-            for (size_t i = 0; i < nsites; i++) {
-                struct strict_site *st = &sites[i];
-                if (st->kind != 4 ||
-                    st->pc < segs[gi].vaddr ||
-                    st->pc >= segs[gi].vaddr + segs[gi].filesz)
+            for (size_t k = 0; k + 4 <= segs[gi].filesz; k += 4) {
+                uint32_t w;
+                memcpy(&w, segp + k, 4);
+                if (!a64_is_excl_load(w, NULL, NULL, NULL, NULL))
                     continue;
-                if (ab->sites[st->ab_id].kind != 1)
-                    continue;   /* 仅 ldaxr (排他) 配对 stlxr */
-                size_t off = (size_t)(st->pc - segs[gi].vaddr);
-                for (size_t k = off + 4;
-                     k + 4 <= segs[gi].filesz && k < off + 4 + 128;
-                     k += 4) {
+                for (size_t k2 = k + 4;
+                     k2 + 4 <= segs[gi].filesz && k2 < k + 4 + 256;
+                     k2 += 4) {
                     uint32_t w;
-                    memcpy(&w, segp + k, 4);
-                    if (!a64_is_excl_store(w, NULL, NULL, NULL, NULL, NULL))
+                    memcpy(&w, segp + k2, 4);
+                    if (!a64_is_excl_store(w, NULL, NULL, NULL, NULL,
+                                           NULL))
                         continue;
-                    uint64_t pc = segs[gi].vaddr + k;
+                    uint64_t pc = segs[gi].vaddr + k2;
                     int dup = 0;
                     for (size_t d = 0; d < n_stx; d++)
                         if (stx_pcs[d] == pc) {
@@ -1380,7 +1378,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                         }
                     if (!dup && n_stx < 512)
                         stx_pcs[n_stx++] = pc;
-                    break;      /* 每个 ldaxr 只配对最近的 stlxr */
+                    break;      /* 每个排他 load 只配对最近的 store */
                 }
             }
             uint64_t need = (((cnt * A64_ATOM_BLOCK_SIZE +

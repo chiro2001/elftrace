@@ -131,6 +131,12 @@ int a64_is_plain_load(uint32_t w, int *size, unsigned *rt, unsigned *rn,
 int a64_is_excl_store(uint32_t w, int *size, unsigned *rs,
                       unsigned *rn, unsigned *rt, int *acquire);
 
+/* 排他 load 检测: ldxr/ldaxr 族 (含 b/h/w/x)。size 0-3, rt=数据,
+ * rn=基址, acquire=1 为 ldaxr 族。用于扫描"配对 stlxr" (覆盖未
+ * 插桩的 ldxr: 无锁队列 CAS 用 ldxr+stlxr, ldxr 不在回放站点里)。 */
+int a64_is_excl_load(uint32_t w, int *size, unsigned *rt,
+                     unsigned *rn, int *acquire);
+
 /* 排他 store → 等宽无条件 str [Xn] (数据寄存器不变) */
 uint32_t a64_excl_store_to_str(int size, unsigned rn, unsigned rt);
 

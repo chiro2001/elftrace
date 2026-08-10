@@ -399,6 +399,25 @@ int a64_is_excl_store(uint32_t w, int *size, unsigned *rs,
     return 1;
 }
 
+int a64_is_excl_load(uint32_t w, int *size, unsigned *rt,
+                     unsigned *rn, int *acquire)
+{
+    uint32_t m = w & 0x3F007C00U;
+    if (m != 0x0800FC00U && m != 0x08007C00U)
+        return 0;
+    if (!((w >> 22) & 1U))
+        return 0;               /* stxr/stlxr (store) */
+    if (size)
+        *size = (int)((w >> 30) & 3U);
+    if (rt)
+        *rt = w & 0x1FU;
+    if (rn)
+        *rn = (w >> 5) & 0x1FU;
+    if (acquire)
+        *acquire = (m == 0x0800FC00U) ? 1 : 0;
+    return 1;
+}
+
 uint32_t a64_excl_store_to_str(int size, unsigned rn, unsigned rt)
 {
     static const uint32_t bases[4] = {
