@@ -45,12 +45,29 @@ extern void inject_flush_icache(pid_t pid,
 struct asite {
     uint64_t pc;
     uint32_t orig_insn;
-    int kind;                   /* 0=ldar 族, 2=普通 ldr 立即数,
-                                   3=普通 ldr 寄存器偏移 */
+    int kind;                   /* 0=ldar 族, 2/3=普通 ldr, 4=LSE CAS */
     size_t seg;                 /* 所属可执行段索引 */
     uint64_t page;              /* 记录页地址 */
     uint32_t page_off;          /* 块偏移 */
 };
+
+/* CAS 扫描误报过滤: 候选指令的下一条必须是 ret 或分支 (真实 CAS
+ * 站点位于代码里, 后面常跟 ret/b.cond/cbz; 数据/字面量池的下一条
+ * 是随机值)。仅用于 CAS 候选, 不用于 ldar/ldxr (它们掩码更紧)。 */
+static int a64_is_ret_or_branch(uint32_t w)
+{
+    if (w == 0xD65F03C0U)               /* ret */
+        return 1;
+    if ((w & 0xFC000000U) == 0x14000000U)   /* b / bl */
+        return 1;
+    if ((w & 0xFF000010U) == 0x54000000U)   /* b.cond */
+        return 1;
+    if ((w & 0x7C000000U) == 0x34000000U)   /* cbz/cbnz/tbz/tbnz */
+        return 1;
+    if ((w & 0xFFFFFC1FU) == 0xD61F0000U)   /* br/blr (含 ret) */
+        return 1;
+    return 0;
+}
 
 struct atomic_trace_ctx {
     pid_t pid;
@@ -66,6 +83,8 @@ struct atomic_trace_ctx {
     size_t n_pages;
     uint64_t dump_event_ptr;    /* 已转储事件游标 (绝对地址) */
     uint64_t total_events;      /* 已转储事件数 (补偿模型) */
+    uint64_t cas_dump_ptr;      /* 已转储 CAS 事件游标 */
+    uint64_t total_cas_events;
     unsigned base_insns, append_insns;
     int record_all;             /* 诊断: 全量记录普通 load 访问 */
     /* 补偿: 每检查点 {measured, overhead, orig} */
@@ -285,6 +304,33 @@ static int atomic_scan(pid_t pid, struct asite **out, size_t *n_out,
             int size;
             unsigned rt, rn;
             int kind;
+            /* LSE CAS 结局录制: 默认关闭 (实验性)。开启后采集端会
+               patch cas/casa/casl/casal 记录结局; 但当前观测到开启后
+               冻结堆状态不再自洽 (切片 malloc 数次后崩溃/挂死, 机制
+               未明), 生产路径用构建侧 --atomic-force-cas-pc 兜底。 */
+            if (a64_is_lse_cas(w, NULL, NULL, NULL) &&
+                getenv("ELFTRACE_CAS_RECORD")) {
+                /* 误报过滤: 数据/字面量池里随机字也会匹配 CAS 编码
+                   (13 个固定位), patch 会破坏 literal load → 目标崩溃。
+                   要求下一条是 ret/分支 (真实 cas8_* 家族全是
+                   cas*; ret)。 */
+                uint32_t wnext;
+                if (off + 8 > (uint64_t)got)
+                    continue;
+                memcpy(&wnext, buf + off + 4, 4);
+                if (!a64_is_ret_or_branch(wnext))
+                    continue;
+                if (n == cap) {
+                    cap = cap ? cap * 2 : 64;
+                    sites = xrealloc(sites, cap * sizeof(*sites));
+                }
+                sites[n].pc = sg->start + off;
+                sites[n].orig_insn = w;
+                sites[n].kind = 4;
+                sites[n].seg = i;
+                n++;
+                continue;
+            }
             if (!a64_is_load_any(w, &size, &rt, &rn, &kind))
                 continue;
             if (rt == 31)
@@ -492,15 +538,19 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
         uint8_t *p = hdr;
         uint64_t state_off = A64_ATB_HDR_SIZE;
         uint64_t events_off = state_off + n_sites * A64_ATB_STATE_SIZE;
+        uint64_t cas_base = ctx->abuf_addr + buf_size / 2;
         write_u64(&p, A64_ATB_MAGIC);
         write_u64(&p, A64_ATB_VERSION);
         write_u64(&p, n_sites);
         write_u64(&p, state_off);
         write_u64(&p, events_off);
         write_u64(&p, ctx->abuf_addr + events_off);
-        write_u64(&p, ctx->abuf_addr + buf_size);
+        write_u64(&p, cas_base);            /* 前半: load 事件区 */
         write_u64(&p, 0);
         write_u64(&p, buf_size);
+        write_u64(&p, cas_base);            /* 后半: CAS 事件区 */
+        write_u64(&p, ctx->abuf_addr + buf_size);
+        write_u64(&p, 0);
         if (tmem_rw(pid, 1, ctx->abuf_addr, hdr, sizeof(hdr)) < 0) {
             warn("atomic: cannot init event buffer @ %#llx",
                  (unsigned long long)ctx->abuf_addr);
@@ -573,6 +623,14 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
                     ctx->abuf_addr + A64_ATB_OFF_EVENTS_END,
                     ctx->abuf_addr + A64_ATB_OFF_OVERFLOW,
                     sites[i].pc + 4, &cnt, ctx->record_all);
+            } else if (sites[i].kind == 4) {
+                bl = a64_cas_record_block(
+                    blk, block_abs, sites[i].orig_insn, ctx->tls, i,
+                    state_abs,
+                    ctx->abuf_addr + A64_ATB_OFF_CAS_EVENT_PTR,
+                    ctx->abuf_addr + A64_ATB_OFF_CAS_EVENTS_END,
+                    ctx->abuf_addr + A64_ATB_OFF_CAS_OVERFLOW,
+                    sites[i].pc + 4, &cnt);
             } else {
                 bl = a64_atomic_record_block(
                     blk, block_abs, sites[i].orig_insn, ctx->tls, i,
@@ -860,6 +918,62 @@ static int atomic_events_append(struct atomic_trace_ctx *ctx)
     ctx->total_events = total;
     if (overflow)
         fprintf(stderr, "atomic: event buffer overflow flag set\n");
+
+    /* CAS 事件区 (56B/事件) → cas_events.bin */
+    {
+        char cpath[600];
+        snprintf(cpath, sizeof(cpath), "%s/atomics/cas_events.bin",
+                 ctx->out);
+        uint64_t cas_ptr = 0, cas_overflow = 0;
+        uint64_t cas_base = ctx->abuf_addr + ctx->abuf_size / 2;
+        if (tmem_rw(ctx->pid, 0,
+                    ctx->abuf_addr + A64_ATB_OFF_CAS_EVENT_PTR,
+                    &cas_ptr, 8) < 0)
+            return 0;
+        tmem_rw(ctx->pid, 0,
+                ctx->abuf_addr + A64_ATB_OFF_CAS_OVERFLOW,
+                &cas_overflow, 8);
+        if (ctx->cas_dump_ptr == 0)
+            ctx->cas_dump_ptr = cas_base;
+        if (cas_ptr < ctx->cas_dump_ptr)
+            cas_ptr = ctx->cas_dump_ptr;
+        uint64_t n_cas = (cas_ptr - ctx->cas_dump_ptr) / 56;
+        uint64_t ctotal = 0;
+        FILE *cf = fopen(cpath, "r+b");
+        if (!cf) {
+            cf = fopen(cpath, "wb");
+            if (!cf)
+                return 0;
+            struct evfile_hdr hdr = {A64_AT_CAS_EVENTS_MAGIC, 1, 0, 0};
+            fwrite(&hdr, sizeof(hdr), 1, cf);
+        } else {
+            struct evfile_hdr hdr;
+            if (fread(&hdr, sizeof(hdr), 1, cf) == 1 &&
+                hdr.magic == A64_AT_CAS_EVENTS_MAGIC && hdr.version == 1)
+                ctotal = hdr.n_events;
+        }
+        if (n_cas) {
+            uint8_t *cev = xmalloc(n_cas * 56);
+            if (tmem_rw(ctx->pid, 0, ctx->cas_dump_ptr, cev,
+                        n_cas * 56) == 0) {
+                fseek(cf, 0, SEEK_END);
+                fwrite(cev, 1, n_cas * 56, cf);
+                ctx->cas_dump_ptr += n_cas * 56;
+                ctotal += n_cas;
+            }
+            free(cev);
+        }
+        {
+            struct evfile_hdr hdr = {A64_AT_CAS_EVENTS_MAGIC, 1, ctotal,
+                                     ctotal * 56};
+            fseek(cf, 0, SEEK_SET);
+            fwrite(&hdr, sizeof(hdr), 1, cf);
+        }
+        fclose(cf);
+        ctx->total_cas_events = ctotal;
+        if (cas_overflow)
+            fprintf(stderr, "atomic: CAS event buffer overflow flag set\n");
+    }
     return 0;
 }
 

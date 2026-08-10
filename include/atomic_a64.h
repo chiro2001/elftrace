@@ -39,9 +39,10 @@ struct a64_ld_addr {
 };
 
 /* ---- 块/页布局 ---- */
-#define A64_ATOM_BLOCK_SIZE  0x240   /* 每站点块 (代码 + 数据区@0x200..0x238) */
+#define A64_ATOM_BLOCK_SIZE  0x280   /* 每站点块 (代码 + 数据区@0x200..0x278;
+                                        LSE CAS 记录块需要 last-tuple 槽) */
 #define A64_ATOM_PAGE_SIZE   0x1000
-#define A64_ATOM_BLOCKS_PER_PAGE  7   /* 7*0x240=0xFC0 */
+#define A64_ATOM_BLOCKS_PER_PAGE  4   /* 4*0x280=0xA00 */
 
 /* 逐站点最小保存集 (生成器内部动态布局), 此处无固定偏移 */
 
@@ -85,6 +86,32 @@ size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
                              uint64_t ret_addr,
                              struct a64_atom_counts *counts,
                              int record_all);
+
+/* ---- LSE CAS 记录跳板 (kind=4) ----
+ * 入口保存 {rs,rt,rn}+scratch, 从槽重载后执行原始 cas/casa/casl/casal
+ * (保留真实读改写语义), 捕获 old=Rs 与 success=(old==expected), 按
+ * {addr,old,success,expected,desired} 五元组游程压缩追加到独立的
+ * CAS 事件区 (56B/事件)。非目标线程只执行真实 CAS 不记录。 */
+size_t a64_cas_record_block(uint8_t *out, uint64_t block_abs,
+                            uint32_t orig_insn, uint64_t tls,
+                            uint64_t site_id, uint64_t state_abs,
+                            uint64_t cas_event_ptr_addr,
+                            uint64_t cas_events_end_addr,
+                            uint64_t cas_overflow_addr,
+                            uint64_t ret_addr,
+                            struct a64_atom_counts *counts);
+
+/* ---- LSE CAS 结局回放跳板 ----
+ * 按 ordinal 查 48B 运行段 {start,addr,old,success,expected,desired};
+ * 按 ordinal 命中运行段: success=1 写 desired (切片自己的 Rt) 到
+ * 录制 run.addr (对象身份跨站点校验暂缓: ldar 值回放带 +1 延迟,
+ * 逐访问对齐会误报; 与 load 回放一致), Rs 一律装录制 old。
+ * 超出窗口访问预算或 run.addr==0 → exit_abs 兜底。 */
+size_t a64_cas_replay_block(uint8_t *out, uint64_t block_abs,
+                            uint64_t runs_abs, uint64_t n_runs,
+                            unsigned rs, unsigned rt, unsigned rn,
+                            uint64_t ret_addr,
+                            uint64_t load_limit, uint64_t exit_abs);
 
 /* ---- 回放跳板块 ----
  * 入口: stp x16,x17; nop; ldr x16,[pc,#8]; br x16; .quad block_abs。
@@ -140,16 +167,17 @@ int a64_is_excl_load(uint32_t w, int *size, unsigned *rt,
 /* ---- LSE CAS 族 (cas/casa/casl/casal, 32/64 位) ----
  * 编码 (ARM ARM):
  *   [31:30] size (00=w, 11=x)
- *   bit27=1; [23:22]=1L (bit22=L, acquire)
- *   [23:21] = 101 (CAS 族)
+ *   [29:24] 001000 (bit27=1, bit22 不参与)
+ *   [23:21] = 101 (CAS 族; bit22=L acquire 不参与)
  *   [20:16] Rs = 期望值 (CAS 成功后返回旧值)
  *   [15]    o0 (casl/casal 置位)
  *   [14:10] 11111
  *   [9:5]   Rn = 地址
  *   [4:0]   Rt = 新值
- * 匹配掩码: (w & 0x08A07C00) == 0x08A07C00 —— 只钉 bit27/bit23/
- * bit21/bits14..10, bit22 (L) 与 bit15 (o0) 不参与 (casa/casal 的
- * bit22=1, 旧掩码 0x3FE07C00 会漏掉它们)。实测编码:
+ * 匹配掩码: (w & 0x3FA07C00) == 0x08A07C00 —— 钉 bits[29:24]=001000/
+ * bit23/bit21/bits[14:10]=11111, bit22 (L) 与 bit15 (o0) 不参与
+ * (casa/casal 的 bit22=1)。**不可**再简化掩码: 0x08A07C00 会放行
+ * 数据/字面量池误报 (0x3FE07C00 又漏 casa/casal)。实测编码:
  *   cas=0xc8a07c22 casl=0xc8a0fc22 casa=0xc8e07c22 casal=0xc8e0fc22
  *   (swpal=0xf8e08020 ldaddal=0xf8e00020 均被 bits14..10 排除)。 */
 int a64_is_lse_cas(uint32_t w, unsigned *rs, unsigned *rt,
@@ -187,7 +215,7 @@ int a64_is_ldar_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
 /* ---- 缓冲区头 (注入到目标地址空间, tracer 与跳板共享) ---- */
 #define A64_ATB_MAGIC    0x41544F4DULL   /* "ATOM" */
 #define A64_ATB_VERSION  1
-#define A64_ATB_HDR_SIZE 72
+#define A64_ATB_HDR_SIZE 96
 #define A64_ATB_OFF_MAGIC       0
 #define A64_ATB_OFF_VERSION     8
 #define A64_ATB_OFF_N_SITES     16
@@ -197,6 +225,9 @@ int a64_is_ldar_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
 #define A64_ATB_OFF_EVENTS_END  48   /* 绝对地址 (事件区末尾) */
 #define A64_ATB_OFF_OVERFLOW    56
 #define A64_ATB_OFF_BUF_SIZE    64
+#define A64_ATB_OFF_CAS_EVENT_PTR 72  /* CAS 事件区 (56B/事件) */
+#define A64_ATB_OFF_CAS_EVENTS_END 80
+#define A64_ATB_OFF_CAS_OVERFLOW 88
 
 /* 站点状态槽 (24B) */
 #define A64_ATB_STATE_SIZE      24
@@ -211,6 +242,7 @@ int a64_is_ldar_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
 /* ---- 侧车文件魔数 (trace 输出 atomics/) ---- */
 #define A64_AT_SITES_MAGIC  0x53495445ULL   /* "ETIS" */
 #define A64_AT_EVENTS_MAGIC 0x56455441ULL   /* "ATEV" */
+#define A64_AT_CAS_EVENTS_MAGIC 0x43564541ULL /* "AEVC" */
 #define A64_AT_CKPT_MAGIC   0x4B435441ULL   /* "ATCK" */
 
 #endif

@@ -433,7 +433,7 @@ int a64_is_excl_load(uint32_t w, int *size, unsigned *rt,
 int a64_is_lse_cas(uint32_t w, unsigned *rs, unsigned *rt,
                    unsigned *rn)
 {
-    if ((w & 0x08A07C00U) != 0x08A07C00U)
+    if ((w & 0x3FA07C00U) != 0x08A07C00U)
         return 0;
     if (rs)
         *rs = (w >> 16) & 0x1FU;
@@ -851,6 +851,302 @@ size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
     v = overflow_addr;          memcpy(out + REC_OVERFLOW_ADDR_OFF, &v, 8);
     v = ret_addr;               memcpy(out + REC_RET_ADDR_OFF, &v, 8);
     v = record_all ? 1 : 0;     memcpy(out + REC_RECORD_ALL_OFF, &v, 8);
+
+    return A64_ATOM_BLOCK_SIZE;
+}
+
+/* ---- LSE CAS 记录跳板 ----
+ * 数据区 (0x200..0x278):
+ *   tls, site_id, state_abs, cas_event_ptr_addr, cas_events_end_addr,
+ *   cas_overflow_addr, ret_addr (0x200..0x238);
+ *   last_old/last_addr/last_success/last_expected/last_desired
+ *   (0x238..0x260, 游程压缩比较用)。
+ * 事件 (56B): {site_id, ordinal, addr, old, success, expected, desired}。
+ */
+#define CASREC_TLS_OFF           0x200
+#define CASREC_SITE_ID_OFF       0x208
+#define CASREC_STATE_ABS_OFF     0x210
+#define CASREC_EVENT_PTR_ADDR_OFF 0x218
+#define CASREC_EVENTS_END_ADDR_OFF 0x220
+#define CASREC_OVERFLOW_ADDR_OFF 0x228
+#define CASREC_RET_ADDR_OFF      0x230
+#define CASREC_LAST_OFF          0x238
+
+size_t a64_cas_record_block(uint8_t *out, uint64_t block_abs,
+                            uint32_t orig_insn, uint64_t tls,
+                            uint64_t site_id, uint64_t state_abs,
+                            uint64_t cas_event_ptr_addr,
+                            uint64_t cas_events_end_addr,
+                            uint64_t cas_overflow_addr,
+                            uint64_t ret_addr,
+                            struct a64_atom_counts *counts)
+{
+    unsigned rs, rt, rn;
+    if (!a64_is_lse_cas(orig_insn, &rs, &rt, &rn))
+        return 0;
+    /* rs/rt/rn 占用 x16/x17 (块基址/入口暂存) 或 x31 (sp/xzr):
+       不支持, 站点保持原指令 (采集原生执行, 切片无结局回放)。 */
+    if (rs == 16 || rs == 17 || rs == 31 ||
+        rt == 16 || rt == 17 || rt == 31 ||
+        rn == 16 || rn == 17 || rn == 31)
+        return 0;
+
+    memset(out, 0, A64_ATOM_BLOCK_SIZE);
+    uint8_t *p = out;
+
+    /* 入口 (4 指令 + 8B 字面量 = 0x18 字节, 代码从 0x18 开始) */
+    put32(&p, 0xA9BF47F0U);     /* stp x16,x17,[sp,#-16]! */
+    put32(&p, INSN_NOP);
+    put32(&p, ldr_lit(16, 8));
+    put32(&p, INSN_BR_X16);
+    put64(&p, block_abs + 0x18);
+    /* p == out + 0x18 */
+
+    put32(&p, 0xD1006210U);     /* sub x16, x16, #0x18 */
+    unsigned base_rec[] = {12, 13, 14, 15, 16, 17, 18, 19,
+                           20, 21, 22, 23, 24, 25};
+    struct save_plan pl;
+    plan_save(&pl, base_rec, sizeof(base_rec) / sizeof(base_rec[0]),
+              rt, rn, rs);
+    emit_plan_save(&p, &pl);
+
+    /* 从保存槽重载 rs/rt/rn (plan_save 可能已破坏原寄存器) */
+    put32(&p, ldr_x_imm(31, rs, (unsigned)pl.off[rs]));
+    put32(&p, ldr_x_imm(31, rt, (unsigned)pl.off[rt]));
+    put32(&p, ldr_x_imm(31, rn, (unsigned)pl.off[rn]));
+    /* 执行原始 CAS (真实读改写, Rs 返回旧值) */
+    put32(&p, orig_insn);
+    /* old → x13, addr → x12 */
+    if (rs != 13)
+        put32(&p, mov_x(13, rs));
+    if (rn != 12)
+        put32(&p, mov_x(12, rn));
+
+    /* TLS 过滤: 非目标线程只执行真实 CAS, 不记录 */
+    put32(&p, INSN_MRS_X14_TPIDR);
+    put32(&p, ldr_x16_imm(15, CASREC_TLS_OFF));
+    put32(&p, cmp_x(14, 15));
+    uint8_t *tls_bne = p;
+    put32(&p, bcond(0, 1));     /* b.ne done (占位) */
+
+    /* 序号 = ++state.ordinal */
+    put32(&p, ldr_x16_imm(17, CASREC_STATE_ABS_OFF));
+    put32(&p, ldr_x_imm(17, 19, 0));
+    put32(&p, add_x(19, 19, 1));
+    put32(&p, str_x_imm(17, 19, 0));
+
+    /* success = (old == expected) → x21; expected → x20 (槽内旧值) */
+    put32(&p, ldr_x_imm(31, 20, (unsigned)pl.off[rs]));
+    put32(&p, cmp_x(13, 20));
+    put32(&p, 0x9A9F17F5U);     /* cset x21, eq */
+    /* desired → x22 */
+    put32(&p, ldr_x_imm(31, 22, (unsigned)pl.off[rt]));
+
+    /* 五元组游程压缩: (old,addr,success,expected,desired) 全同 → 不追加 */
+    put32(&p, ldr_x16_imm(23, CASREC_LAST_OFF + 0));
+    put32(&p, cmp_x(13, 23));
+    put32(&p, ldr_x16_imm(23, CASREC_LAST_OFF + 8));
+    put32(&p, ccmp_eq(12, 23));
+    put32(&p, ldr_x16_imm(23, CASREC_LAST_OFF + 16));
+    put32(&p, ccmp_eq(21, 23));
+    put32(&p, ldr_x16_imm(23, CASREC_LAST_OFF + 24));
+    put32(&p, ccmp_eq(20, 23));
+    put32(&p, ldr_x16_imm(23, CASREC_LAST_OFF + 32));
+    put32(&p, ccmp_eq(22, 23));
+    uint8_t *same_b = p;
+    put32(&p, bcond(0, 0));     /* b.eq done (占位) */
+    put32(&p, str_x16_imm(13, CASREC_LAST_OFF + 0));
+    put32(&p, str_x16_imm(12, CASREC_LAST_OFF + 8));
+    put32(&p, str_x16_imm(21, CASREC_LAST_OFF + 16));
+    put32(&p, str_x16_imm(20, CASREC_LAST_OFF + 24));
+    put32(&p, str_x16_imm(22, CASREC_LAST_OFF + 32));
+
+    /* 追加事件 {site_id, ordinal, addr, old, success, expected, desired} */
+    put32(&p, ldr_x16_imm(18, CASREC_EVENT_PTR_ADDR_OFF));
+    put32(&p, ldr_x_imm(18, 24, 0));    /* cas_event_ptr */
+    put32(&p, add_x(25, 24, 56));
+    put32(&p, ldr_x16_imm(23, CASREC_EVENTS_END_ADDR_OFF));
+    put32(&p, ldr_x_imm(23, 23, 0));
+    put32(&p, cmp_x(25, 23));
+    uint8_t *ovf_b = p;
+    put32(&p, bcond(0, 8));     /* b.hi overflow (占位) */
+    put32(&p, ldr_x16_imm(20, CASREC_SITE_ID_OFF));
+    put32(&p, str_x_imm(24, 20, 0));    /* site_id */
+    put32(&p, str_x_imm(24, 19, 8));    /* ordinal */
+    put32(&p, str_x_imm(24, 12, 16));   /* addr */
+    put32(&p, str_x_imm(24, 13, 24));   /* old */
+    put32(&p, str_x_imm(24, 21, 32));   /* success */
+    put32(&p, ldr_x_imm(31, 20, (unsigned)pl.off[rs]));
+    put32(&p, str_x_imm(24, 20, 40));   /* expected */
+    put32(&p, str_x_imm(24, 22, 48));   /* desired */
+    put32(&p, str_x_imm(18, 25, 0));    /* hdr.cas_event_ptr = event+56 */
+    uint8_t *skip_b = p;
+    put32(&p, 0x14000000U);     /* b done (占位) */
+    put32(&p, ldr_x16_imm(20, CASREC_OVERFLOW_ADDR_OFF));
+    put32(&p, movz_x(21, 1, 0));
+    put32(&p, str_x_imm(20, 21, 0));
+
+    /* done: CAS 结果 (old) 写回 Rs 保存槽, 恢复现场, 跳回站点下一条 */
+    {
+        int rs_off = pl.off[rs];
+        if (rs_off < 0)
+            return 0;
+        uint8_t *done = p;
+        put32(&p, str_x_imm(31, 13, (unsigned)rs_off));
+        emit_plan_restore(&p, &pl);
+
+        int32_t d1 = (int32_t)(done - tls_bne);
+        int32_t d2 = (int32_t)(done - same_b);
+        int32_t d3 = (int32_t)((skip_b + 4) - ovf_b);
+        uint32_t w4 = a64_encode_b(block_abs + (uint64_t)(skip_b - out),
+                                   block_abs + (uint64_t)(done - out));
+        uint32_t w;
+        w = bcond(d1, 1);   memcpy(tls_bne, &w, 4);
+        w = bcond(d2, 0);   memcpy(same_b, &w, 4);
+        w = bcond(d3, 8);   memcpy(ovf_b, &w, 4);
+        memcpy(skip_b, &w4, 4);
+    }
+    uint64_t b_off = (uint64_t)(p - out);
+    put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
+
+    if (counts) {
+        size_t code_n = (size_t)(p - out) / 4;
+        unsigned steady = (unsigned)code_n - 17 - 3;
+        counts->base = steady + 1;
+        counts->append = 17;
+        counts->skip = steady - 12 + 1;
+    }
+
+    uint64_t v = tls;           memcpy(out + CASREC_TLS_OFF, &v, 8);
+    v = site_id;                memcpy(out + CASREC_SITE_ID_OFF, &v, 8);
+    v = state_abs;              memcpy(out + CASREC_STATE_ABS_OFF, &v, 8);
+    v = cas_event_ptr_addr;     memcpy(out + CASREC_EVENT_PTR_ADDR_OFF, &v, 8);
+    v = cas_events_end_addr;    memcpy(out + CASREC_EVENTS_END_ADDR_OFF, &v, 8);
+    v = cas_overflow_addr;      memcpy(out + CASREC_OVERFLOW_ADDR_OFF, &v, 8);
+    v = ret_addr;               memcpy(out + CASREC_RET_ADDR_OFF, &v, 8);
+
+    return A64_ATOM_BLOCK_SIZE;
+}
+
+/* ---- LSE CAS 结局回放跳板 ----
+ * 运行段 48B: {start, addr, old, success, expected, desired}。
+ * 数据区: ord/cursor/runs_abs/n_runs/load_limit/exit_abs (0x200..0x230)。
+ */
+#define CASREP_ORD_OFF      0x200
+#define CASREP_CURSOR_OFF   0x208
+#define CASREP_RUNS_ABS_OFF 0x210
+#define CASREP_NRUNS_OFF    0x218
+#define CASREP_LOAD_LIMIT_OFF 0x220
+#define CASREP_EXIT_ABS_OFF 0x228
+
+size_t a64_cas_replay_block(uint8_t *out, uint64_t block_abs,
+                            uint64_t runs_abs, uint64_t n_runs,
+                            unsigned rs, unsigned rt, unsigned rn,
+                            uint64_t ret_addr,
+                            uint64_t load_limit, uint64_t exit_abs)
+{
+    if (rs == 31 || rt == 31 || rn == 31)
+        return 0;
+
+    memset(out, 0, A64_ATOM_BLOCK_SIZE);
+    uint8_t *p = out;
+
+    /* 入口 (4 指令 + 8B 字面量 = 0x18) */
+    put32(&p, 0xA9BF47F0U);
+    put32(&p, INSN_NOP);
+    put32(&p, ldr_lit(16, 8));
+    put32(&p, INSN_BR_X16);
+    put64(&p, block_abs + 0x18);
+
+    put32(&p, 0xD1006210U);     /* sub x16, x16, #0x18 */
+    unsigned base_rep[] = {16, 17, 18, 19, 20, 21, 22, 23,
+                           24, 25, 26, 27, 28, 29};
+    struct save_plan pl;
+    plan_save(&pl, base_rep, sizeof(base_rep) / sizeof(base_rep[0]),
+              rt, rn, rs);
+    emit_plan_save(&p, &pl);
+
+    /* 序号 = ++ordinal; 超窗口预算 → exit_abs */
+    put32(&p, ldr_x16_imm(19, CASREP_ORD_OFF));
+    put32(&p, add_x(19, 19, 1));
+    put32(&p, str_x16_imm(19, CASREP_ORD_OFF));
+    put32(&p, ldr_x16_imm(17, CASREP_LOAD_LIMIT_OFF));
+    put32(&p, cmp_x(19, 17));
+    uint8_t *lim_b = p;
+    put32(&p, bcond(0, 8));     /* b.hi limit_exit (占位) */
+
+    /* 游标推进: while (cursor+1 < n_runs && runs[cursor+1].start <= ord) */
+    put32(&p, ldr_x16_imm(20, CASREP_CURSOR_OFF));
+    put32(&p, ldr_x16_imm(21, CASREP_NRUNS_OFF));
+    put32(&p, ldr_x16_imm(22, CASREP_RUNS_ABS_OFF));
+    uint8_t *loop_top = p;
+    put32(&p, add_x(23, 20, 1));
+    put32(&p, cmp_x(23, 21));
+    uint8_t *hs_b = p;
+    put32(&p, bcond(0, 2));     /* b.hs have (占位) */
+    put32(&p, movz_x(24, 48, 0));
+    put32(&p, mul_x(24, 23, 24));
+    put32(&p, add_xr(24, 24, 22));
+    put32(&p, ldr_x_imm(24, 25, 0));    /* next.start */
+    put32(&p, cmp_x(25, 19));
+    uint8_t *hi_b = p;
+    put32(&p, bcond(0, 8));     /* b.hi have (占位) */
+    put32(&p, mov_x(20, 23));
+    put32(&p, bcond((int32_t)(loop_top - p), 14));
+    uint8_t *have = p;
+    put32(&p, str_x16_imm(20, CASREP_CURSOR_OFF));
+    put32(&p, movz_x(24, 48, 0));
+    put32(&p, mul_x(24, 20, 24));
+    put32(&p, add_xr(24, 24, 22));      /* run base → x24 */
+
+    /* 期望值校验: 当前 Rs == run.expected (恒定的站点才回放, 该值
+       无 +1 延迟问题; 若切片路径分歧 (如走到 help CAS) → fail-closed) */
+    put32(&p, ldr_x_imm(31, 27, (unsigned)pl.off[rs]));
+    put32(&p, ldr_x_imm(24, 28, 32));   /* run.expected */
+    put32(&p, cmp_x(27, 28));
+    uint8_t *exp_ne = p;
+    put32(&p, bcond(0, 1));     /* b.ne limit_exit (占位) */
+    /* 纯结局回放: 不做任何内存写入! 写入目标在切片冻结堆里可能是
+       空闲 chunk (消费者缺席, 其 +8 是 tcache/free-list 指针), 覆盖
+       即腐蚀堆 → malloc #4 崩溃。主线程控制流完全由 ldar 值回放 +
+       CAS 结果 (Rs=old) 驱动, 不需要真实写队列。 */
+    put32(&p, ldr_x_imm(24, 23, 16));   /* Rs 值 = run.old */
+
+    /* set: 把最终 Rs 值写入保存槽, 恢复现场, 跳回 */
+    {
+        int rs_off = pl.off[rs];
+        if (rs_off < 0)
+            return 0;
+        uint8_t *set = p;
+        put32(&p, str_x_imm(31, 23, (unsigned)rs_off));
+        emit_plan_restore(&p, &pl);
+        uint64_t b_off = (uint64_t)(p - out);
+        put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
+
+        /* limit_exit: 兜底退出 (预算耗尽或校验失败) */
+        uint8_t *limit_exit = p;
+        put32(&p, ldr_x16_imm(16, CASREP_EXIT_ABS_OFF));
+        put32(&p, INSN_BR_X16);
+
+        int32_t d1 = (int32_t)(have - hs_b);
+        int32_t d2 = (int32_t)(have - hi_b);
+        int32_t d8 = (int32_t)(limit_exit - exp_ne);
+        uint32_t w;
+        w = bcond(d1, 2);   memcpy(hs_b, &w, 4);
+        w = bcond(d2, 8);   memcpy(hi_b, &w, 4);
+        w = bcond(d8, 1);   memcpy(exp_ne, &w, 4);
+        if (lim_b) {
+            uint32_t w6 = bcond((int32_t)(limit_exit - lim_b), 8);
+            memcpy(lim_b, &w6, 4);
+        }
+    }
+
+    uint64_t v = 0;         memcpy(out + CASREP_ORD_OFF, &v, 8);
+    v = 0;                  memcpy(out + CASREP_CURSOR_OFF, &v, 8);
+    v = runs_abs;           memcpy(out + CASREP_RUNS_ABS_OFF, &v, 8);
+    v = n_runs;             memcpy(out + CASREP_NRUNS_OFF, &v, 8);
+    v = load_limit;         memcpy(out + CASREP_LOAD_LIMIT_OFF, &v, 8);
+    v = exit_abs;           memcpy(out + CASREP_EXIT_ABS_OFF, &v, 8);
 
     return A64_ATOM_BLOCK_SIZE;
 }

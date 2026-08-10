@@ -52,6 +52,7 @@ int main(void)
         0xf8e08020U,    /* swpal x0,x0,[x1] */
         0xf8e00020U,    /* ldaddal x0,x0,[x1] */
         0x38208020U,    /* swp w0,w0,[x1] (32 位, bits14..10 非 11111) */
+        0xfce17fdfU,    /* 数据/字面量池误报样本 (python 二进制) */
         0xd503201fU,    /* nop */
     };
     for (size_t i = 0;

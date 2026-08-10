@@ -150,6 +150,7 @@ struct strict_site {
     int rec_id;                 /* syscall: 回放记录号 (-1=mock) */
     size_t ab_id;               /* atomic: 原子站点索引 */
     uint64_t ab_run_off;        /* atomic: 运行表在 blob 内的偏移 */
+    uint64_t cas_run_off;       /* atomic LSE CAS: 结局运行表偏移 */
 };
 
 /* ---- trace --atomic-replay 侧车 (atomics/) ---- */
@@ -163,6 +164,10 @@ struct ab_site {
 struct ab_run {
     uint64_t start;             /* 窗口内起始序号 (1-based) */
     uint64_t addr, value;
+};
+struct ab_cas_run {
+    uint64_t start;             /* 窗口内起始序号 (1-based) */
+    uint64_t addr, old, success, expected, desired;
 };
 struct atomic_build {
     int have;
@@ -178,6 +183,10 @@ struct atomic_build {
     size_t *run_off;            /* 站点 i 的 runs 起始索引 */
     size_t *run_cnt;
     unsigned char *synth_only;  /* 站点只有合成首段 (窗口内无事件) */
+    struct ab_cas_run *cas_runs; /* LSE CAS 结局运行段 (48B) */
+    size_t cas_n_runs;
+    size_t *cas_run_off;
+    size_t *cas_run_cnt;
 };
 
 /* 解析 compensation.txt: r_num/r_den + 逐检查点 {idx measured overhead orig} */
@@ -572,6 +581,89 @@ static void atomic_load(const char *dir, long from, long to,
     else
         fprintf(stderr, "atomic: %zu sites, %zu window run segments\n",
                 (size_t)n_sites, ab->n_runs);
+
+    /* LSE CAS 结局事件 (cas_events.bin, 56B/条) → 每站点 48B 运行段
+       {start, addr, old, success, expected, desired}。采集端已按
+       五元组游程压缩, 每条事件即一个运行段的起点。 */
+    ab->cas_run_off = xcalloc(n_sites ? n_sites : 1, sizeof(size_t));
+    ab->cas_run_cnt = xcalloc(n_sites ? n_sites : 1, sizeof(size_t));
+    snprintf(path, sizeof(path), "%s/atomics/cas_events.bin", dir);
+    FILE *cf = fopen(path, "rb");
+    if (cf) {
+        fseek(cf, 0, SEEK_END);
+        long csz = ftell(cf);
+        fseek(cf, 0, SEEK_SET);
+        uint8_t *cb = xmalloc(csz > 0 ? (size_t)csz : 1);
+        if (fread(cb, 1, (size_t)csz, cf) == (size_t)csz) {
+            const uint8_t *cp = cb;
+            const uint8_t *ce = cb + csz;
+            if (ce - cp >= 32 && rd_u64(&cp) == A64_AT_CAS_EVENTS_MAGIC &&
+                rd_u64(&cp) == 1) {
+                uint64_t n_cev = rd_u64(&cp);
+                rd_u64(&cp);            /* bytes */
+                for (uint64_t k = 0; k < n_cev &&
+                                  ce - cp >= 56; k++) {
+                    uint64_t site_id = rd_u64(&cp);
+                    uint64_t ord = rd_u64(&cp);
+                    uint64_t addr = rd_u64(&cp);
+                    uint64_t old = rd_u64(&cp);
+                    uint64_t success = rd_u64(&cp);
+                    uint64_t expected = rd_u64(&cp);
+                    uint64_t desired = rd_u64(&cp);
+                    if (site_id >= n_sites ||
+                        ab->sites[site_id].kind != 4)
+                        continue;
+                    if (ord <= ab->sites[site_id].from_ord ||
+                        ord > ab->sites[site_id].to_ord)
+                        continue;
+                    ab->cas_run_cnt[site_id]++;
+                }
+                size_t cacc = 0;
+                for (size_t i = 0; i < n_sites; i++) {
+                    ab->cas_run_off[i] = cacc;
+                    cacc += ab->cas_run_cnt[i];
+                }
+                ab->cas_runs = xcalloc(cacc ? cacc : 1,
+                                       sizeof(*ab->cas_runs));
+                ab->cas_n_runs = cacc;
+                size_t *cfilled = xcalloc(n_sites ? n_sites : 1,
+                                          sizeof(size_t));
+                cp = cb + 32;
+                for (uint64_t k = 0; k < n_cev &&
+                                  ce - cp >= 56; k++) {
+                    uint64_t site_id = rd_u64(&cp);
+                    uint64_t ord = rd_u64(&cp);
+                    uint64_t addr = rd_u64(&cp);
+                    uint64_t old = rd_u64(&cp);
+                    uint64_t success = rd_u64(&cp);
+                    uint64_t expected = rd_u64(&cp);
+                    uint64_t desired = rd_u64(&cp);
+                    if (site_id >= n_sites ||
+                        ab->sites[site_id].kind != 4)
+                        continue;
+                    if (ord <= ab->sites[site_id].from_ord ||
+                        ord > ab->sites[site_id].to_ord)
+                        continue;
+                    size_t o = ab->cas_run_off[site_id] +
+                               cfilled[site_id]++;
+                    ab->cas_runs[o].start =
+                        ord - ab->sites[site_id].from_ord;
+                    ab->cas_runs[o].addr = addr;
+                    ab->cas_runs[o].old = old;
+                    ab->cas_runs[o].success = success;
+                    ab->cas_runs[o].expected = expected;
+                    ab->cas_runs[o].desired = desired;
+                }
+                free(cfilled);
+                if (ab->cas_n_runs)
+                    fprintf(stderr,
+                            "atomic: %zu LSE CAS outcome runs\n",
+                            ab->cas_n_runs);
+            }
+        }
+        free(cb);
+        fclose(cf);
+    }
 
     /* 补偿系数与逐检查点账本 (Run 1 或 Run 2 的 compensation.txt) */
     atomic_comp_load(dir, ab);
@@ -1070,7 +1162,9 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                         (unsigned long long)ab->sites[i].pc);
                 continue;
             }
-            if (!ab->run_cnt[i] && !ab->synth_only[i])
+            if (ab->sites[i].kind == 4
+                    ? !ab->cas_run_cnt[i]
+                    : (!ab->run_cnt[i] && !ab->synth_only[i]))
                 continue;
             if (exit_override == ab->sites[i].pc) {
                 /* 窗口终点指令被替换为退出跳板, 该站点在切片中不会
@@ -1274,6 +1368,29 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 buf_append(blob, &r->start, 8);
                 buf_append(blob, &r->addr, 8);
                 buf_append(blob, &r->value, 8);
+            }
+        }
+    }
+
+    /* 5.5b LSE CAS 结局运行表 (每站点连续 48B 段) */
+    if (ab && ab->have) {
+        for (size_t i = 0; i < nsites; i++) {
+            struct strict_site *st = &sites[i];
+            if (st->kind != 4 ||
+                ab->sites[st->ab_id].kind != 4)
+                continue;
+            if (blob->size & 7)
+                buf_zero(blob, 8 - (blob->size & 7));
+            st->cas_run_off = blob->size;
+            size_t o = ab->cas_run_off[st->ab_id];
+            for (size_t k = 0; k < ab->cas_run_cnt[st->ab_id]; k++) {
+                struct ab_cas_run *r = &ab->cas_runs[o + k];
+                buf_append(blob, &r->start, 8);
+                buf_append(blob, &r->addr, 8);
+                buf_append(blob, &r->old, 8);
+                buf_append(blob, &r->success, 8);
+                buf_append(blob, &r->expected, 8);
+                buf_append(blob, &r->desired, 8);
             }
         }
     }
@@ -1501,7 +1618,55 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 unsigned rt, rn;
                 int kind;
                 struct a64_ld_addr ad, *adp = NULL;
-                if (ab->sites[st->ab_id].kind == 2 ||
+                size_t bl;
+                if (ab->sites[st->ab_id].kind == 4) {
+                    unsigned crs, crt, crn;
+                    if (!a64_is_lse_cas(
+                            ab->sites[st->ab_id].orig_insn,
+                            &crs, &crt, &crn))
+                        die("atomic: bad LSE CAS at %#llx",
+                            (unsigned long long)st->pc);
+                    if (ab->cas_run_cnt[st->ab_id] == 0)
+                        die("atomic: CAS site %#llx has no outcome runs",
+                            (unsigned long long)st->pc);
+                    /* 只回放 expected 恒定的站点 (如入队 CAS 恒 0):
+                       变化站点 (glibc malloc arena CAS 指针随分配
+                       切换) 回放录制指针会让 malloc 操作错误 arena
+                       → 堆损坏/abort。变化站点恢复原生 (冻结 arena
+                       自洽), 与未插桩行为一致。 */
+                    uint64_t exp0 =
+                        ab->cas_runs[ab->cas_run_off[st->ab_id]].expected;
+                    int const_exp = 1;
+                    for (size_t r = 0;
+                         r < ab->cas_run_cnt[st->ab_id]; r++) {
+                        if (ab->cas_runs[ab->cas_run_off[st->ab_id] + r]
+                                .expected != exp0) {
+                            const_exp = 0;
+                            break;
+                        }
+                    }
+                    if (!const_exp) {
+                        fprintf(stderr,
+                                "atomic: CAS site %#llx expected varies "
+                                "(%zu runs), native\n",
+                                (unsigned long long)st->pc,
+                                ab->cas_run_cnt[st->ab_id]);
+                        continue;
+                    }
+                    bl = a64_cas_replay_block(
+                        page + o, taddr + o,
+                        base + st->cas_run_off,
+                        ab->cas_run_cnt[st->ab_id],
+                        crs, crt, crn, st->pc + 4,
+                        ab->sites[st->ab_id].to_ord -
+                            ab->sites[st->ab_id].from_ord,
+                        base + STUB_STRICT_BAIL_OFF);
+                    fprintf(stderr,
+                            "atomic: CAS outcome replay site %#llx "
+                            "runs=%zu\n",
+                            (unsigned long long)st->pc,
+                            ab->cas_run_cnt[st->ab_id]);
+                } else if (ab->sites[st->ab_id].kind == 2 ||
                     ab->sites[st->ab_id].kind == 3) {
                     if (!a64_is_plain_load(
                             ab->sites[st->ab_id].orig_insn,
@@ -1514,8 +1679,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                                &size, &rt, &rn, &kind))
                     die("atomic: bad orig insn at %#llx",
                         (unsigned long long)st->pc);
-                size_t bl;
-                if (ab->run_cnt[st->ab_id] == 0) {
+                else if (ab->run_cnt[st->ab_id] == 0) {
                     /* 单段常量站点: 快速回放块 (值内嵌, 无游标/查表) */
                     bl = a64_atomic_replay_block_fast(
                         page + o, taddr + o, size, rt, rn, adp,
@@ -3484,6 +3648,9 @@ int build_main(int argc, char **argv)
     free(ab.runs);
     free(ab.run_off);
     free(ab.run_cnt);
+    free(ab.cas_run_off);
+    free(ab.cas_run_cnt);
+    free(ab.cas_runs);
     free(ab.ck_measured);
     free(ab.ck_orig);
 #endif

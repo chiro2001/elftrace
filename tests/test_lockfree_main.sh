@@ -70,14 +70,17 @@ NCK=$(wc -l < "$TF_TMP/lf_r2/manifest.txt")
     echo "FAIL: Run2 no events.bin"; exit 1; }
 
 # ---------- 发现主程序段内的 LSE CAS 站点 (显式开启强制成功) ----------
-# force-success 默认关闭 (CPython/libc 有状态 CAS 会被写坏); 本负载
-# 只对无锁队列入队 CAS (cas8_rel 的 casl) 开启。
+# 采集端 CAS 结局录制默认关闭 (实验性); 生产路径按 PC 显式开启
+# force-success, 只作用于主程序段里 real CAS (掩码 0x3FA07C00 +
+# 下一条 ret 过滤, 排除数据/字面量池误报)。
 CAS_ARGS=$(python3 - "$TF_TMP/lf_r2/ckpt_000000.elftrace" <<'EOF'
 import struct, sys
 f = open(sys.argv[1], "rb").read()
 segs_off, nsegs = struct.unpack_from("<QQ", f, 72)
 strings_off, strings_size = struct.unpack_from("<QQ", f, 112)
 payload_off = struct.unpack_from("<Q", f, 152)[0]
+M = 0x3FA07C00
+E = 0x08A07C00
 pcs = []
 for i in range(nsegs):
     vaddr, filesz, memsz, flags, poff, name_off = \
@@ -91,7 +94,14 @@ for i in range(nsegs):
     base = payload_off + poff
     for k in range(0, filesz - 3, 4):
         w = struct.unpack_from("<I", f, base + k)[0]
-        if (w & 0x08A07C00) == 0x08A07C00:
+        if (w & M) != E:
+            continue
+        if k + 4 >= filesz:
+            continue
+        nx = struct.unpack_from("<I", f, base + k + 4)[0]
+        if nx == 0xd65f03c0 or (nx & 0xFC000000) == 0x14000000 or \
+           (nx & 0xFF000010) == 0x54000000 or \
+           (nx & 0x7C000000) == 0x34000000:
             pcs.append(vaddr + k)
 for pc in pcs:
     print("--atomic-force-cas-pc 0x%x" % pc)
