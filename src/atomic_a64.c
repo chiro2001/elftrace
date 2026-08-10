@@ -245,6 +245,10 @@ int a64_is_ldar_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
         /* ldar 族 */
     } else if (base == 0x085FFC00U || base == 0x885FFC00U) {
         ex = 1;                 /* ldaxr 族 */
+    } else if (base == 0x085F7C00U || base == 0x885F7C00U) {
+        ex = 1;                 /* ldxr 族 (无 acquire, 与 ldaxr 同
+                                   回放路径: 屏障用 ldaxr 更严格,
+                                   语义无害) */
     } else {
         return 0;
     }
@@ -272,6 +276,8 @@ int a64_is_load_any(uint32_t w, int *size, unsigned *rt, unsigned *rn,
         /* ldar 族 */
     } else if (base == 0x085FFC00U || base == 0x885FFC00U) {
         ex = 1;                 /* ldaxr 族 */
+    } else if (base == 0x085F7C00U || base == 0x885F7C00U) {
+        ex = 1;                 /* ldxr 族 (无 acquire) */
     } else {
         uint32_t lbase = w & 0xFFC00000U;
         if (lbase == 0xB9400000U || lbase == 0xF9400000U) {
