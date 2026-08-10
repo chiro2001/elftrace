@@ -190,6 +190,8 @@ while read -r FROM_C TO_C; do
         --from-count "$FROM_C" --to-count "$TO_C" \
         --stack-reserve 67108864 $CAS_ARGS \
         > "$TF_TMP/lff_build.log" 2>&1 || continue
+    grep -q "CAS outcome replay site" "$TF_TMP/lff_build.log" || {
+        echo "  build: 无结局回放站点, 试下一候选"; continue; }
     timeout 120 perf stat -e instructions "$TF_TMP/lff_slice.elf" \
         > /dev/null 2> "$TF_TMP/lff.perf"
     RC=$?
@@ -208,6 +210,61 @@ EOF
 [ "$SELECTED" = 1 ] || {
     echo "FAIL: 无候选窗口得到 rc∈{0,67}"
     exit 1; }
+
+# 断言: 选中的窗口内结局回放真实消费了 help/失败事件
+python3 - "$TF_TMP/lff_r2" "$FROM_C" "$TO_C" <<'EOF'
+import struct, sys
+d, frm, to = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+b = open(d + "/atomics/sites.bin", "rb").read()
+off = 0
+def u64():
+    global off
+    v = struct.unpack_from("<Q", b, off)[0]
+    off += 8
+    return v
+u64(); u64(); n = u64(); u64(); u64(); np = u64(); u64(); u64(); u64()
+off += np * 8
+pcs = []
+for i in range(n):
+    pc = u64(); w, kind = struct.unpack_from("<II", b, off)
+    off += 8
+    pcs.append((pc, kind))
+def ckpt(k):
+    bb = open("%s/atomics/ckpt_%06d.bin" % (d, k), "rb").read()
+    return [struct.unpack_from("<QQQ", bb, 24 + i * 24)[0]
+            for i in range(n)]
+man = open(d + "/manifest.txt").read().splitlines()
+cnt = [int(l.split()[0]) for l in man]
+def idx(c):
+    for i in range(len(cnt) - 1):
+        if cnt[i] <= c < cnt[i + 1]:
+            return i
+    return len(cnt) - 1
+k0, k1 = idx(frm), idx(to)
+f0, f1 = ckpt(k0), ckpt(k1)
+cev = open(d + "/atomics/cas_events.bin", "rb").read()
+ncev = struct.unpack_from("<Q", cev, 16)[0]
+help_ev = fail_ev = 0
+for k in range(ncev):
+    sid, ordv, addr, old, success, expected, desired = \
+        struct.unpack_from("<QQQQQQQ", cev, 32 + k * 56)
+    pc, kind = pcs[sid]
+    if kind != 4:
+        continue
+    if f0[sid][0] < ordv <= f1[sid][0]:
+        if expected != 0:
+            help_ev += 1
+        if success == 0:
+            fail_ev += 1
+print("window help_events=%d fail_events=%d" % (help_ev, fail_ev))
+if help_ev == 0:
+    sys.exit(2)
+EOF
+case $? in
+    0) ;;
+    2) echo "FAIL: 窗口内无 help 事件被回放 (队列没满?)"; exit 1 ;;
+    *) echo "FAIL: 窗口事件分析错误"; exit 1 ;;
+esac
 
 # ---------- 目标阶段零 syscall ----------
 timeout 120 strace -o "$TF_TMP/lff_slice.strace" \

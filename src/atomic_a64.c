@@ -439,6 +439,8 @@ int a64_is_lse_cas(uint32_t w, unsigned *rs, unsigned *rt,
 {
     if ((w & 0x3FA07C00U) != 0x08A07C00U)
         return 0;
+    if (((w >> 30) & 3U) < 2)
+        return 0;               /* CASB/CASH (size 00/01): 不支持, 原生 */
     if (rs)
         *rs = (w >> 16) & 0x1FU;
     if (rt)
@@ -1059,7 +1061,7 @@ static void emit_replay_tel(uint8_t **pp, uint64_t tel_abs,
     put32(&p, movz_x(14, 0x4554, 0));       /* "TELM" LE */
     put32(&p, movk_x(14, 0x4D4C, 1));
     put32(&p, str_x_imm(16, 14, 0));        /* magic */
-    put32(&p, movz_x(14, 1, 0));            /* reason=1: replay bail */
+    put32(&p, mov_x(14, 22));               /* reason = x22 (调用方设) */
     put32(&p, str_x_imm(16, 14, 8));
     put32(&p, ldr_x_imm(15, 14, site_pc_off));
     put32(&p, str_x_imm(16, 14, 16));       /* site_pc */
@@ -1106,6 +1108,7 @@ size_t a64_cas_replay_block(uint8_t *out, uint64_t block_abs,
     put32(&p, ldr_x16_imm(17, CASREP_LOAD_LIMIT_OFF));
     put32(&p, cmp_x(19, 17));
     uint8_t *lim_b = p;
+    put32(&p, movz_x(22, 1, 0));    /* reason=1: ordinal 预算 */
     put32(&p, bcond(0, 8));     /* b.hi limit_exit (占位) */
 
     /* 游标推进: while (cursor+1 < n_runs && runs[cursor+1].start <= ord) */
@@ -1138,6 +1141,7 @@ size_t a64_cas_replay_block(uint8_t *out, uint64_t block_abs,
     put32(&p, ldr_x_imm(24, 28, 32));   /* run.expected */
     put32(&p, cmp_x(27, 28));
     uint8_t *exp_ne = p;
+    put32(&p, movz_x(22, 3, 0));    /* reason=3: expected 失配 */
     put32(&p, bcond(0, 1));     /* b.ne limit_exit (占位) */
     /* 纯结局回放: 不做任何内存写入! 写入目标在切片冻结堆里可能是
        空闲 chunk (消费者缺席, 其 +8 是 tcache/free-list 指针), 覆盖
@@ -1345,6 +1349,7 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
     uint8_t *limit_exit = NULL;
     if (exit_abs) {
         limit_exit = p;
+        put32(&p, movz_x(22, 1, 0));    /* reason=1: ordinal 预算 */
         if (tel_abs) {
             emit_replay_tel(&p, tel_abs, REP_SITE_PC_OFF);
         } else {
@@ -1486,6 +1491,7 @@ size_t a64_atomic_replay_block_fast(uint8_t *out, uint64_t block_abs,
     uint8_t *limit_exit = NULL;
     if (exit_abs && load_limit) {
         limit_exit = p;
+        put32(&p, movz_x(22, 1, 0));    /* reason=1: ordinal 预算 */
         if (tel_abs) {
             emit_replay_tel(&p, tel_abs, FAST_SITE_PC_OFF);
         } else {
