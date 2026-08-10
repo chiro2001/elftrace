@@ -1556,8 +1556,11 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 size_t bl3 = a64_lse_cas_trampoline(
                     page + o, taddr + o, w, pc + 4);
                 if (!bl3)
-                    die("atomic: bad LSE CAS at %#llx",
-                        (unsigned long long)pc);
+                    die("atomic: bad LSE CAS at %#llx (insn %08x, "
+                        "rs=%u rt=%u rn=%u)",
+                        (unsigned long long)pc, w,
+                        (w >> 16) & 0x1FU, w & 0x1FU,
+                        (w >> 5) & 0x1FU);
                 uint32_t bw = a64_patch_b(pc, taddr + o);
                 memcpy(segp + (pc - segs[gi].vaddr), &bw, 4);
                 fprintf(stderr,

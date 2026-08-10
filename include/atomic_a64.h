@@ -140,14 +140,18 @@ int a64_is_excl_load(uint32_t w, int *size, unsigned *rt,
 /* ---- LSE CAS 族 (cas/casa/casl/casal, 32/64 位) ----
  * 编码 (ARM ARM):
  *   [31:30] size (00=w, 11=x)
- *   [29:24] 001000 (bit27=1, bit22=0)
+ *   bit27=1; [23:22]=1L (bit22=L, acquire)
  *   [23:21] = 101 (CAS 族)
  *   [20:16] Rs = 期望值 (CAS 成功后返回旧值)
- *   [15]    L (acquire), [16] A (release)
+ *   [15]    o0 (casl/casal 置位)
  *   [14:10] 11111
  *   [9:5]   Rn = 地址
  *   [4:0]   Rt = 新值
- * 匹配掩码: (w & 0x3FE07C00) == 0x08A07C00。 */
+ * 匹配掩码: (w & 0x08A07C00) == 0x08A07C00 —— 只钉 bit27/bit23/
+ * bit21/bits14..10, bit22 (L) 与 bit15 (o0) 不参与 (casa/casal 的
+ * bit22=1, 旧掩码 0x3FE07C00 会漏掉它们)。实测编码:
+ *   cas=0xc8a07c22 casl=0xc8a0fc22 casa=0xc8e07c22 casal=0xc8e0fc22
+ *   (swpal=0xf8e08020 ldaddal=0xf8e00020 均被 bits14..10 排除)。 */
 int a64_is_lse_cas(uint32_t w, unsigned *rs, unsigned *rt,
                    unsigned *rn);
 
