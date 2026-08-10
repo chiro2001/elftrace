@@ -70,10 +70,12 @@ NCK=$(wc -l < "$TF_TMP/lf_r2/manifest.txt")
 [ -f "$TF_TMP/lf_r2/atomics/events.bin" ] || {
     echo "FAIL: Run2 no events.bin"; exit 1; }
 
-# ---------- 发现主程序段内的 LSE CAS 站点 (显式开启强制成功) ----------
+# ---------- 发现 LSE CAS 站点 ----------
 # 采集端 CAS 结局录制默认关闭 (实验性); 生产路径按 PC 显式开启
 # force-success, 只作用于主程序段里 real CAS (掩码 0x3FA07C00 +
-# 下一条 ret 过滤, 排除数据/字面量池误报)。
+# 下一条 ret 过滤, 排除数据/字面量池误报)。库 (libc 等) 的共享
+# 有状态 CAS (malloc arena) 结局回放会因冻结态与录制态分歧而
+# fail-closed, 实验路径显式 skip 让它们原生执行。
 CAS_ARGS=$(python3 - "$TF_TMP/lf_r2/ckpt_000000.elftrace" <<'EOF'
 import struct, sys
 f = open(sys.argv[1], "rb").read()
@@ -90,8 +92,9 @@ for i in range(nsegs):
     if 0 < name_off < strings_size:
         e = f.find(b"\0", strings_off + name_off)
         name = f[strings_off + name_off:e]
-    if not (flags & 1) or b"prog_lockfree_main" not in name:
+    if not (flags & 1):
         continue
+    main_seg = b"prog_lockfree_main" in name
     base = payload_off + poff
     for k in range(0, filesz - 3, 4):
         w = struct.unpack_from("<I", f, base + k)[0]
@@ -103,13 +106,26 @@ for i in range(nsegs):
         if nx == 0xd65f03c0 or (nx & 0xFC000000) == 0x14000000 or \
            (nx & 0xFF000010) == 0x54000000 or \
            (nx & 0x7C000000) == 0x34000000:
-            pcs.append(vaddr + k)
+            pcs.append((vaddr + k, main_seg))
 for pc in pcs:
-    print("--atomic-force-cas-pc 0x%x" % pc)
+    if pc[1]:
+        print("--atomic-force-cas-pc 0x%x" % pc[0])
+    else:
+        print("--atomic-skip-pc 0x%x" % pc[0])
 EOF
 )
 [ -n "$CAS_ARGS" ] || {
     echo "FAIL: no LSE CAS found in main executable segment"
+    exit 1; }
+if [ -n "${ELFTRACE_CAS_RECORD:-}" ]; then
+    # 实验: 库 CAS skip (原生), 主程序 CAS 走结局回放
+    CAS_ARGS=$(echo "$CAS_ARGS" | grep -- --atomic-skip-pc)
+else
+    # 生产: 主程序 CAS force-success, 库 CAS 本就无事件不受影响
+    CAS_ARGS=$(echo "$CAS_ARGS" | grep -- --atomic-force-cas-pc)
+fi
+[ -n "$CAS_ARGS" ] || {
+    echo "FAIL: no usable CAS sites for this mode"
     exit 1; }
 echo "atomic: force-cas sites: $(echo $CAS_ARGS | wc -w)"
 
@@ -272,9 +288,13 @@ EOF
 )
 [ "$NEV" -gt 0 ] || { echo "FAIL: no recorded atomic events"; exit 1; }
 
-NCAS=$(grep -c "force-success LSE CAS" "$TF_TMP/lf_build.log")
+if [ -n "${ELFTRACE_CAS_RECORD:-}" ]; then
+    NCAS=$(grep -c "CAS outcome replay site" "$TF_TMP/lf_build.log")
+else
+    NCAS=$(grep -c "force-success LSE CAS" "$TF_TMP/lf_build.log")
+fi
 [ "$NCAS" -gt 0 ] || {
-    echo "FAIL: no LSE CAS force-success site (server lacks casl?)"
+    echo "FAIL: no LSE CAS replay site"
     exit 1; }
 
 tf_pass "atomic lockfree main (rc=0, clean, ratio $R%, $NEV events, $NCAS cas)"
