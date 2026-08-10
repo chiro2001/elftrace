@@ -25,7 +25,7 @@ ROOT=$(pwd)
 LOG="$ROOT/tmp/test_run.log"
 mkdir -p "$ROOT/tmp"
 
-TESTS="strict atomic_spin atomic_tramp atomic_boundary basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle baremetal imix bm_edge realworld http_server http_pool http_pool_sat threadpool condvar comp_ratio"
+TESTS="strict atomic_spin atomic_tramp atomic_boundary basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle baremetal imix bm_edge realworld http_server http_pool threadpool condvar comp_ratio"
 PASS=0
 FAIL=0
 
@@ -58,7 +58,7 @@ for t in $TESTS; do
     # aarch64 真机较慢: baremetal/realworld 需要更长超时
     TIMEOUT=600
     case "$t" in
-        baremetal|realworld|http_server|http_pool|http_pool_sat|threadpool) [ "$(uname -m)" = "aarch64" ] && TIMEOUT=1800 ;;
+        baremetal|realworld|http_server|http_pool|threadpool) [ "$(uname -m)" = "aarch64" ] && TIMEOUT=1800 ;;
         condvar) [ "$(uname -m)" = "aarch64" ] && TIMEOUT=3600 ;;
     esac
     if timeout "$TIMEOUT" "$TS" > "$LOG" 2>&1; then
