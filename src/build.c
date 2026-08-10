@@ -526,17 +526,16 @@ static void atomic_load(const char *dir, long from, long to,
                             ord > ab->sites[site_id].to_ord)
                             continue;
                         size_t o = ab->run_off[site_id] + filled[site_id]++;
-                        /* 原子站点: 保留 +1 (合成首段覆盖窗口第一次
-                           读, 首个事件值相对冻结内存超前, 曾致 SPSC
-                           从"队列已满"开始自旋)。普通 load (分配器
-                           链): 必须用 ord-from_ord —— 若 worker 在
-                           检查点与窗口首次读之间改写链头, 首次读的
-                           真实值就是首个事件, 合成旧值会把整个 pop
-                           链错位 (HTTP 确定性崩)。 */
+                        /* canonical RLE clipping (round-17 gpt 评审):
+                           合成首段 (start=1, from_val) 只填补首个真实
+                           事件之前的 ordinal 空洞; 真实事件一律
+                           start = ord - from_ord。首个事件恰在 C+1 时
+                           与合成段同 start, 游标会推进到真实事件
+                           (真实值生效), 不再无条件 +1 延迟。load 与
+                           CAS 统一此规则后跨站点 ordinal 对齐, 结局
+                           回放可按访问序号命中正确事件。 */
                         ab->runs[o].start = ord -
-                            ab->sites[site_id].from_ord +
-                            (ab->sites[site_id].kind == 2 ||
-                             ab->sites[site_id].kind == 3 ? 0 : 1);
+                            ab->sites[site_id].from_ord;
                         ab->runs[o].addr = addr;
                         ab->runs[o].value = value;
                     }
@@ -1626,33 +1625,30 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                             &crs, &crt, &crn))
                         die("atomic: bad LSE CAS at %#llx",
                             (unsigned long long)st->pc);
-                    if (ab->cas_run_cnt[st->ab_id] == 0)
-                        die("atomic: CAS site %#llx has no outcome runs",
-                            (unsigned long long)st->pc);
-                    /* 只回放 expected 恒定的站点 (如入队 CAS 恒 0):
-                       变化站点 (glibc malloc arena CAS 指针随分配
-                       切换) 回放录制指针会让 malloc 操作错误 arena
-                       → 堆损坏/abort。变化站点恢复原生 (冻结 arena
-                       自洽), 与未插桩行为一致。 */
-                    uint64_t exp0 =
-                        ab->cas_runs[ab->cas_run_off[st->ab_id]].expected;
-                    int const_exp = 1;
-                    for (size_t r = 0;
-                         r < ab->cas_run_cnt[st->ab_id]; r++) {
-                        if (ab->cas_runs[ab->cas_run_off[st->ab_id] + r]
-                                .expected != exp0) {
-                            const_exp = 0;
+                    /* 正交性: --atomic-force-cas-pc 显式列出的站点
+                       一律走 force-success 跳板, 无视 cas_events
+                       (采集端开不开 CAS 插桩不改变 force-cas 构建
+                       产物行为, round-17 矩阵 #5 回归)。 */
+                    int force = 0;
+                    for (size_t f = 0; f < g_n_force_cas; f++)
+                        if (g_force_cas_pcs[f] == st->pc) {
+                            force = 1;
                             break;
                         }
-                    }
-                    if (!const_exp) {
+                    if (force) {
+                        bl = a64_lse_cas_trampoline(
+                            page + o, taddr + o,
+                            ab->sites[st->ab_id].orig_insn,
+                            st->pc + 4);
                         fprintf(stderr,
-                                "atomic: CAS site %#llx expected varies "
-                                "(%zu runs), native\n",
+                                "atomic: force-success LSE CAS %#llx "
+                                "-> %#llx (forced)\n",
                                 (unsigned long long)st->pc,
-                                ab->cas_run_cnt[st->ab_id]);
-                        continue;
-                    }
+                                (unsigned long long)(taddr + o));
+                    } else {
+                        if (ab->cas_run_cnt[st->ab_id] == 0)
+                            die("atomic: CAS site %#llx has no outcome "
+                                "runs", (unsigned long long)st->pc);
                     bl = a64_cas_replay_block(
                         page + o, taddr + o,
                         base + st->cas_run_off,
@@ -1661,11 +1657,12 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                         ab->sites[st->ab_id].to_ord -
                             ab->sites[st->ab_id].from_ord,
                         base + STUB_STRICT_BAIL_OFF);
-                    fprintf(stderr,
-                            "atomic: CAS outcome replay site %#llx "
-                            "runs=%zu\n",
-                            (unsigned long long)st->pc,
-                            ab->cas_run_cnt[st->ab_id]);
+                        fprintf(stderr,
+                                "atomic: CAS outcome replay site %#llx "
+                                "runs=%zu\n",
+                                (unsigned long long)st->pc,
+                                ab->cas_run_cnt[st->ab_id]);
+                    }
                 } else {
                     if (ab->sites[st->ab_id].kind == 2 ||
                         ab->sites[st->ab_id].kind == 3) {
