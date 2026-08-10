@@ -412,7 +412,7 @@ int a64_is_excl_store(uint32_t w, int *size, unsigned *rs,
 int a64_is_excl_load(uint32_t w, int *size, unsigned *rt,
                      unsigned *rn, int *acquire)
 {
-    uint32_t m = w & 0x3F007C00U;
+    uint32_t m = w & 0x3F00FC00U;   /* 含 bit15: LDXR(0)/LDAXR(1) 可辨 */
     if (m != 0x0800FC00U && m != 0x08007C00U)
         return 0;
     if (!((w >> 22) & 1U))

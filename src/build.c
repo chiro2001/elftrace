@@ -733,6 +733,10 @@ static int a64_in_exec_ranges(const uint64_t ranges[][2], int nr,
 static uint32_t a64_patch_b(uint64_t from, uint64_t to)
 {
     int64_t d = (int64_t)(to - from);
+    if (d > (127LL << 20) || d < (-128LL << 20))
+        die("atomic: branch out of range %#llx -> %#llx (dist %+lld)",
+            (unsigned long long)from, (unsigned long long)to,
+            (long long)d);
     return 0x14000000U |
            (((uint32_t)((uint64_t)d >> 2)) & 0x03FFFFFFU);
 }
@@ -1389,9 +1393,9 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 for (size_t k2 = k + 4;
                      k2 + 4 <= segs[gi].filesz && k2 < k + 4 + 256;
                      k2 += 4) {
-                    uint32_t w;
-                    memcpy(&w, segp + k2, 4);
-                    if (!a64_is_excl_store(w, NULL, NULL, NULL, NULL,
+                    uint32_t w2;
+                    memcpy(&w2, segp + k2, 4);
+                    if (!a64_is_excl_store(w2, NULL, NULL, NULL, NULL,
                                            NULL))
                         continue;
                     uint64_t pc = segs[gi].vaddr + k2;
@@ -1405,8 +1409,9 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                         stx_pcs[n_stx++] = pc;
                     /* 比较序列检测: ldxr 之后、stlxr 之前找
                        cmp <rt>,<rs> 与 b.ne (64/32 位) */
-                    unsigned rt = 0;
-                    a64_is_excl_load(w, NULL, &rt, NULL, NULL);
+                    unsigned rt;
+                    if (!a64_is_excl_load(w, NULL, &rt, NULL, NULL))
+                        rt = 0;
                     int cmp_off = -1;
                     unsigned cmp_rs = 0;
                     int w32 = 0;

@@ -26,6 +26,7 @@ int main(void)
 {
     unsigned rs, rt, rn;
     int size;
+    int acq;
 
     /* LSE CAS 四变体 × 64/32 位 */
     static const uint32_t cas64[] = {
@@ -65,6 +66,12 @@ int main(void)
           "stlxr register decode wrong");
     CHECK(a64_is_excl_store(0xc8037c22U, NULL, NULL, NULL, NULL, NULL),
           "stxr not recognized as excl store");
+    CHECK(a64_is_excl_store(0xc8037c22U, NULL, NULL, NULL, NULL, &acq),
+          "stxr not recognized as excl store (acquire out)");
+    CHECK(acq == 0, "stxr release flag wrong (should be 0)");
+    CHECK(a64_is_excl_store(0xc811fc41U, NULL, NULL, NULL, NULL, &acq),
+          "stlxr not recognized as excl store (acquire out)");
+    CHECK(acq == 1, "stlxr release flag wrong (should be 1)");
     CHECK(!a64_is_excl_store(0xc85f7c40U, NULL, NULL, NULL, NULL, NULL),
           "ldxr misclassified as excl store");
     CHECK(!a64_is_excl_store(0xc8dffc20U, NULL, NULL, NULL, NULL, NULL),
@@ -77,6 +84,12 @@ int main(void)
     /* a64_is_excl_load: load 类命中, store 拒绝 */
     CHECK(a64_is_excl_load(0xc85f7c40U, &size, &rt, &rn, NULL),
           "ldxr not recognized as excl load");
+    CHECK(a64_is_excl_load(0xc85f7c40U, NULL, NULL, NULL, &acq),
+          "ldxr not recognized as excl load (acquire out)");
+    CHECK(acq == 0, "ldxr acquire flag wrong (should be 0)");
+    CHECK(a64_is_excl_load(0xc85ffc40U, NULL, NULL, NULL, &acq),
+          "ldaxr not recognized as excl load");
+    CHECK(acq == 1, "ldaxr acquire flag wrong (should be 1)");
     CHECK(a64_is_excl_load(0xc8dffc20U, NULL, NULL, NULL, NULL),
           "ldar not recognized as excl load");
     CHECK(!a64_is_excl_load(0xc811fc41U, NULL, NULL, NULL, NULL),
