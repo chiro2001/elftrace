@@ -392,9 +392,10 @@ int a64_is_excl_store(uint32_t w, int *size, unsigned *rs,
     uint32_t m = w & 0x3F00FC00U;
     if (m != 0x0800FC00U && m != 0x08007C00U)
         return 0;
-    if ((w >> 22) & 1U)
-        return 0;               /* bit22=1: ldxr/ldar/LSE CAS 是 load,
-                                   不是排他 store */
+    /* bits[22:21] 判别: stxr/stlxr=00; ldxr/ldar=10 (load);
+       LSE CAS (cas/casa/casl/casal) = 01/11 (bit21=1) */
+    if (((w >> 21) & 3U) != 0)
+        return 0;
     if (size)
         *size = (int)((w >> 30) & 3U);
     if (rs)
@@ -416,6 +417,8 @@ int a64_is_excl_load(uint32_t w, int *size, unsigned *rt,
         return 0;
     if (!((w >> 22) & 1U))
         return 0;               /* stxr/stlxr (store) */
+    if ((w >> 21) & 1U)
+        return 0;               /* bit21=1: LSE CAS 族, 不是排他 load */
     if (size)
         *size = (int)((w >> 30) & 3U);
     if (rt)

@@ -27,7 +27,7 @@ ROOT=$(pwd)
 LOG="$ROOT/tmp/test_run.log"
 mkdir -p "$ROOT/tmp"
 
-TESTS="strict atomic_spin lockfree_main atomic_tramp atomic_boundary basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle baremetal imix bm_edge realworld http_server http_pool threadpool condvar comp_ratio"
+TESTS="strict atomic_spin lockfree_main atomic_tramp atomic_boundary atomic_encoding basic dbg fd ipc cpp fd_rw py syscall stack bigmem thread append bareheap interval bundle baremetal imix bm_edge realworld http_server http_pool threadpool condvar comp_ratio"
 PASS=0
 FAIL=0
 
