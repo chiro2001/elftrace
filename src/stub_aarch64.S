@@ -1648,7 +1648,7 @@ apply_dirty_filtered:
  * 每条 entry: {vaddr u64, n_gran u32, mode u32, size u32, pad u32};
  *   mode=1: {off u32, data[32]} × n_gran
  *   mode=2: data[size] 整段
- * 破坏 x18-x22, x24, x26; x23 (rec base) 保留。 */
+ * 破坏 x4-x11, x18-x22, x24, x26; x23 (rec base) 保留。 */
 apply_rec_runs:
     ldr  x18, [x25, #40]            /* n_newseg (emitted) */
     ldr  x19, [x25, #48]
@@ -1692,6 +1692,8 @@ arr_entry:
     ldr  x8, [x7, #8]
     cmp  x20, x8
     b.hs arr_noguard
+    cmp  w22, #3
+    beq  arr_skip_64
     cmp  w22, #2
     beq  arr_skip_full
     mov  x8, x21
@@ -1699,10 +1701,18 @@ arr_entry:
     mul  x8, x8, x9
     add  x19, x19, x8
     b    arr_next
+arr_skip_64:
+    mov  x8, x21
+    mov  x9, #72
+    mul  x8, x8, x9
+    add  x19, x19, x8
+    b    arr_next
 arr_skip_full:
     add  x19, x19, x26
     b    arr_next
 arr_noguard:
+    cmp  w22, #3
+    beq  arr_gran64
     cmp  w22, #2
     beq  arr_full
 arr_gran:
@@ -1717,6 +1727,21 @@ arr_gran:
     add  x19, x19, #36
     sub  w21, w21, #1
     b    arr_gran
+arr_gran64:
+    cbz  w21, arr_next
+    ldr  w24, [x19]             /* off */
+    add  x0, x20, x24
+    ldp  x4, x5, [x19, #8]
+    ldp  x6, x7, [x19, #24]
+    ldp  x8, x9, [x19, #40]
+    ldp  x10, x11, [x19, #56]
+    stp  x4, x5, [x0]
+    stp  x6, x7, [x0, #16]
+    stp  x8, x9, [x0, #32]
+    stp  x10, x11, [x0, #48]
+    add  x19, x19, #72
+    sub  w21, w21, #1
+    b    arr_gran64
 arr_full:
     mov  x0, x20
     mov  x1, x19

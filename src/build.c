@@ -1882,10 +1882,12 @@ static void blob_patch_u64(uint8_t *blob, uint64_t off, uint64_t val)
     memcpy(blob + off, &val, 8);
 }
 
-/* 生成一条 newseg/dirty 的 32B granule 记录:
+/* 生成一条 newseg/dirty 的 32B/64B granule 记录:
  *   非空时向 out 追加 entry {vaddr u64, n_gran u32, mode u32,
  *   size u32, pad u32}:
  *     mode=1: {off u32, data[32]} × n_gran (稀疏 granule 拷贝)
+ *     mode=3: {off u32, data[64]} × n_gran (整页无指针变化,
+ *             64B granule, 回放指令数减半)
  *     mode=2: data[size] 整段 (密集内容, 整段拷贝更省指令)
  *   末个不完整 granule 以 0 填充 (BSS 语义, 防越界写)。
  * 返回 1 = 发射, 0 = 预状态与目标一致 (整体跳过)。 */
@@ -1927,6 +1929,18 @@ static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
 {
     uint32_t ng = 0, full = 0;
     int any_ptr = 0;        /* 页内存在"指针保护"granule → 强制 mode 1 */
+    /* 64B granule (mode=3) 安全条件: 整页没有任何指针型 8B 变化
+       (否则 64B 窗口会把指针旁标量一起丢弃, 粒度损失加倍)。 */
+    int no_ptr_64 = 1;
+    if (ptr_filter) {
+        for (size_t g = 0; g < n; g += 64) {
+            size_t len = n - g < 64 ? n - g : 64;
+            if (gran_emitable(oldp + g, newp + g, len) < 0) {
+                no_ptr_64 = 0;
+                break;
+            }
+        }
+    }
     for (size_t g = 0; g < n; g += 32) {
         size_t len = n - g < 32 ? n - g : 32;
         int em = ptr_filter ? gran_emitable(oldp + g, newp + g, len) : 1;
@@ -1947,8 +1961,19 @@ static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
     }
     if (!ng)
         return 0;
-    uint32_t mode = read_set ? 1 :
-                    (any_ptr ? 1 : (full >= 1536 ? 2 : 1));
+    uint32_t mode;
+    if (!read_set && no_ptr_64 && (n % 64) == 0) {
+        /* 整页无指针型变化: 64B granule (只发射有变化的块),
+           回放指令数约减半 */
+        mode = 3;
+        ng = 0;
+        for (size_t g = 0; g < n; g += 64)
+            if (memcmp(oldp + g, newp + g, 64) != 0)
+                ng++;
+    } else {
+        mode = read_set ? 1 :
+               (any_ptr ? 1 : (full >= 1536 ? 2 : 1));
+    }
                             /* 读集过滤时只能逐 granule (整段会写回
                                未被读的字节) */
     if (mode_out)
@@ -1956,7 +1981,8 @@ static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
     if (gran_out)
         *gran_out = ng;
     uint32_t n32 = (uint32_t)ng;
-    uint32_t size = (uint32_t)(mode == 2 ? n : ng * 32);
+    uint32_t size = (uint32_t)(mode == 2 ? n :
+                               (mode == 3 ? ng * 72 : ng * 32));
     uint32_t pad = 0;
     buf_append(out, &vaddr, 8);
     buf_append(out, &n32, 4);
@@ -1965,6 +1991,20 @@ static uint32_t emit_granules(struct buf *out, uint64_t vaddr,
     buf_append(out, &pad, 4);
     if (mode == 2) {
         buf_append(out, newp, n);
+        return 1;
+    }
+    if (mode == 3) {
+        /* 64B granule: {off u32, pad u32, data[64]} (72B, 数据 8 对齐);
+           只发射有变化的块 */
+        for (size_t g = 0; g < n; g += 64) {
+            if (memcmp(oldp + g, newp + g, 64) == 0)
+                continue;
+            uint32_t off = (uint32_t)g;
+            uint32_t pad = 0;
+            buf_append(out, &off, 4);
+            buf_append(out, &pad, 4);
+            buf_append(out, newp + g, 64);
+        }
         return 1;
     }
     for (size_t g = 0; g < n; g += 32) {
@@ -3519,6 +3559,10 @@ int build_main(int argc, char **argv)
                         data_insns += (uint64_t)ng * 16;
                         granules_total += ng;
                         p += 24 + (size_t)ng * 36;
+                    } else if (mode == 3) {
+                        data_insns += (uint64_t)ng * 13;
+                        granules_total += ng;
+                        p += 24 + (size_t)ng * 72;
                     } else {
                         data_insns += (uint64_t)size / 32 * 6;
                         p += 24 + size;
