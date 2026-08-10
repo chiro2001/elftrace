@@ -2288,5 +2288,15 @@ se_exit:
     svc  #0
     b    .
 
+/* 原子/值回放负载上限兜底退出: 与正常窗口结束 (rc=0) 区分, 用 67
+ * 标记“分歧/自旋达到回放预算”。探针/测试据此识别静默分歧, 而不是
+ * 把兜底退出误判为探针通过。 */
+.org STUB_STRICT_BAIL_OFF
+strict_limit_exit:
+    mov  x0, #67
+    mov  x8, #94
+    svc  #0
+    b    .
+
 /* 代码区末尾: 补齐到固定区大小 */
     .org STUB_FIXED_SIZE

@@ -1390,7 +1390,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                         st->pc + 4,
                         ab->sites[st->ab_id].to_ord -
                             ab->sites[st->ab_id].from_ord,
-                        base + STUB_STRICT_EXIT_OFF, kind,
+                        base + STUB_STRICT_BAIL_OFF, kind,
                         ab->runs[ab->run_off[st->ab_id]].value,
                         ab->runs[ab->run_off[st->ab_id]].addr);
                 } else {
@@ -1402,7 +1402,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                         size, rt, rn, st->pc + 4,
                         ab->sites[st->ab_id].to_ord -
                             ab->sites[st->ab_id].from_ord,
-                        base + STUB_STRICT_EXIT_OFF, kind, adp);
+                        base + STUB_STRICT_BAIL_OFF, kind, adp);
                 }
                 if (!bl)
                     die("atomic: cannot generate replay block at %#llx",
