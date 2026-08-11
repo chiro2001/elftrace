@@ -33,7 +33,7 @@ enum {
 };
 
 #define ALLOC_BUF_MAGIC   0x434F4C41ULL   /* "ALOC" */
-#define ALLOC_BUF_VERSION 1
+#define ALLOC_BUF_VERSION 2               /* v2: 40B 事件 + extra 字段 */
 #define ALLOC_BUF_HDR_SIZE 64
 #define ALLOC_EVENT_SIZE  40
 

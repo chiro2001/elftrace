@@ -409,9 +409,6 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
     put32(p, astr(15, 16, ALLOC_DIAG_CNT_OFF));
     put32(p, aldr(21, 16, ALLOC_KIND_OFF));
     put32(p, astr(21, 18, 0));
-    /* pad u32: realloc=new_size(x1) / calloc=elem_size(x1);
-       malloc/free 无用 (0)。构建端离线算 realloc copy_len 用。 */
-    put32(p, astr_w(1, 18, 4));
     put32(p, aldr(21, 31, 32)); /* size (E-64, sp=E-96) */
     put32(p, astr(21, 18, 8));
     put32(p, aldr(21, 31, 48)); /* caller x30 (E-48, sp=E-96) */
@@ -423,8 +420,9 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
     put32(p, aldr(30, 16, ALLOC_RET_LABEL_OFF));
     /* 原函数会访问其栈帧上方的溢出区 (glibc sp+偏移), 与跳板保存槽
        冲突 (曾把 caller x30 槽写坏 → 返回地址变事件地址 → SIGBUS)。
-       压 0x200 缓冲垫, 原函数帧与保存槽隔离。 */
-    put32(p, 0xD10843FFU);      /* sub sp,sp,#0x800 (缓冲垫加大:
+       压 0x800 缓冲垫隔离; event 槽在原函数 sp 上方 0x800 处,
+       远离常见 [sp+0x200..0x280] 溢出访问。 */
+    put32(p, 0xD12003FFU);      /* sub sp,sp,#0x800 (缓冲垫加大:
                                    原函数会访问帧上方溢出区, 0x200 曾被
                                    踩穿破坏保存槽 → event_ptr 提交错乱) */
     if (emit_saved_insn(&p, saved_insn, orig_pc,
@@ -472,10 +470,10 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
         return 0;
     put32(p, abr(18));
 
-    /* ret_label (sp=E-312): 提交事件 (ret + pad=0 + event_ptr 前进),
+    /* ret_label (sp=E-912): 提交事件 (ret + pad=0 + event_ptr 前进),
        弹栈到 E, ret 调用者。x16 可能已被原函数破坏, 先从 base 槽恢复。 */
     uint8_t *ret_label = p;
-    put32(p, 0x910843FFU);      /* add sp,sp,#0x800 (弹回缓冲垫) */
+    put32(p, 0x912003FFU);      /* add sp,sp,#0x800 (弹回缓冲垫) */
     put32(p, aldr(16, 31, 80)); /* ldr x16,[sp,#80] (base 槽 E-32) */
     put32(p, astr(0, 16, ALLOC_DIAG_RET_OFF));  /* 诊断: 最近返回值 */
     put32(p, aldr(18, 31, 0));  /* event (E-112) */
@@ -483,7 +481,7 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
     put32(p, astr_w(31, 18, 4));/* pad = 0 (COMMITTED) */
     put32(p, aldr(17, 16, ALLOC_EVENT_PTR_ADDR_OFF));
     put32(p, aadd(20, 18, ALLOC_EVENT_SIZE));
-    put32(p, astr(20, 17, 0));  /* hdr.event_ptr = event+32 (commit) */
+    put32(p, astr(20, 17, 0));  /* hdr.event_ptr = event+40 (commit) */
     put32(p, aadd(31, 31, 16)); /* pop event (E-96) */
     put32(p, 0xF94003F5U);      /* ldr x21,[sp] (E-96) */
     put32(p, aadd(31, 31, 16)); /* pop x21 (E-80) */

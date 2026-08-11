@@ -54,7 +54,7 @@ MAN="$CKPT/manifest.txt"
 [ -f "$MAN" ] || { echo "FAIL: no manifest"; exit 1; }
 ls "$CKPT/allocs/events.bin" >/dev/null 2>&1 \
     || { echo "FAIL: no alloc events"; exit 1; }
-NEV=$(( $(stat -c %s "$CKPT/allocs/events.bin") / 32 ))
+NEV=$(( $(stat -c %s "$CKPT/allocs/events.bin") / 40 ))
 [ "$NEV" -gt 1000 ] || { echo "FAIL: 事件太少 ($NEV)"; exit 1; }
 echo "alloc e2e: checkpoints=$NCK events=$NEV"
 

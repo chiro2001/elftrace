@@ -128,6 +128,8 @@ static void blob_patch_u64(uint8_t *blob, uint64_t off, uint64_t val);
 static int g_no_atomic_run_burn = 0;
 static int g_no_alloc_fused = 0;    /* --no-alloc-fused: 禁用融合退出
                                        (诊断/对照: 走 TO 站点退出) */
+static uint64_t g_bm_exit_pc = 0;   /* --bm-exit-pc: 显式冷退出点
+                                       (外层循环头, kind=3 计数) */
 
 /* 小编码器 (构建侧跳板生成) */
 static uint32_t b_movz(unsigned rd, unsigned imm16, unsigned hw)
@@ -1196,8 +1198,10 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
        在 cursor==total 处直接跳 strict exit (rc=0), 不再 patch TO
        检查点 PC 的退出点 —— 否则计数/首访退出会先触发 (游标未消费完),
        且 40M 单间隔窗口的"repeated"启发会让循环内退出点首访即退。 */
+    if (g_bm_exit_pc)
+        exit_override = g_bm_exit_pc;   /* 显式冷退出点覆盖 TO PC */
     int alloc_fused_exit = 0;
-    if (!g_no_alloc_fused && g_alloc_build.have &&
+    if (!g_no_alloc_fused && !g_bm_exit_pc && g_alloc_build.have &&
         g_alloc_build.n_ck && exit_override) {
         uint64_t ac_to = 0, ac_from = 0;
         if (to_ckpt >= 0 && (size_t)to_ckpt <= g_alloc_build.n_ck)
@@ -1337,7 +1341,12 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
         /* 循环判定增强: 目标 PC 或回边在窗口检查点中出现 >= 2 次
            才认为是"重复路径" (仅跑一次则直接埋 exit) */
         int repeated = 0;
-        if (in_loop) {
+        if (g_bm_exit_pc) {
+            repeated = 1;       /* 用户显式指定循环头, 强制按循环处理 */
+            fprintf(stderr, "strict: explicit exit pc %#llx, "
+                    "forced loop treatment\n",
+                    (unsigned long long)exit_override);
+        } else if (in_loop) {
             size_t hits = 0;
             for (size_t i = 0; i < nckpt_pcs; i++) {
                 if (ckpt_pcs[i] == exit_override ||
@@ -2481,8 +2490,18 @@ synth_done:
             c_to = g_alloc_build.n_events;
         if (c_from > c_to)
             c_from = c_to;
-        uint64_t total = c_to - c_from;
-        if (!total) {
+        uint64_t window = c_to - c_from;
+        /* slack: 显式冷退出点 (--bm-exit-pc) 时, 切片消费完窗口事件后
+           继续跑尾部工作 (到 TO 边界/冷循环计数退出), 事件表多装下一
+           检查点间隔的事件供其消费; 上限防御性封顶。 */
+        uint64_t slack = 0;
+        if (g_bm_exit_pc && g_alloc_build.n_ck &&
+            (size_t)to_ckpt < g_alloc_build.n_ck)
+            slack = g_alloc_build.ck_counts[to_ckpt] - c_to;
+        if (slack > window * 4 + 4096)
+            slack = window * 4 + 4096;
+        uint64_t total = window + slack;
+        if (!window) {
             warn("alloc: 窗口内无分配事件 (from %llu to %llu)",
                  (unsigned long long)c_from, (unsigned long long)c_to);
         } else {
@@ -2490,8 +2509,11 @@ synth_done:
             uint64_t cursor_abs = base + blob->size;
             uint64_t v = 0;         /* 游标相对裁剪后事件表 (从 0 起) */
             buf_append(blob, &v, 8);
+            uint64_t win_total_abs = base + blob->size;
+            v = window;             /* 窗口内事件数 (欠消费断言用) */
+            buf_append(blob, &v, 8);
             uint64_t total_abs = base + blob->size;
-            v = total;
+            v = total;              /* 窗口+slack (overrun 上限) */
             buf_append(blob, &v, 8);
             uint64_t events_abs = base + blob->size;
             buf_append(blob, g_alloc_build.events +
@@ -2508,7 +2530,7 @@ synth_done:
                 struct hm { uint64_t ptr, size; } *hm =
                     xcalloc(HMAP_CAP, sizeof(*hm));
                 uint64_t *cl = xcalloc(total ? total : 1, sizeof(*cl));
-                for (size_t e = 0; e < c_to; e++) {
+                for (size_t e = 0; e < c_to + slack; e++) {
                     const uint8_t *ev =
                         g_alloc_build.events + e * ALLOC_EVENT_SIZE;
                     uint32_t k;
@@ -2537,7 +2559,7 @@ synth_done:
                         size_t h = (size_t)(old >> 12) & (HMAP_CAP - 1);
                         if (hm[h].ptr == old)
                             old_size = hm[h].size;
-                        if (e >= c_from && e < c_to && old_size) {
+                        if (e >= c_from && e < c_to + slack && old_size) {
                             uint64_t clen = old_size < new ? old_size : new;
                             /* 复制循环按 8B 块递减, 长度必须 8 对齐
                                (非倍数会在末块后变负数, cbnz 永不停止,
@@ -2574,16 +2596,28 @@ synth_done:
                     const uint8_t *ev = g_alloc_build.events +
                                         (c_from + e) * ALLOC_EVENT_SIZE;
                     uint32_t k;
-                    uint64_t sz, ret;
+                    uint64_t sz, ret, extra = 0, extent;
                     memcpy(&k, ev, 4);
                     memcpy(&sz, ev + 8, 8);
                     memcpy(&ret, ev + 24, 8);
-                    if (k > 2 || !ret || !sz)
+                    if (k == 1 || k == 2)
+                        memcpy(&extra, ev + 32, 8);
+                    /* 统一分配 extent: malloc=arg0, calloc=nmemb*elem,
+                       realloc=new_size (extra); free 不预映射 */
+                    if (k == 0)
+                        extent = sz;
+                    else if (k == 1)
+                        extent = sz * extra;
+                    else if (k == 2)
+                        extent = extra;
+                    else
                         continue;
-                    if (sz > (1ULL << 24))
-                        sz = 1ULL << 24;   /* 防御上限 16MB */
+                    if (!ret || !extent)
+                        continue;
+                    if (extent > (1ULL << 24))
+                        extent = 1ULL << 24;   /* 防御上限 16MB */
                     for (uint64_t pg = ret & ~0xfffULL;
-                         pg < ret + sz && np < ALLOC_PG_CAP;
+                         pg < ret + extent && np < ALLOC_PG_CAP;
                          pg += 0x1000)
                         pgs[np++] = pg >> 12;
                 }
@@ -2658,7 +2692,8 @@ synth_done:
                     page + o, taddr + o, cursor_abs, total_abs,
                     events_abs, (uint32_t)g_alloc_build.kinds[f],
                     tel_abs, base + STUB_STRICT_BAIL_OFF, pc,
-                    g_no_alloc_fused ? 0 : base + STUB_STRICT_EXIT_OFF,
+                    (g_no_alloc_fused || g_bm_exit_pc)
+                        ? 0 : base + STUB_STRICT_EXIT_OFF,
                     copy_len_abs);
                 if (!bl)
                     die("alloc: replay block gen failed for %#llx", pc);
@@ -2681,11 +2716,13 @@ synth_done:
             blob_patch_u64(blob->data, RST_DESC_ALLOC_CURSOR_ABS,
                            cursor_abs);
             blob_patch_u64(blob->data, RST_DESC_ALLOC_TOTAL_ABS,
-                           total_abs);
+                           win_total_abs);
             fprintf(stderr, "alloc: replay window events=%llu "
-                    "(cursor %#llx total %#llx events %#llx)\n",
-                    (unsigned long long)total,
+                    "(cursor %#llx window %#llx total %#llx "
+                    "events %#llx)\n",
+                    (unsigned long long)window,
                     (unsigned long long)cursor_abs,
+                    (unsigned long long)win_total_abs,
                     (unsigned long long)total_abs,
                     (unsigned long long)events_abs);
         }
@@ -3199,6 +3236,9 @@ int build_main(int argc, char **argv)
         } else if (strcmp(argv[i], "--bm-exit-count") == 0 &&
                    i + 1 < argc) {
             exit_count_override = strtoull(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--bm-exit-pc") == 0 &&
+                   i + 1 < argc) {
+            g_bm_exit_pc = strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--stack-reserve") == 0 &&
                    i + 1 < argc) {
             stack_reserve = strtoull(argv[++i], NULL, 0);

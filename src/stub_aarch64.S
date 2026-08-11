@@ -2284,7 +2284,8 @@ alloc_undercheck:
     ldr  x1, [x16, #RST_DESC_ALLOC_CURSOR_ABS]
     ldr  x2, [x1]
     cmp  x2, x0
-    b.eq se_exit
+    b.hs se_exit                /* 游标 >= 窗口事件数 (含 slack 超额)
+                                   即通过欠消费检查 */
     movz x4, #(STUB_TELEMETRY_OFF & 0xffff)
     movk x4, #(STUB_TELEMETRY_OFF >> 16), lsl #16
     add  x3, x16, x4                /* tel_abs */
