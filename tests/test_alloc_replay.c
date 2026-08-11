@@ -28,6 +28,11 @@ static void *map_fixed(uint64_t addr, size_t len)
     return p == MAP_FAILED ? NULL : p;
 }
 
+static void flush_icache(void *p, size_t n)
+{
+    __builtin___clear_cache((char *)p, (char *)p + n);
+}
+
 static uint64_t call_fake(uint64_t arg)
 {
     register uint64_t r asm("x0") = arg;
@@ -92,6 +97,7 @@ int main(int argc, char **argv)
         return 1;
     }
     emit_bail_stub(bailp);
+    flush_icache(bailp, 0x40);
     /* exit 桩: 校验 cursor==3 → exit_group(77), 否则 78 */
     {
         uint32_t w = 0x58000102U;   /* ldr x2,[pc,#32] → index 8 */
@@ -141,12 +147,14 @@ int main(int argc, char **argv)
         printf("FAIL: block size %zu\n", sz);
         return 1;
     }
+    flush_icache(blk, 0x280);
     uint32_t bw = a64_encode_b(FAKE_ABS, BLK_ABS);
     if (!bw) {
         printf("FAIL: patch branch\n");
         return 1;
     }
     memcpy(fake, &bw, 4);
+    flush_icache(fake, 16);
 
     uint64_t rc = 0;
     if (strcmp(mode, "overrun") == 0) {
