@@ -137,17 +137,11 @@ T=$((TO_C - FROM_C))
 [ "$T" -gt 100000000 ] || {
     echo "FAIL: window too small T=$T"; exit 1; }
 echo "atomic: spin window pc=$SPIN_PC site=$SPIN_ID from=$FROM_C to=$TO_C T=$T"
-
-# 采集补偿修复后 Run2 manifest 计数即原始口径 (每检查点 k×every,
-# 触发间隔按 r 放大)。健康检查: 自旋主导窗口的 T 应≈站点访问数×原生
-# 循环体 (ldar+cbz=2); 若补偿失效 T 会是 ~20x, 立即判 FAIL。
-T_SPIN_EST=$(( (SPIN_TO - SPIN_FROM) * 2 ))
-if [ "$T" -lt $((T_SPIN_EST / 2)) ] || [ "$T" -gt $((T_SPIN_EST * 3)) ]; then
-    echo "FAIL: 补偿口径异常 T=$T vs 站点估算 $T_SPIN_EST"
-    exit 1
-fi
-T_ORIG=$T
-echo "atomic: spin accesses=$((SPIN_TO - SPIN_FROM)) T_orig=$T_ORIG (原始口径)"
+echo "atomic: spin accesses=$((SPIN_TO - SPIN_FROM)) (窗口内)"
+# T_orig 用 build 账本 T_ref (ck_orig 差: measured − Σord×(base−1)):
+# manifest 名义计数 (k×every) 用全局 r 缩放, 自旋阶段会被低缩放
+# (~5x 而非 ~20x), 不是精确原始口径。
+T_ORIG=0
 
 # ---------- 测量: 基线 (逐访问) vs run-burn ----------
 measure() {  # $1 = 标签, $2 = 额外构建参数
@@ -158,6 +152,14 @@ measure() {  # $1 = 标签, $2 = 额外构建参数
         --stack-reserve 67108864 $extra \
         > "$TF_TMP/srb_build.log" 2>&1 || {
         echo "FAIL: build $label"; exit 1; }
+    if [ "$label" = burn ]; then
+        T_ORIG=$(grep -oE "T_ref=[0-9]+" "$TF_TMP/srb_build.log" \
+            | head -1 | cut -d= -f2)
+        T_ORIG=${T_ORIG:-0}
+        [ "$T_ORIG" -gt 10000000 ] || {
+            echo "FAIL: build 无有效 T_ref (T_orig=$T_ORIG)"; exit 1; }
+        echo "atomic: T_orig=$T_ORIG (build 账本原始指令口径)"
+    fi
     local rc
     timeout 120 perf stat -e instructions "$TF_TMP/srb_slice.elf" \
         > /dev/null 2> "$TF_TMP/srb.perf"
