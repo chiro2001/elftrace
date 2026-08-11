@@ -56,58 +56,70 @@ wait $PID 2>/dev/null
 NCK=$(wc -l < "$TF_TMP/srb_r2/manifest.txt")
 [ "$NCK" -ge 8 ] || { echo "FAIL: Run2 only $NCK checkpoints"; exit 1; }
 
-# ---------- 选窗: 从自旋段 (连续同 pc 检查点) 到自旋后 ----------
+# ---------- 选窗: 自旋站点计数增长的窗口中段 → 自旋结束后 ----------
+# 注意: 采集期 perf 样本的 PC 常落在记录跳板内, 不能用"检查点 pc ==
+# 站点"识别自旋; 正确信号是站点执行计数 (atomics/ckpt_*.bin) 的增长。
 WIN=$(python3 - "$TF_TMP/srb_r2" <<'EOF'
+import struct
 import sys
 d = sys.argv[1]
 b = open(d + "/atomics/sites.bin", "rb").read()
 off = 0
 def u64():
     global off
-    v = __import__("struct").unpack_from("<Q", b, off)[0]
+    v = struct.unpack_from("<Q", b, off)[0]
     off += 8
     return v
 assert u64() == 0x53495445 and u64() == 1
 n_sites = u64(); u64(); u64(); n_pages = u64()
 u64(); u64(); u64()
 off += n_pages * 8
-site_pcs = set()
+sites = []
 for i in range(n_sites):
     pc = u64()
-    w, kind = __import__("struct").unpack_from("<II", b, off)
+    w, kind = struct.unpack_from("<II", b, off)
     off += 8
-    if kind <= 3:
-        site_pcs.add(pc)
+    sites.append((pc, kind))
+def counts(k):
+    bb = open("%s/atomics/ckpt_%06d.bin" % (d, k), "rb").read()
+    return [struct.unpack_from("<QQQ", bb, 24 + i * 24)[0]
+            for i in range(n_sites)]
 man = open(d + "/manifest.txt").read().splitlines()
 cnt = [int(l.split()[0]) for l in man]
 pcs = [int(l.split()[1], 16) for l in man]
-# 连续同 pc 最长的站点 = 自旋站点
-best = -1
-best_pc = None
-i = 0
-while i < len(pcs):
-    if pcs[i] in site_pcs:
-        j = i
-        while j < len(pcs) and pcs[j] == pcs[i]:
-            j += 1
-        if j - i > best:
-            best = j - i
-            best_pc = pcs[i]
-        i = j
-    else:
-        i += 1
-if best < 3 or best_pc is None:
+n = len(cnt)
+if n < 6:
     sys.exit(2)
-# from = 自旋段第 2 个检查点 (确保 run 中段), to = 自旋后第一个检查点
-run = []
-for k, pc in enumerate(pcs):
-    if pc == best_pc:
-        run.append(k)
-to_k = run[-1] + 1
-if to_k >= len(cnt) or to_k - run[0] < 2:
+# 自旋站点 = kind<=3 中累计执行增量最大的站点
+tot = [0] * n_sites
+for k in range(1, n):
+    c0 = counts(k - 1)
+    c1 = counts(k)
+    for i in range(n_sites):
+        if sites[i][1] <= 3 and c1[i] > c0[i]:
+            tot[i] += c1[i] - c0[i]
+best = max(range(n_sites), key=lambda i: tot[i] if sites[i][1] <= 3 else -1)
+if tot[best] < 1000000:
     sys.exit(2)
-from_k = run[0] + 1
-print(best, hex(best_pc), cnt[from_k], cnt[to_k])
+sc = [counts(k)[best] for k in range(n)]
+total_gain = sc[-1] - sc[0]
+target = sc[0] + total_gain // 3
+from_k = None
+for k in range(1, n):
+    if sc[k] >= target:
+        from_k = k
+        break
+if from_k is None or from_k >= n - 2:
+    sys.exit(2)
+site_set = {s[0] for s in sites}
+to_k = None
+for k in range(from_k + 1, n):
+    if sc[k] == sc[k - 1] and pcs[k] not in site_set:
+        to_k = k
+        break
+if to_k is None:
+    sys.exit(2)
+print(best, hex(sites[best][0]), cnt[from_k], cnt[to_k])
 EOF
 )
 case $? in
@@ -122,6 +134,19 @@ T=$((TO_C - FROM_C))
 [ "$T" -gt 100000000 ] || {
     echo "FAIL: window too small T=$T"; exit 1; }
 echo "atomic: spin window pc=$SPIN_PC hits=$SPIN_HITS from=$FROM_C to=$TO_C T=$T"
+
+# 采集膨胀: manifest 计数是插桩后的 measured 指令; 预期指令数应折算回
+# 原始口径 (compensation.txt: r_num=measured, r_den=orig, orig=meas*den/num)
+RN=$(awk '/^r_num/{print $2}' "$TF_TMP/srb_r2/atomics/compensation.txt")
+RD=$(awk '/^r_den/{print $2}' "$TF_TMP/srb_r2/atomics/compensation.txt")
+if [ -n "${RN:-}" ] && [ -n "${RD:-}" ] && [ "${RN:-0}" -gt 0 ]; then
+    T_ORIG=$((T * RD / RN))
+else
+    T_ORIG=$T
+fi
+[ "$T_ORIG" -gt 10000000 ] || {
+    echo "FAIL: T_orig too small ($T_ORIG, r=$RN/$RD)"; exit 1; }
+echo "atomic: compensation r=$RN/$RD T_orig=$T_ORIG (原始指令口径)"
 
 # ---------- 测量: 基线 (逐访问) vs run-burn ----------
 measure() {  # $1 = 标签, $2 = 额外构建参数
@@ -158,14 +183,19 @@ grep -q "run-burn spin site" "$TF_TMP/srb_build.log" || {
     echo "FAIL: run-burn 未命中自旋站点 (构建日志无 run-burn spin site)"
     exit 1; }
 
-MB=$((A_BASE * 100 / T))
-MR=$((A_BURN * 100 / T))
+MB=$((A_BASE * 100 / T_ORIG))
+MR=$((A_BURN * 100 / T_ORIG))
 echo "atomic: multiplier base=$((MB / 100)).$((MB % 100))x " \
-     "burn=$((MR / 100)).$((MR % 100))x (T=$T)"
+     "burn=$((MR / 100)).$((MR % 100))x (T_orig=$T_ORIG)"
 
 if [ "$A_BURN" -lt "$A_BASE" ]; then
     tf_pass "atomic run-burn 降低动态指令数 (A_burn=$A_BURN < A_base=$A_BASE)"
 else
     tf_fail "run-burn 未降低动态指令数 (A_burn=$A_BURN >= A_base=$A_BASE)"
+fi
+if awk -v b=$MR -v g=115 'BEGIN{exit !(b < g)}'; then
+    tf_pass "atomic run-burn 指令倍率 < 1.15x (multiplier=$((MR / 100)).$((MR % 100))x)"
+else
+    tf_fail "run-burn 指令倍率 >= 1.15x (multiplier=$((MR / 100)).$((MR % 100))x)"
 fi
 tf_finish
