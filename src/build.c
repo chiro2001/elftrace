@@ -1234,11 +1234,13 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
     if (ab && ab->have && ab->n_sites) {
         for (size_t i = 0; i < ab->n_sites; i++) {
             uint8_t *q = NULL;
+            int site_seg = -1;
             for (size_t k = 0; k < nsegs; k++) {
                 if (ab->sites[i].pc >= segs[k].vaddr &&
                     ab->sites[i].pc < segs[k].vaddr + segs[k].filesz) {
                     q = blob->data + payload_off + segs[k].payload_off +
                         (ab->sites[i].pc - segs[k].vaddr);
+                    site_seg = (int)k;
                     break;
                 }
             }
@@ -1275,15 +1277,57 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                     : (!ab->run_cnt[i] && !ab->synth_only[i]))
                 continue;
             if (exit_override == ab->sites[i].pc) {
-                /* 窗口终点指令被替换为退出跳板, 该站点在切片中不会
-                   执行, 无需回放 (原指令已还原)。硬失败会因检查点
-                   pc 落在站点上 (数据相关) 让 http 窗口偶发不可构建;
-                   跳过该站点, 退出优先。 */
+                /* 单 load 自旋站点: 退出由 run-burn 融合接管 (ordinal
+                   预算), 保留回放站点。其他站点: 终点指令被替换为退出
+                   跳板, 切片中不会执行, 跳过回放 (退出优先)。 */
+                int spin_ok = 0;
+                if (site_seg >= 0 && ab->sites[i].kind != 4) {
+                    int size2;
+                    unsigned rt2, rn2;
+                    int kind2;
+                    struct a64_ld_addr ad2;
+                    if (ab->sites[i].kind == 2 ||
+                        ab->sites[i].kind == 3) {
+                        if (a64_is_plain_load(
+                                ab->sites[i].orig_insn, &size2, &rt2,
+                                &rn2, &kind2, &ad2)) {
+                            uint32_t sb;
+                            uint64_t sbe;
+                            if (a64_find_spin_loop(
+                                    q - (ab->sites[i].pc -
+                                         segs[site_seg].vaddr),
+                                    segs[site_seg].filesz,
+                                    ab->sites[i].pc,
+                                    segs[site_seg].vaddr, rt2,
+                                    &sb, &sbe))
+                                spin_ok = 1;
+                        }
+                    } else if (a64_is_load_any(
+                                   ab->sites[i].orig_insn, &size2,
+                                   &rt2, &rn2, &kind2)) {
+                        uint32_t sb;
+                        uint64_t sbe;
+                        if (a64_find_spin_loop(
+                                q - (ab->sites[i].pc -
+                                     segs[site_seg].vaddr),
+                                segs[site_seg].filesz,
+                                ab->sites[i].pc,
+                                segs[site_seg].vaddr, rt2,
+                                &sb, &sbe))
+                            spin_ok = 1;
+                    }
+                }
+                if (!spin_ok) {
+                    fprintf(stderr,
+                            "atomic: exit point %#llx coincides with "
+                            "replay site, skip site (exit wins)\n",
+                            (unsigned long long)ab->sites[i].pc);
+                    continue;
+                }
                 fprintf(stderr,
-                        "atomic: exit point %#llx coincides with replay "
-                        "site, skip site (exit wins)\n",
+                        "atomic: exit point %#llx coincides with run-burn "
+                        "spin site, keep site (fused exit)\n",
                         (unsigned long long)ab->sites[i].pc);
-                continue;
             }
             if (nsites == sites_cap) {
                 sites_cap = sites_cap ? sites_cap * 2 : 32;
@@ -1581,6 +1625,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
 
     /* 6.5 原子回放跳板页: 每段就近一组页, 每站点 0x220B 块 */
     if (ab && ab->have) {
+        size_t exit_rm = SIZE_MAX;   /* run-burn 融合: 待移除的退出站点 */
         for (size_t gi = 0; gi < nsegs; gi++) {
             size_t cnt = 0;
             for (size_t i = 0; i < nsites; i++) {
@@ -1806,18 +1851,15 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                                                &spin_backedge);
                         if (g_no_atomic_run_burn)
                             use_burn = 0;
+                        int fused_exit = 0;
                         if (use_burn) {
                             /* 退出点在自旋循环内 (load 站点或回边):
-                               禁用 run-burn —— K 计数器在那里, 整 run
-                               烧录会绕过计数 */
+                               K 融合 —— 不建独立退出站点, burn 块在
+                               ordinal 预算 (load_limit) 处干净退出
+                               (rc=0), 无需通用 counter。 */
                             if (exit_override == st->pc ||
                                 exit_override == spin_backedge)
-                                use_burn = 0;
-                            for (size_t x = 0;
-                                 x < nsites && use_burn; x++)
-                                if (sites[x].pc == spin_backedge &&
-                                    sites[x].kind == 2)
-                                    use_burn = 0;
+                                fused_exit = 1;
                         }
                         if (use_burn) {
                             bl = a64_atomic_replay_burn_block(
@@ -1828,14 +1870,26 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                                 size, rt, rn, st->pc + 4,
                                 ab->sites[st->ab_id].to_ord -
                                     ab->sites[st->ab_id].from_ord,
-                                base + STUB_STRICT_BAIL_OFF, tel_abs,
+                                base + STUB_STRICT_BAIL_OFF,
+                                fused_exit ? base + STUB_STRICT_EXIT_OFF : 0,
+                                tel_abs,
                                 kind, adp, spin_body);
                             fprintf(stderr,
                                     "atomic: run-burn spin site %#llx "
-                                    "body=%u -> %#llx\n",
+                                    "body=%u -> %#llx%s\n",
                                     (unsigned long long)st->pc,
                                     spin_body,
-                                    (unsigned long long)(taddr + o));
+                                    (unsigned long long)(taddr + o),
+                                    fused_exit ? " [fused-exit]" : "");
+                            if (fused_exit && exit_rm == SIZE_MAX) {
+                                for (size_t x = 0; x < nsites; x++)
+                                    if (sites[x].pc == exit_override &&
+                                        sites[x].kind >= 1 &&
+                                        sites[x].kind <= 3) {
+                                        exit_rm = x;
+                                        break;
+                                    }
+                            }
                         } else {
                             bl = a64_atomic_replay_block(
                                 page + o, taddr + o, runs_abs,
@@ -1932,6 +1986,17 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                     break;
                 }
             }
+        }
+        /* run-burn 融合: 移除独立退出站点 (其指令不再 patch, 孤儿
+           站点块无害; 退出由 burn 块 ordinal 预算完成) */
+        if (exit_rm != SIZE_MAX && exit_rm < nsites) {
+            fprintf(stderr,
+                    "atomic: fused exit site %#llx removed (run-burn "
+                    "ordinal budget exit)\n",
+                    (unsigned long long)sites[exit_rm].pc);
+            memmove(&sites[exit_rm], &sites[exit_rm + 1],
+                    (nsites - exit_rm - 1) * sizeof(*sites));
+            nsites--;
         }
     }
 

@@ -1440,12 +1440,14 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
  * 每 run 边界固定开销 ~50 条, 长自旋 run 下指令倍率 → 1。
  */
 #define BURN_BODY_LEN_OFF 0x240
+#define BURN_CLEAN_EXIT_OFF 0x248
 
 size_t a64_atomic_replay_burn_block(uint8_t *out, uint64_t block_abs,
                                     uint64_t runs_abs, uint64_t n_runs,
                                     int size, unsigned rt, unsigned rn,
                                     uint64_t ret_addr,
                                     uint64_t load_limit, uint64_t exit_abs,
+                                    uint64_t clean_exit_abs,
                                     uint64_t tel_abs,
                                     int kind,
                                     const struct a64_ld_addr *ad,
@@ -1635,14 +1637,21 @@ size_t a64_atomic_replay_burn_block(uint8_t *out, uint64_t block_abs,
     uint64_t b_off = (uint64_t)(p - out);
     put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
 
-    /* ---- limit_exit (reason=1: ordinal 预算) ---- */
+    /* ---- limit_exit ----
+       clean_exit_abs 非 0 (窗口结束在自旋内, 退出站点与 burn 融合):
+       直接跳干净退出 (rc=0), 不写遥测; 否则 reason=1 bail。 */
     uint8_t *limit_exit = p;
-    put32(&p, movz_x(22, 1, 0));
-    if (tel_abs) {
-        emit_replay_tel(&p, tel_abs, REP_SITE_PC_OFF);
-    } else {
-        put32(&p, ldr_x16_imm(16, REP_EXIT_ABS_OFF));
+    if (clean_exit_abs) {
+        put32(&p, ldr_x16_imm(16, BURN_CLEAN_EXIT_OFF));
         put32(&p, INSN_BR_X16);
+    } else {
+        put32(&p, movz_x(22, 1, 0));
+        if (tel_abs) {
+            emit_replay_tel(&p, tel_abs, REP_SITE_PC_OFF);
+        } else {
+            put32(&p, ldr_x16_imm(16, REP_EXIT_ABS_OFF));
+            put32(&p, INSN_BR_X16);
+        }
     }
 
     /* 回填 */
@@ -1690,6 +1699,7 @@ size_t a64_atomic_replay_burn_block(uint8_t *out, uint64_t block_abs,
         v = 0;                  memcpy(out + REP_MISS_OFF, &v, 8);
         v = ret_addr - 4;       memcpy(out + REP_SITE_PC_OFF, &v, 8);
         v = body_len;           memcpy(out + BURN_BODY_LEN_OFF, &v, 8);
+        v = clean_exit_abs;     memcpy(out + BURN_CLEAN_EXIT_OFF, &v, 8);
     }
 
     return A64_ATOM_BLOCK_SIZE;
