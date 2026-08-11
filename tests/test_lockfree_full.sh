@@ -128,6 +128,35 @@ EOF
 [ -n "$CAS_ARGS" ] || {
     echo "FAIL: no LSE CAS found"; exit 1; }
 
+# ---------- 发现主程序段 malloc bl (结果重放) ----------
+MP=$(python3 - "$TF_TMP/lff_r2/ckpt_000000.elftrace" <<'EOF'
+import struct, sys
+f = open(sys.argv[1], "rb").read()
+segs_off, nsegs = struct.unpack_from("<QQ", f, 72)
+strings_off, strings_size = struct.unpack_from("<QQ", f, 112)
+payload_off = struct.unpack_from("<Q", f, 152)[0]
+for i in range(nsegs):
+    vaddr, filesz, memsz, flags, poff, name_off = \
+        struct.unpack_from("<QQQQQQ", f, segs_off + i * 48)
+    name = b""
+    if 0 < name_off < strings_size:
+        e = f.find(b"\0", strings_off + name_off)
+        name = f[strings_off + name_off:e]
+    if not (flags & 1) or b"prog_lockfree_main" not in name:
+        continue
+    base = payload_off + poff
+    # main 的 malloc 调用 (bl, 0x94xxxxxx), 主循环 0xae0 附近
+    for k in range(0xac0, 0xb00, 4):
+        w = struct.unpack_from("<I", f, base + k)[0]
+        if (w & 0xFC000000) == 0x94000000:
+            print("0x%x" % (vaddr + k))
+            break
+EOF
+)
+[ -n "$MP" ] || { echo "FAIL: no malloc bl in main"; exit 1; }
+CAS_ARGS="$CAS_ARGS --malloc-replay-pc $MP"
+echo "atomic: malloc-replay pc=$MP"
+
 # ---------- 选窗: 有原子事件的窗口 ----------
 WIN=$(python3 - "$TF_TMP/lff_r2" <<'EOF'
 import struct, sys
@@ -181,34 +210,65 @@ case $? in
     *) echo "FAIL: window selection error"; exit 1 ;;
 esac
 
-# ---------- 逐候选构建: rc ∈ {0,67}, 遥测分诊 ----------
+# ---------- 逐候选构建 + K 校准: rc=0, R ≤ 15% ----------
 SELECTED=0
 while read -r FROM_C TO_C; do
+    T=$((TO_C - FROM_C))
     echo "atomic: trying window from-count=$FROM_C to-count=$TO_C"
-    tf_build /dev/null "$TF_TMP/lff_slice.elf" --mode baremetal \
-        --bm-strict --checkpoints "$TF_TMP/lff_r2" \
-        --from-count "$FROM_C" --to-count "$TO_C" \
-        --stack-reserve 67108864 $CAS_ARGS \
-        > "$TF_TMP/lff_build.log" 2>&1 || continue
-    grep -q "CAS outcome replay site" "$TF_TMP/lff_build.log" || {
-        echo "  build: 无结局回放站点, 试下一候选"; continue; }
-    timeout 120 perf stat -e instructions "$TF_TMP/lff_slice.elf" \
-        > /dev/null 2> "$TF_TMP/lff.perf"
-    RC=$?
-    if [ "$RC" = 0 ] || [ "$RC" = 67 ]; then
-        if [ "$RC" = 67 ]; then
-            echo "  rc=67 (自旋结束), 遥测:"
-            "$TF_TMP/tel_run" "$TF_TMP/lff_slice.elf" 2>&1 | tail -2
+    K0=0
+    A0=0
+    for iter in 1 2 3 4 5; do
+        EXTRA=()
+        [ "$K0" -gt 0 ] && EXTRA=(--bm-exit-count "$K0")
+        tf_build /dev/null "$TF_TMP/lff_slice.elf" --mode baremetal \
+            --bm-strict --checkpoints "$TF_TMP/lff_r2" \
+            --from-count "$FROM_C" --to-count "$TO_C" \
+            --stack-reserve 67108864 $CAS_ARGS "${EXTRA[@]}" \
+            > "$TF_TMP/lff_build.log" 2>&1 || continue 2
+        grep -q "CAS outcome replay site" "$TF_TMP/lff_build.log" || {
+            echo "  build: 无结局回放站点, 试下一候选"; continue 2; }
+        timeout 120 perf stat -e instructions "$TF_TMP/lff_slice.elf" \
+            > /dev/null 2> "$TF_TMP/lff.perf"
+        RC=$?
+        if [ "$RC" != 0 ]; then
+            if [ "$RC" = 67 ]; then
+                echo "  rc=67 (自旋结束), 遥测:"
+                "$TF_TMP/tel_run" "$TF_TMP/lff_slice.elf" 2>&1 | tail -2
+            else
+                echo "  rc=$RC, 试下一候选"
+            fi
+            A0=0
+            break
         fi
-        SELECTED=1
+        A=$(grep "instructions" "$TF_TMP/lff.perf" \
+            | grep -oE "[0-9,]+" | head -1 | tr -d ",")
+        echo "atomic: iter $iter K=${K0:-def} A=$A T=$T"
+        A0=${A:-0}
+        if [ "$iter" = 1 ] && [ "$A0" -gt 0 ]; then
+            K0=$(grep -oE "K=[0-9]+" "$TF_TMP/lff_build.log" | head -1 \
+                | cut -d= -f2)
+        fi
+        if [ "$A0" -gt 0 ]; then
+            D=$((A0 > T ? A0 - T : T - A0))
+            if [ $((D * 100 / A0)) -le 15 ]; then
+                R=$((D * 100 / A0))
+                SELECTED=1
+                break
+            fi
+        fi
+        if [ "$iter" -lt 5 ] && [ "$K0" -gt 0 ] && [ "$A0" -gt 0 ]; then
+            K0=$((K0 * T / A0))
+            [ "$K0" -gt 0 ] || K0=1
+        fi
+    done
+    if [ "$SELECTED" = 1 ]; then
         break
     fi
-    echo "  rc=$RC, 试下一候选"
 done <<EOF
 $WIN
 EOF
 [ "$SELECTED" = 1 ] || {
-    echo "FAIL: 无候选窗口得到 rc∈{0,67}"
+    echo "FAIL: 无候选窗口达到 rc=0 且 R≤15% (last A0=$A0)"
     exit 1; }
 
 # 断言: 选中的窗口内结局回放真实消费了 help/失败事件
@@ -231,7 +291,7 @@ for i in range(n):
     pcs.append((pc, kind))
 def ckpt(k):
     bb = open("%s/atomics/ckpt_%06d.bin" % (d, k), "rb").read()
-    return [struct.unpack_from("<QQQ", bb, 24 + i * 24)[0]
+    return [struct.unpack_from("<QQQ", bb, 24 + i * 24)
             for i in range(n)]
 man = open(d + "/manifest.txt").read().splitlines()
 cnt = [int(l.split()[0]) for l in man]

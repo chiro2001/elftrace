@@ -36,6 +36,47 @@
 static uint64_t g_force_cas_pcs[256];
 static size_t g_n_force_cas = 0;
 
+/* --malloc-replay-pc: 把该 pc 的 bl 调用 patch 成"返回录制指针"的
+ * 跳板 (malloc 结果重放)。解决冻结堆在分配模式偏离录制时损坏的问题:
+ * 切片不再调用真实 malloc, 按序返回录制中对应 malloc 的返回值
+ * (对 lockfree 负载即入队 CAS 的 desired, 1:1)。 */
+static uint64_t g_malloc_replay_pcs[16];
+static size_t g_n_malloc_replay = 0;
+
+/* 小编码器 (构建侧跳板生成) */
+static uint32_t b_movz(unsigned rd, unsigned imm16, unsigned hw)
+{
+    return 0xD2800000U | ((hw & 3) << 21) | ((imm16 & 0xffff) << 5) | rd;
+}
+static uint32_t b_movk(unsigned rd, unsigned imm16, unsigned hw)
+{
+    return 0xF2800000U | ((hw & 3) << 21) | ((imm16 & 0xffff) << 5) | rd;
+}
+static uint32_t b_ldr(unsigned rt, unsigned rn, unsigned imm)
+{
+    return 0xF9400000U | ((imm / 8) << 10) | (rn << 5) | rt;
+}
+static uint32_t b_str(unsigned rt, unsigned rn, unsigned imm)
+{
+    return 0xF9000000U | ((imm / 8) << 10) | (rn << 5) | rt;
+}
+static uint32_t b_addi(unsigned rd, unsigned rn, unsigned imm)
+{
+    return 0x91000000U | (imm << 10) | (rn << 5) | rd;
+}
+static uint32_t b_add_reg(unsigned rd, unsigned rn, unsigned rm, unsigned sh)
+{
+    return 0x8B000000U | (rm << 16) | ((sh & 7) << 10) | (rn << 5) | rd;
+}
+static uint32_t b_cmpi(unsigned rn, unsigned imm)
+{
+    return 0xF1000000U | (imm << 10) | (rn << 5) | 31U;
+}
+static uint32_t b_br(unsigned rn)
+{
+    return 0xD61F0000U | (rn << 5);
+}
+
 /* ---- 生成的 stub blob (按目标架构选择) ---- */
 extern const unsigned char stub_blob_x86_64[];
 extern const unsigned int stub_blob_x86_64_len;
@@ -1804,6 +1845,196 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
         }
     }
 
+    /* 6.6 malloc 结果重放 (--malloc-replay-pc)
+     * 录制表 = 窗口内入队 CAS (expected==0, success==1) 的 desired,
+     * 按 ordinal 升序 (lockfree 负载 1 malloc ↔ 1 入队, 1:1)。
+     * 跳板: 计数器 → 查表 → x0=录制指针 → br x30; 超表尾 →
+     * 遥测 reason=6 + bail (fail-closed)。 */
+    if (ab && ab->have && g_n_malloc_replay) {
+        struct mr_pair {
+            uint64_t start, desired;
+        } *mt = NULL;
+        size_t nm = 0, mcap = 0;
+        for (size_t i = 0; i < ab->n_sites; i++) {
+            if (ab->sites[i].kind != 4)
+                continue;
+            for (size_t r = 0; r < ab->cas_run_cnt[i]; r++) {
+                struct ab_cas_run *rr =
+                    &ab->cas_runs[ab->cas_run_off[i] + r];
+                if (rr->expected != 0 || rr->success != 1)
+                    continue;
+                if (nm == mcap) {
+                    mcap = mcap ? mcap * 2 : 64;
+                    mt = xrealloc(mt, mcap * sizeof(*mt));
+                }
+                mt[nm].start = rr->start;
+                mt[nm].desired = rr->desired;
+                nm++;
+            }
+        }
+        for (size_t i = 1; i < nm; i++)
+            for (size_t j = i; j > 0 && mt[j - 1].start > mt[j].start; j--) {
+                struct mr_pair t = mt[j];
+                mt[j] = mt[j - 1];
+                mt[j - 1] = t;
+            }
+        if (!nm) {
+            fprintf(stderr, "atomic: --malloc-replay-pc given but no "
+                    "enqueue CAS outcomes (need CAS_RECORD capture)\n");
+        } else {
+            if (blob->size & 7)
+                buf_zero(blob, 8 - (blob->size & 7));
+            uint64_t counter_abs = base + blob->size;
+            uint64_t zero = 0;
+            buf_append(blob, &zero, 8);
+            uint64_t table_abs = base + blob->size;
+            for (size_t i = 0; i < nm; i++)
+                buf_append(blob, &mt[i].desired, 8);
+            fprintf(stderr,
+                    "atomic: malloc replay: %zu entries "
+                    "(table %#llx, counter %#llx)\n",
+                    nm, (unsigned long long)table_abs,
+                    (unsigned long long)counter_abs);
+
+            for (size_t s = 0; s < g_n_malloc_replay; s++) {
+                uint64_t pc = g_malloc_replay_pcs[s];
+                int segi = -1;
+                for (size_t k = 0; k < nsegs; k++) {
+                    if (pc >= segs[k].vaddr &&
+                        pc + 4 <= segs[k].vaddr + segs[k].filesz) {
+                        segi = (int)k;
+                        break;
+                    }
+                }
+                if (segi < 0) {
+                    warn("--malloc-replay-pc %#llx not in payload",
+                         (unsigned long long)pc);
+                    continue;
+                }
+                uint8_t *segp = blob->data + payload_off +
+                                segs[segi].payload_off;
+                uint32_t orig;
+                memcpy(&orig, segp + (pc - segs[segi].vaddr), 4);
+                if ((orig & 0xFC000000U) != 0x94000000U) {
+                    warn("--malloc-replay-pc %#llx: not a bl (%08x), skip",
+                         (unsigned long long)pc, orig);
+                    continue;
+                }
+                uint64_t need = 0x1000;
+                uint64_t taddr = find_gap_near(
+                    segs, nsegs, pl, npl, pc, need, base, blob->size);
+                if (!taddr)
+                    taddr = find_gap_near(
+                        segs, nsegs, pl, npl,
+                        pc > need ? pc - need : 0, need,
+                        base, blob->size);
+                if (!taddr)
+                    die("malloc replay: no trampoline gap near %#llx",
+                        (unsigned long long)pc);
+                spload_add(&pl, &npl, &pl_cap, taddr, need,
+                           PF_R | PF_W | PF_X);
+                uint8_t *page = xcalloc(1, need);
+                uint8_t *p = page;
+                uint64_t v;
+                v = counter_abs;
+                for (int h = 0; h < 4; h++) {
+                    uint32_t w = h == 0 ? b_movz(16, (uint32_t)v & 0xffff, 0)
+                                        : b_movk(16, ((uint64_t)v >> (16 * h))
+                                                     & 0xffff, h);
+                    memcpy(p, &w, 4);
+                    p += 4;
+                }
+                uint32_t w = b_ldr(17, 16, 0);
+                memcpy(p, &w, 4); p += 4;
+                w = b_cmpi(17, (unsigned)nm);
+                memcpy(p, &w, 4); p += 4;
+                uint8_t *hs = p;    /* b.hs overrun (占位) */
+                memcpy(p, &(uint32_t){0}, 4); p += 4;
+                v = table_abs;
+                for (int h = 0; h < 4; h++) {
+                    uint32_t w2 = h == 0 ? b_movz(9, (uint32_t)v & 0xffff, 0)
+                                         : b_movk(9, ((uint64_t)v >> (16 * h))
+                                                      & 0xffff, h);
+                    memcpy(p, &w2, 4);
+                    p += 4;
+                }
+                w = b_add_reg(9, 9, 17, 3);
+                memcpy(p, &w, 4); p += 4;
+                w = b_ldr(0, 9, 0);
+                memcpy(p, &w, 4); p += 4;
+                w = b_addi(17, 17, 1);
+                memcpy(p, &w, 4); p += 4;
+                w = b_str(17, 16, 0);
+                memcpy(p, &w, 4); p += 4;
+                w = b_br(30);
+                memcpy(p, &w, 4); p += 4;
+                /* overrun: 遥测 reason=6 + bail */
+                uint8_t *ovr = p;
+                v = tel_abs;
+                for (int h = 0; h < 4; h++) {
+                    uint32_t w2 = h == 0 ? b_movz(9, (uint32_t)v & 0xffff, 0)
+                                         : b_movk(9, ((uint64_t)v >> (16 * h))
+                                                      & 0xffff, h);
+                    memcpy(p, &w2, 4);
+                    p += 4;
+                }
+                w = b_movz(14, 0x4554, 0);
+                memcpy(p, &w, 4); p += 4;
+                w = b_movk(14, 0x4D4C, 1);
+                memcpy(p, &w, 4); p += 4;
+                w = b_str(14, 9, 0);
+                memcpy(p, &w, 4); p += 4;
+                w = b_movz(14, 6, 0);
+                memcpy(p, &w, 4); p += 4;
+                w = b_str(14, 9, 8);
+                memcpy(p, &w, 4); p += 4;
+                w = b_movz(14, (uint32_t)pc & 0xffff, 0);
+                memcpy(p, &w, 4); p += 4;
+                w = b_movk(14, ((uint64_t)pc >> 16) & 0xffff, 1);
+                memcpy(p, &w, 4); p += 4;
+                w = b_movk(14, ((uint64_t)pc >> 32) & 0xffff, 2);
+                memcpy(p, &w, 4); p += 4;
+                w = b_str(14, 9, 16);
+                memcpy(p, &w, 4); p += 4;
+                w = b_str(17, 9, 24);
+                memcpy(p, &w, 4); p += 4;
+                v = base + STUB_STRICT_BAIL_OFF;
+                for (int h = 0; h < 4; h++) {
+                    uint32_t w2 = h == 0 ? b_movz(16, (uint32_t)v & 0xffff, 0)
+                                         : b_movk(16, ((uint64_t)v >> (16 * h))
+                                                      & 0xffff, h);
+                    memcpy(p, &w2, 4);
+                    p += 4;
+                }
+                w = b_br(16);
+                memcpy(p, &w, 4); p += 4;
+                /* 回填 b.hs overrun */
+                int32_t d = (int32_t)(ovr - hs);
+                w = 0x54000000U | (((uint32_t)(d / 4) & 0x7FFFF) << 5) | 8U;
+                memcpy(hs, &w, 4);
+                /* patch 站点 bl → b 跳板 */
+                uint32_t bw = a64_encode_b(pc, taddr);
+                if (!bw)
+                    die("malloc replay: branch out of range %#llx -> %#llx",
+                        (unsigned long long)pc,
+                        (unsigned long long)taddr);
+                memcpy(segp + (pc - segs[segi].vaddr), &bw, 4);
+                for (size_t i = 0; i < npl; i++) {
+                    if (pl[i].vaddr == taddr) {
+                        pl[i].filesz = need;
+                        pl[i].data = page;
+                        break;
+                    }
+                }
+                fprintf(stderr,
+                        "atomic: malloc replay site %#llx -> %#llx\n",
+                        (unsigned long long)pc,
+                        (unsigned long long)taddr);
+            }
+        }
+        free(mt);
+    }
+
     /* 7. patch 目标代码: svc/回边/退出指令 → b <跳板> */
     for (size_t i = 0; i < nsites; i++) {
         struct strict_site *st = &sites[i];
@@ -2330,6 +2561,10 @@ int build_main(int argc, char **argv)
         } else if (strcmp(argv[i], "--atomic-force-cas-pc") == 0 &&
                    i + 1 < argc && g_n_force_cas < 256) {
             g_force_cas_pcs[g_n_force_cas++] =
+                strtoull(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--malloc-replay-pc") == 0 &&
+                   i + 1 < argc && g_n_malloc_replay < 16) {
+            g_malloc_replay_pcs[g_n_malloc_replay++] =
                 strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--atomic-no-value-replay") == 0) {
             atomic_no_value_replay = 1;
