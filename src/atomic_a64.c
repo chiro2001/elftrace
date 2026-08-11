@@ -1550,7 +1550,7 @@ size_t a64_atomic_replay_burn_block(uint8_t *out, uint64_t block_abs,
     put32(&p, add_x(23, 20, 1));
     put32(&p, cmp_x(23, 21));
     uint8_t *last_b = p;
-    put32(&p, bcond(0, 8));     /* b.hs burn_last (占位) */
+    put32(&p, bcond(0, 2));     /* b.hs burn_last (cursor+1 >= n_runs) */
     put32(&p, movz_x(24, 24, 0));
     put32(&p, mul_x(24, 23, 24));
     put32(&p, add_xr(24, 24, 22));
@@ -1684,7 +1684,7 @@ size_t a64_atomic_replay_burn_block(uint8_t *out, uint64_t block_abs,
         w = bcond(d3, 8);   memcpy(lo_b, &w, 4);
         w = bcond(d4, 1);   memcpy(ne_b, &w, 4);
         w = bcond(d5, 0);   memcpy(eq_b, &w, 4);
-        w = bcond(d6, 8);   memcpy(last_b, &w, 4);
+        w = bcond(d6, 2);   memcpy(last_b, &w, 4);
         w = bcond(d7, 8);   memcpy(cap_b, &w, 4);
         w = bcond(d8, 1);   memcpy(na_b, &w, 4);
         w = cbz_x(d9, 28);  memcpy(za_b, &w, 4);
