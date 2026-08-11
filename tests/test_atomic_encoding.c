@@ -5,6 +5,8 @@
  *   casl   x0,x2,[x1] = 0xc8a0fc22
  *   casa   x0,x2,[x1] = 0xc8e07c22
  *   casal  x0,x2,[x1] = 0xc8e0fc22
+ *   cas    w0,w2,[x1] = 0x88a07c22  (32 位, gcc 实测 size 位=10, 即
+ *   0x88... 系; 0x08... 系 size=00 是 CASB/CASH 类, 必须拒绝)
  *   swpal  x0,x0,[x1] = 0xf8e08020
  *   ldaddal x0,x0,[x1] = 0xf8e00020
  * 防回归: 掩码 (w & 0x08A07C00) == 0x08A07C00 必须同时命中
@@ -33,7 +35,7 @@ int main(void)
         0xc8a07c22U, 0xc8a0fc22U, 0xc8e07c22U, 0xc8e0fc22U,
     };
     static const uint32_t cas32[] = {
-        0x08a07c22U, 0x08a0fc22U, 0x08e07c22U, 0x08e0fc22U,
+        0x88a07c22U, 0x88a0fc22U, 0x88e07c22U, 0x88e0fc22U,
     };
     for (size_t i = 0; i < 4; i++) {
         CHECK(a64_is_lse_cas(cas64[i], &rs, &rt, &rn),
@@ -43,6 +45,10 @@ int main(void)
         CHECK(a64_is_lse_cas(cas32[i], &rs, &rt, &rn),
               "32-bit CAS variant not matched");
     }
+    /* size<2 (CASB/CASH 类, 0x08... 系) 必须拒绝: 记录/回放只支持
+       32/64 位 (round-18 评审; 实测 32 位是 0x88... 系 size=10) */
+    CHECK(!a64_is_lse_cas(0x08a07c22U, NULL, NULL, NULL),
+          "CASB/CASH (size<2) matched as LSE CAS");
 
     /* 非 CAS 指令必须全部拒绝 */
     static const uint32_t noncas[] = {
