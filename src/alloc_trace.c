@@ -86,12 +86,12 @@ static int atmem_rw(pid_t pid, int wr, uint64_t addr, void *buf, size_t len)
 }
 
 /* ---- maps 解析: 找 libc 可执行段 ---- */
-static int find_libc_exec(uint64_t *start_out, uint64_t *end_out,
+static int find_libc_exec(pid_t pid, uint64_t *start_out, uint64_t *end_out,
                           char *path, size_t pathsz)
 {
-    FILE *f = fopen("/proc/self/../self/maps", "r");
-    if (!f)
-        f = fopen("/proc/self/maps", "r");
+    char mp[64];
+    snprintf(mp, sizeof(mp), "/proc/%d/maps", pid);
+    FILE *f = fopen(mp, "r");
     if (!f)
         return -1;
     char line[512];
@@ -243,6 +243,83 @@ static void aemit_addr(uint8_t **pp, unsigned rd, uint64_t v)
     *pp = p;
 }
 
+/* 分支重定位: 原指令在 orig_pc 处的分支改写到 new_pc 处执行,
+ * 目标保持原始绝对目标。返回 0 = 不可重定位。 */
+static uint32_t areloc_branch(uint32_t w, uint64_t orig_pc,
+                              uint64_t new_pc)
+{
+    uint64_t target = a64_branch_target(w, orig_pc);
+    if (!target)
+        return 0;
+    int64_t d = (int64_t)(target - new_pc);
+    if (a64_is_cbz(w) || a64_is_cbnz(w)) {
+        if (d < -(1 << 20) || d >= (1 << 20))
+            return 0;
+        return (w & 0xFF00001FU) |
+               (((uint32_t)(d >> 2) & 0x7FFFFU) << 5);
+    }
+    if (a64_is_bcond(w)) {
+        if (d < -(1 << 20) || d >= (1 << 20))
+            return 0;
+        return (w & 0xFF000010U) |
+               (((uint32_t)(d >> 2) & 0x7FFFFU) << 5);
+    }
+    if (a64_is_b(w) || a64_is_bl(w)) {
+        if (d < -(1 << 25) || d >= (1 << 25))
+            return 0;
+        return (w & 0xFC000000U) |
+               ((uint32_t)(d >> 2) & 0x3FFFFFFU);
+    }
+    return 0;
+}
+
+/* 内联原函数首条指令 (分支则重定位到本槽) */
+static int emit_saved_insn(uint8_t **pp, uint32_t saved,
+                           uint64_t orig_pc, uint64_t slot_pc)
+{
+    uint8_t *p = *pp;
+    uint32_t w = saved;
+    if (a64_is_cbz(w) || a64_is_cbnz(w) || a64_is_bcond(w) ||
+        a64_is_b(w) || a64_is_bl(w)) {
+        w = areloc_branch(w, orig_pc, slot_pc);
+        if (!w) {
+            /* 直接重定位超范围 (跳板页可能离 libc 入口 >1MB):
+               逆条件跳过 + ldr x15,[pc,#8] + br x15 + .quad 目标,
+               支持任意距离 (x15 caller-saved)。 */
+            uint64_t target = a64_branch_target(saved, orig_pc);
+            if (!target)
+                return -1;
+            uint32_t inv;
+            if (a64_is_cbz(saved))
+                inv = 0xB5000000U | (saved & 0x1F);   /* cbnz xt */
+            else if (a64_is_cbnz(saved))
+                inv = 0xB4000000U | (saved & 0x1F);   /* cbz xt */
+            else if (a64_is_bcond(saved))
+                inv = 0x54000000U | ((saved & 0xF) ^ 1);
+            else
+                return -1;
+            uint8_t *skip = p + 20;   /* 跳过 ldr+br+.quad, 落到 func+4 */
+            inv |= (((uint32_t)((skip - p) / 4) & 0x7FFFF) << 5);
+            memcpy(p, &inv, 4);
+            p += 4;
+            uint32_t ldr = 0x58000000U | (2U << 5) | 15U;
+            memcpy(p, &ldr, 4);
+            p += 4;
+            uint32_t br = 0xD61F0000U | (15U << 5);
+            memcpy(p, &br, 4);
+            p += 4;
+            memcpy(p, &target, 8);
+            p += 8;
+            *pp = p;
+            return 0;
+        }
+    }
+    memcpy(p, &w, 4);
+    p += 4;
+    *pp = p;
+    return 0;
+}
+
 /* 生成单个分配器函数的记录跳板 (0x300B)
  *
  * 栈纪律 (sp 从调用者入口 E 起):
@@ -257,6 +334,7 @@ static void aemit_addr(uint8_t **pp, unsigned rd, uint64_t v)
  *   - non-target/overflow: ret → 原调用者 (x30 未动)。 */
 size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
                           uint32_t saved_insn,
+                          uint64_t orig_pc,
                           uint64_t orig_next,
                           uint64_t tls,
                           uint64_t hdr_event_ptr_addr,
@@ -288,6 +366,10 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
     put32(p, astr(30, 31, 0));  /* str x30,[sp] */
     put32(p, 0xD10043FFU);      /* sub sp,sp,#16 (size 槽, E-64) */
     put32(p, astr(0, 31, 0));   /* str x0,[sp] */
+    /* 诊断: 调用计数++ (x15 为 caller-saved, TLS 检查后空闲) */
+    put32(p, aldr(15, 16, ALLOC_DIAG_CNT_OFF));
+    put32(p, aadd(15, 15, 1));
+    put32(p, astr(15, 16, ALLOC_DIAG_CNT_OFF));
     put32(p, 0xA9BF53F3U);      /* stp x19,x20,[sp,#-16]! (E-80) */
     put32(p, 0xD10043FFU);      /* sub sp,sp,#16 (x21 槽, E-96) */
     put32(p, astr(21, 31, 0));  /* str x21,[sp] */
@@ -310,8 +392,13 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
     put32(p, 0xD10043FFU);      /* sub sp,sp,#16 (event 槽, E-112) */
     put32(p, astr(18, 31, 0));  /* str event,[sp] */
     put32(p, aldr(30, 16, ALLOC_RET_LABEL_OFF));
-    memcpy(p, &saved_insn, 4);  /* 原函数首条指令 */
-    p += 4;
+    /* 原函数会访问其栈帧上方的溢出区 (glibc sp+偏移), 与跳板保存槽
+       冲突 (曾把 caller x30 槽写坏 → 返回地址变事件地址 → SIGBUS)。
+       压 0x200 缓冲垫, 原函数帧与保存槽隔离。 */
+    put32(p, 0xD10803FFU);      /* sub sp,sp,#0x200 */
+    if (emit_saved_insn(&p, saved_insn, orig_pc,
+                        block_abs + (uint64_t)(p - out)) < 0)
+        return 0;               /* 不可重定位 */
     put32(p, aldr(18, 16, ALLOC_ORIG_NEXT_OFF));
     put32(p, abr(18));
 
@@ -328,8 +415,9 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
     put32(p, 0xA8C17FFEU);      /* ldp x30,xzr,[sp],#16 (caller, E-32) */
     put32(p, aadd(31, 31, 16)); /* pop base 槽 (E-16) */
     put32(p, 0xA8C147F0U);      /* ldp x16,x17,[sp],#16 (entry, E) */
-    memcpy(p, &saved_insn, 4);
-    p += 4;
+    if (emit_saved_insn(&p, saved_insn, orig_pc,
+                        block_abs + (uint64_t)(p - out)) < 0)
+        return 0;
     put32(p, abr(18));
 
     /* non_target (sp=E-32): 弹 base+entry, 原生执行 */
@@ -337,12 +425,15 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
     put32(p, aldr(18, 16, ALLOC_ORIG_NEXT_OFF));
     put32(p, aadd(31, 31, 16)); /* pop base 槽 (E-16) */
     put32(p, 0xA8C147F0U);      /* ldp x16,x17,[sp],#16 (E) */
-    memcpy(p, &saved_insn, 4);
-    p += 4;
+    if (emit_saved_insn(&p, saved_insn, orig_pc,
+                        block_abs + (uint64_t)(p - out)) < 0)
+        return 0;
     put32(p, abr(18));
 
     /* ret_label (sp=E-112): 写回 ret, 弹栈到 E, ret 调用者 */
     uint8_t *ret_label = p;
+    put32(p, astr(0, 16, ALLOC_DIAG_RET_OFF));  /* 诊断: 最近返回值 */
+    put32(p, 0x910803FFU);      /* add sp,sp,#0x200 (弹回缓冲垫) */
     put32(p, aldr(18, 31, 0));  /* event (E-112) */
     put32(p, astr(0, 18, 24));  /* ret */
     put32(p, aadd(31, 31, 16)); /* pop event (E-96) */
@@ -380,12 +471,14 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
 }
 
 /* ---- 就近找空闲 gap (解析 maps) ---- */
-static uint64_t alloc_find_gap(uint64_t near, uint64_t size)
+static uint64_t alloc_find_gap(pid_t pid, uint64_t near, uint64_t size)
 {
     struct amap { uint64_t s, e; };
     struct amap maps[1024];
     size_t n = 0;
-    FILE *f = fopen("/proc/self/maps", "r");
+    char mp[64];
+    snprintf(mp, sizeof(mp), "/proc/%d/maps", pid);
+    FILE *f = fopen(mp, "r");
     if (!f)
         return 0;
     char line[512];
@@ -440,6 +533,62 @@ static uint64_t alloc_find_gap(uint64_t near, uint64_t size)
     return 0;
 }
 
+/* 目标内 icache/dcache 刷新 (patch 函数入口 + 跳板页后必须执行;
+   /proc/pid/mem 写代码页不保证指令缓存一致, 曾导致目标执行旧指令
+   随机崩溃) */
+static int alloc_flush_ranges(pid_t pid,
+                              const struct user_regs_struct *regs,
+                              uint64_t list_abs, uint64_t n_ranges)
+{
+    uint32_t code[64];
+    size_t n = 0;
+    size_t cbz_off = 0, inner_off = 0, bne_off = 0, loop_off = 0,
+           b_off = 0, done_off = 0;
+    uint64_t v = list_abs;
+    code[n++] = 0xD2800000U | ((uint32_t)(v & 0xffff) << 5) | 16U;
+    if (v & 0xFFFF0000ULL)
+        code[n++] = 0xF2800000U | (1U << 21) |
+                    ((uint32_t)((v >> 16) & 0xffff) << 5) | 16U;
+    if (v & 0xFFFFFFFF0000ULL)
+        code[n++] = 0xF2800000U | (2U << 21) |
+                    ((uint32_t)((v >> 32) & 0xffff) << 5) | 16U;
+    if (v & 0xFFFFFFFFFFFF0000ULL)
+        code[n++] = 0xF2800000U | (3U << 21) |
+                    ((uint32_t)((v >> 48) & 0xffff) << 5) | 16U;
+    code[n++] = 0xF9400213U;             /* ldr x19,[x16] */
+    code[n++] = 0x91002210U;             /* add x20,x16,#8 */
+    loop_off = n;
+    cbz_off = n;
+    code[n++] = 0xB4000000U | 19U;
+    code[n++] = 0xF9400295U;             /* ldr x21,[x20] */
+    code[n++] = 0xF9408296U;             /* ldr x22,[x20,#16] */
+    code[n++] = 0xCB1502D7U;             /* sub x23,x22,x21 */
+    code[n++] = 0x9100FEF7U;             /* add x23,x23,#63 */
+    code[n++] = 0xD346FEF7U;             /* lsr x23,x23,#6 */
+    inner_off = n;
+    code[n++] = 0xD50B7B35U;             /* dc cvau,x21 */
+    code[n++] = 0xD50B7535U;             /* ic ivau,x21 */
+    code[n++] = 0x910102B5U;             /* add x21,x21,#64 */
+    bne_off = n;
+    code[n++] = 0x54000001U;
+    code[n++] = 0x91010294U;             /* add x20,x20,#16 */
+    code[n++] = 0xD1000673U;             /* sub x19,x19,#1 */
+    b_off = n;
+    code[n++] = 0x14000000U;
+    done_off = n;
+    code[n++] = 0xD5033B9FU;             /* dsb ish */
+    code[n++] = 0xD5033FDFU;             /* isb */
+    code[n++] = 0xD4200000U;             /* brk #0 */
+    code[cbz_off] = 0xB4000000U |
+        (((uint32_t)(done_off - cbz_off) & 0x7FFFF) << 5) | 19U;
+    code[bne_off] = 0x54000001U |
+        (((uint32_t)(inner_off - bne_off) & 0x7FFFF) << 5);
+    code[b_off] = a64_encode_b((uint64_t)b_off * 4,
+                               (uint64_t)loop_off * 4);
+    (void)n_ranges;
+    return inject_run_snippet(pid, regs, code, n, NULL);
+}
+
 /* ---- 事件增量转储: events.bin + 游标推进 ---- */
 static int alloc_events_dump(struct alloc_trace_ctx *ctx)
 {
@@ -456,8 +605,11 @@ static int alloc_events_dump(struct alloc_trace_ctx *ctx)
     uint64_t n_new = (event_ptr - ctx->dump_event_ptr) / ALLOC_EVENT_SIZE;
     uint64_t total = ctx->total_events;
     FILE *f = fopen(path, "a+b");
-    if (!f)
+    if (!f) {
+        fprintf(stderr, "alloc: dump fopen %s failed (errno %d)\n",
+                path, errno);
         return -1;
+    }
     if (n_new) {
         uint8_t *ev = xmalloc(n_new * ALLOC_EVENT_SIZE);
         if (atmem_rw(ctx->pid, 0, ctx->dump_event_ptr, ev,
@@ -478,6 +630,23 @@ int alloc_trace_ckpt(struct alloc_trace_ctx *ctx, size_t ckpt_no)
     if (!ctx || !ctx->armed)
         return 0;
     alloc_events_dump(ctx);
+    /* 诊断: 每 50 个检查点读一次各块调用计数 (定位 TLS 过滤/记录路径) */
+    if (ckpt_no % 50 == 1) {
+        for (size_t i = 0; i < ctx->n_funcs; i++) {
+            uint64_t blk = ctx->funcs[i].page + ctx->funcs[i].page_off;
+            uint64_t cnt = 0, ret = 0;
+            if (atmem_rw(ctx->pid, 0, blk + ALLOC_DIAG_CNT_OFF,
+                         &cnt, 8) == 0)
+                atmem_rw(ctx->pid, 0, blk + ALLOC_DIAG_RET_OFF,
+                         &ret, 8);
+            fprintf(stderr,
+                    "alloc: ckpt %zu func[%zu] kind=%d calls=%llu "
+                    "last_ret=%#llx\n",
+                    ckpt_no, i, ctx->funcs[i].kind,
+                    (unsigned long long)cnt,
+                    (unsigned long long)ret);
+        }
+    }
     char path[600];
     snprintf(path, sizeof(path), "%s/allocs/ckpt_%06zu.bin",
              ctx->out, ckpt_no);
@@ -497,7 +666,23 @@ int alloc_trace_finish(struct alloc_trace_ctx *ctx)
 {
     if (!ctx)
         return 0;
+    fprintf(stderr, "alloc: finish total_events=%llu armed=%d\n",
+            (unsigned long long)(ctx ? ctx->total_events : 0),
+            ctx ? ctx->armed : 0);
     if (ctx->armed) {
+        for (size_t i = 0; i < ctx->n_funcs; i++) {
+            uint64_t blk = ctx->funcs[i].page + ctx->funcs[i].page_off;
+            uint64_t ret = 0, cnt = 0;
+            atmem_rw(ctx->pid, 0, blk + ALLOC_DIAG_RET_OFF, &ret, 8);
+            atmem_rw(ctx->pid, 0, blk + ALLOC_DIAG_CNT_OFF, &cnt, 8);
+            fprintf(stderr,
+                    "alloc: func[%zu] kind=%d pc=%#llx calls=%llu "
+                    "last_ret=%#llx\n",
+                    i, ctx->funcs[i].kind,
+                    (unsigned long long)ctx->funcs[i].pc,
+                    (unsigned long long)cnt,
+                    (unsigned long long)ret);
+        }
         alloc_events_dump(ctx);
         /* 恢复函数入口原指令 (目标随后被 trace 终止) */
         for (size_t i = 0; i < ctx->n_funcs; i++)
@@ -534,7 +719,7 @@ int alloc_trace_arm(struct alloc_trace_ctx **ctx_out, pid_t pid,
 
     uint64_t lstart, lend;
     char path[512];
-    if (find_libc_exec(&lstart, &lend, path, sizeof(path)) < 0) {
+    if (find_libc_exec(pid, &lstart, &lend, path, sizeof(path)) < 0) {
         warn("alloc: libc exec segment not found");
         free(ctx);
         return -1;
@@ -545,8 +730,17 @@ int alloc_trace_arm(struct alloc_trace_ctx **ctx_out, pid_t pid,
         free(ctx);
         return -1;
     }
+    fprintf(stderr,
+            "alloc: libc exec %#llx-%#llx path=%s syms "
+            "malloc=%#llx calloc=%#llx realloc=%#llx free=%#llx\n",
+            (unsigned long long)lstart, (unsigned long long)lend, path,
+            (unsigned long long)syms[0], (unsigned long long)syms[1],
+            (unsigned long long)syms[2], (unsigned long long)syms[3]);
 
     for (int k = 0; k < ALLOC_NKIND; k++) {
+        const char *fm = getenv("ELFTRACE_ALLOC_KIND");
+        if (fm && strchr(fm, '0' + k) == NULL)
+            continue;           /* 诊断: 只拦截指定 kind */
         uint32_t w = 0;
         if (atmem_rw(pid, 0, syms[k], &w, 4) < 0) {
             warn("alloc: cannot read entry %#llx",
@@ -554,12 +748,12 @@ int alloc_trace_arm(struct alloc_trace_ctx **ctx_out, pid_t pid,
             free(ctx);
             return -1;
         }
-        /* 入口首条指令须可内联: 拒绝分支/PC 相对/svc */
-        if (a64_is_b(w) || a64_is_bl(w) || a64_is_bcond(w) ||
-            a64_is_cbz(w) || a64_is_cbnz(w) || a64_is_tbz(w) ||
-            a64_is_tbnz(w) || a64_is_adr(w) || a64_is_adrp(w) ||
-            a64_is_ldr_literal(w) || a64_is_svc0(w) || a64_is_br(w)) {
-            warn("alloc: entry %#llx first insn %08x not inlineable",
+        /* 入口首条指令须可内联/重定位: b.cond/cbz/cbnz/b/bl 由生成器
+           重定位到跳板; 拒绝 tbz/tbnz/adr/adrp/ldr 字面量/svc/br/ret */
+        if (a64_is_tbz(w) || a64_is_tbnz(w) || a64_is_adr(w) ||
+            a64_is_adrp(w) || a64_is_ldr_literal(w) ||
+            a64_is_svc0(w) || a64_is_br(w)) {
+            warn("alloc: entry %#llx first insn %08x not relocatable",
                  (unsigned long long)syms[k], w);
             free(ctx);
             return -1;
@@ -615,7 +809,7 @@ int alloc_trace_arm(struct alloc_trace_ctx **ctx_out, pid_t pid,
 
     /* 跳板页 (就近 libc) */
     size_t need = ((ctx->n_funcs * ALLOC_BLOCK_SIZE + 0xfff) & ~0xfffULL);
-    uint64_t taddr = alloc_find_gap(lend, need);
+    uint64_t taddr = alloc_find_gap(pid, lend, need);
     if (!taddr) {
         warn("alloc: no gap near libc");
         inject_syscall(pid, regs, 215, ret, buf_size, 0, 0, 0, 0, NULL);
@@ -641,9 +835,17 @@ int alloc_trace_arm(struct alloc_trace_ctx **ctx_out, pid_t pid,
         uint8_t blk[ALLOC_BLOCK_SIZE];
         size_t n = alloc_record_block(
             blk, block_abs, ctx->funcs[i].first_insn,
+            ctx->funcs[i].pc,
             ctx->funcs[i].pc + 4, ctx->tls,
             ctx->abuf_addr + 24, ctx->abuf_addr + 32,
             ctx->abuf_addr + 40, ctx->funcs[i].kind);
+        if (!n) {
+            warn("alloc: block gen failed for %#llx (kind %d)",
+                 (unsigned long long)ctx->funcs[i].pc,
+                 ctx->funcs[i].kind);
+            free(ctx);
+            return -1;
+        }
         if (atmem_rw(pid, 1, block_abs, blk, n) < 0) {
             warn("alloc: cannot write block for %#llx",
                  (unsigned long long)ctx->funcs[i].pc);
@@ -658,6 +860,38 @@ int alloc_trace_arm(struct alloc_trace_ctx **ctx_out, pid_t pid,
             continue;
         }
         o += ALLOC_BLOCK_SIZE;
+    }
+
+    /* icache/dcache 刷新: patch 的函数入口页 + 跳板页 */
+    {
+        size_t n_ranges = ctx->n_funcs + ctx->n_pages;
+        size_t list_bytes = 8 + n_ranges * 16;
+        uint8_t *lst = xcalloc(1, list_bytes);
+        uint8_t *lp = lst;
+        uint64_t v = n_ranges;
+        memcpy(lp, &v, 8);
+        lp += 8;
+        for (size_t i = 0; i < ctx->n_funcs; i++) {
+            v = ctx->funcs[i].pc & ~0xfffULL;
+            memcpy(lp, &v, 8);
+            lp += 8;
+            v = (ctx->funcs[i].pc & ~0xfffULL) + 4096;
+            memcpy(lp, &v, 8);
+            lp += 8;
+        }
+        for (size_t i = 0; i < ctx->n_pages; i++) {
+            v = ctx->pages[i];
+            memcpy(lp, &v, 8);
+            lp += 8;
+            v = ctx->pages[i] + 4096;
+            memcpy(lp, &v, 8);
+            lp += 8;
+        }
+        uint64_t list_abs = ctx->abuf_addr + ctx->abuf_size - 4096;
+        if (atmem_rw(pid, 1, list_abs, lst, list_bytes) == 0 &&
+            !getenv("ELFTRACE_ALLOC_NOFLUSH"))
+            alloc_flush_ranges(pid, regs, list_abs, n_ranges);
+        free(lst);
     }
 
     /* 侧车目录 */

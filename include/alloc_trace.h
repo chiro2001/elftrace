@@ -44,12 +44,15 @@ enum {
 #define ALLOC_ORIG_NEXT_OFF      0x220
 #define ALLOC_RET_LABEL_OFF      0x228
 #define ALLOC_KIND_OFF           0x230
+#define ALLOC_DIAG_RET_OFF       0x250   /* 诊断: 最近返回值 */
+#define ALLOC_DIAG_CNT_OFF       0x258   /* 诊断: 调用计数 */
 
 struct alloc_trace_ctx;
 
 /* 记录跳板生成器 (导出供单元测试) */
 size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
-                          uint32_t saved_insn, uint64_t orig_next,
+                          uint32_t saved_insn, uint64_t orig_pc,
+                          uint64_t orig_next,
                           uint64_t tls, uint64_t hdr_event_ptr_addr,
                           uint64_t hdr_events_end_addr,
                           uint64_t hdr_overflow_addr, uint64_t kind);

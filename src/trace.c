@@ -85,9 +85,9 @@ struct trace_ctx {
     int have_pending;
     struct collect_snapshot prev_b; /* 上一 syscall 边界完整镜像 (diff 基线) */
     int have_prev_b;
+    int alloc_enabled;          /* --alloc-replay (x86 上仅告警) */
 #if defined(__aarch64__)
     int atomic_enabled;         /* --atomic-replay */
-    int alloc_enabled;          /* --alloc-replay */
     uint64_t atomic_buf_size;   /* 事件缓冲 (默认 64MB) */
     struct atomic_trace_ctx *atomic;
     struct alloc_trace_ctx *alloc;
@@ -663,13 +663,14 @@ int trace_main(int argc, char **argv)
 #if defined(__aarch64__)
     /* 武装原子记录: 再 INTERRUPT 停止目标 → 注入/扫描/patch →
        恢复 PTRACE_SYSCALL 运行 */
-    if (tc.atomic_enabled) {
+    if (tc.atomic_enabled || tc.alloc_enabled) {
         if (collect_interrupt_sc(&tc) == 0) {
             struct user_regs_struct rr;
             struct iovec io = {.iov_base = &rr, .iov_len = sizeof(rr)};
             if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
                        &io) == 0) {
-                if (atomic_trace_arm(&tc.atomic, pid, &rr, tc.out,
+                if (tc.atomic_enabled &&
+                    atomic_trace_arm(&tc.atomic, pid, &rr, tc.out,
                                      tc.atomic_buf_size, value_sites,
                                      vr_record_all) < 0)
                     warn("trace: atomic replay unavailable, continuing "
