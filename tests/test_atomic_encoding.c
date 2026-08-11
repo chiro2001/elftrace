@@ -33,7 +33,7 @@ int main(void)
         0xc8a07c22U, 0xc8a0fc22U, 0xc8e07c22U, 0xc8e0fc22U,
     };
     static const uint32_t cas32[] = {
-        0x08a07c22U, 0x08a0fc22U, 0x08e07c22U, 0x08e0fc22U,
+        0x88a07c22U, 0x88a0fc22U, 0x88e07c22U, 0x88e0fc22U,
     };
     for (size_t i = 0; i < 4; i++) {
         CHECK(a64_is_lse_cas(cas64[i], &rs, &rt, &rn),
