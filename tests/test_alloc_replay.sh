@@ -48,5 +48,12 @@ if [ "$rc" -ne 11 ]; then
     exit 1
 fi
 
-tf_pass "alloc replay (3 events ok, fused=77, overrun=9, mismatch=11)"
+"${RUN[@]}" "$TF_TMP/test_alloc_replay" argmis
+rc=$?
+if [ "$rc" -ne 12 ]; then
+    echo "FAIL: alloc replay arg mismatch (expected exit 12, got $rc)"
+    exit 1
+fi
+
+tf_pass "alloc replay (ok/fused/overrun/mismatch/argmis)"
 tf_finish

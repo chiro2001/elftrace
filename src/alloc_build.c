@@ -93,6 +93,14 @@ size_t alloc_replay_block(uint8_t *out, uint64_t block_abs,
     memcpy(p, &w, 4); p += 4;              /* b.eq +12 (跳过 8B 兜底) */
     uint8_t *mis = p;                       /* movz x22,#11; b bail (8B) */
     p += 8;
+    w = b_ldr(23, 21, 8);
+    memcpy(p, &w, 4); p += 4;              /* x23 = [event+8] 录制参数 */
+    w = 0xEB17001FU;
+    memcpy(p, &w, 4); p += 4;              /* cmp x0,x24 (调用参数一致) */
+    w = 0x54000060U;
+    memcpy(p, &w, 4); p += 4;              /* b.eq +12 (跳过 8B 兜底) */
+    uint8_t *argmis = p;                    /* movz x22,#12; b bail (8B) */
+    p += 8;
     w = b_ldr(0, 21, 24);
     memcpy(p, &w, 4); p += 4;              /* x0 = [event+24] ret */
     w = b_addi(18, 18, 1);
@@ -104,14 +112,27 @@ size_t alloc_replay_block(uint8_t *out, uint64_t block_abs,
        exit_abs==0 时禁用 (逐事件返回, 靠 TO 站点/循环计数退出)。 */
     w = b_ldr(20, 16, 0x238);
     memcpy(p, &w, 4); p += 4;              /* exit_abs */
-    w = 0xB4000094U;
-    memcpy(p, &w, 4); p += 4;              /* cbz x20, +16 (跳过 3 条) */
+    uint8_t *fused_cbz = p;
+    w = 0xB4000000U | (20U << 5);           /* cbz x20 (占位, 回填) */
+    memcpy(p, &w, 4); p += 4;
     w = 0xEB13025FU;
     memcpy(p, &w, 4); p += 4;              /* cmp x18,x19 */
-    w = 0x54000041U;
-    memcpy(p, &w, 4); p += 4;              /* b.ne +8 (跳过 br) */
+    uint8_t *fused_bne = p;
+    w = 0x54000000U | 1U;                   /* b.ne (占位, 回填) */
+    memcpy(p, &w, 4); p += 4;
     w = 0xD61F0280U;
     memcpy(p, &w, 4); p += 4;              /* br x20 */
+    uint8_t *restore = p;
+    {
+        uint32_t cbz = 0xB4000000U |
+                       (((uint32_t)((restore - fused_cbz) / 4) &
+                         0x7FFFF) << 5) | 20U;
+        memcpy(fused_cbz, &cbz, 4);
+        uint32_t bne = 0x54000000U |
+                       (((uint32_t)((restore - fused_bne) / 4) &
+                         0x7FFFF) << 5) | 1U;
+        memcpy(fused_bne, &bne, 4);
+    }
     w = 0xA8C17FF7U;
     memcpy(p, &w, 4); p += 4;              /* ldp x23,xzr,[sp],#16 */
     w = 0xA8C15BF5U;
@@ -153,16 +174,21 @@ size_t alloc_replay_block(uint8_t *out, uint64_t block_abs,
     {
         uint32_t w9 = b_movz(22, 9, 0);
         uint32_t w11 = b_movz(22, 11, 0);
+        uint32_t w12 = b_movz(22, 12, 0);
         uint32_t bw9 = a64_encode_b(block_abs + (uint64_t)(ovr + 4 - out),
                                     block_abs + (uint64_t)(bail - out));
         uint32_t bw11 = a64_encode_b(block_abs + (uint64_t)(mis + 4 - out),
                                      block_abs + (uint64_t)(bail - out));
-        if (!bw9 || !bw11)
+        uint32_t bw12 = a64_encode_b(block_abs + (uint64_t)(argmis + 4 - out),
+                                     block_abs + (uint64_t)(bail - out));
+        if (!bw9 || !bw11 || !bw12)
             return 0;
         memcpy(ovr, &w9, 4);
         memcpy(ovr + 4, &bw9, 4);
         memcpy(mis, &w11, 4);
         memcpy(mis + 4, &bw11, 4);
+        memcpy(argmis, &w12, 4);
+        memcpy(argmis + 4, &bw12, 4);
     }
 
     v = cursor_addr; memcpy(out + 0x200, &v, 8);

@@ -151,6 +151,12 @@ static uint32_t b_br(unsigned rn)
     return 0xD61F0000U | (rn << 5);
 }
 
+static int cmp_u64p(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
 /* ---- 生成的 stub blob (按目标架构选择) ---- */
 extern const unsigned char stub_blob_x86_64[];
 extern const unsigned int stub_blob_x86_64_len;
@@ -2474,6 +2480,59 @@ synth_done:
             uint64_t events_abs = base + blob->size;
             buf_append(blob, g_alloc_build.events + c_from * 32,
                        (size_t)total * 32);
+
+            /* 3.7b alloc 引用页预映射 (M3 子集): 窗口事件里
+               malloc/calloc/realloc 返回指针 + size 覆盖的页面, 若未被
+               初始段/已有 pload 覆盖, 补零填充 RW 映射 (filesz=0)。
+               快照 [heap] 段的 brk 顶可能与录制时刻差一页 (检查点
+               粒度/边界相位), 切片程序写返回指针会 SEGV。 */
+            {
+                enum { ALLOC_PG_CAP = 1 << 18 };
+                uint64_t *pgs = xmalloc(ALLOC_PG_CAP * sizeof(*pgs));
+                size_t np = 0;
+                for (size_t e = 0; e < total && np < ALLOC_PG_CAP; e++) {
+                    const uint8_t *ev =
+                        g_alloc_build.events + (c_from + e) * 32;
+                    uint32_t k;
+                    uint64_t sz, ret;
+                    memcpy(&k, ev, 4);
+                    memcpy(&sz, ev + 8, 8);
+                    memcpy(&ret, ev + 24, 8);
+                    if (k > 2 || !ret || !sz)
+                        continue;
+                    if (sz > (1ULL << 24))
+                        sz = 1ULL << 24;   /* 防御上限 16MB */
+                    for (uint64_t pg = ret & ~0xfffULL;
+                         pg < ret + sz && np < ALLOC_PG_CAP;
+                         pg += 0x1000)
+                        pgs[np++] = pg >> 12;
+                }
+                /* 排序去重 → 合并连续页区间 */
+                qsort(pgs, np, sizeof(*pgs), cmp_u64p);
+                size_t w = 0;
+                for (size_t i = 0; i < np; i++) {
+                    if (w && pgs[w - 1] == pgs[i])
+                        continue;
+                    pgs[w++] = pgs[i];
+                }
+                np = w;
+                for (size_t i = 0; i < np; ) {
+                    size_t j = i + 1;
+                    while (j < np && pgs[j] == pgs[j - 1] + 1)
+                        j++;
+                    uint64_t va = pgs[i] << 12;
+                    uint64_t len = (pgs[j - 1] - pgs[i] + 1) << 12;
+                    if (!range_covered(segs, nsegs, pl, npl, va, len))
+                        spload_add(&pl, &npl, &pl_cap, va, len,
+                                   PF_R | PF_W);
+                    i = j;
+                }
+                free(pgs);
+                fprintf(stderr,
+                        "alloc: premap %zu distinct alloc-referenced "
+                        "page%s\n",
+                        np, np == 1 ? "" : "s");
+            }
 
             /* 跳板页 (就近首个入口所在段) */
             uint64_t lseg_end = 0;

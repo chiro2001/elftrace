@@ -33,7 +33,7 @@ static void flush_icache(void *p, size_t n)
     __builtin___clear_cache((char *)p, (char *)p + n);
 }
 
-static uint64_t call_fake(uint64_t arg)
+__attribute__((noinline)) static uint64_t call_fake(uint64_t arg)
 {
     register uint64_t r asm("x0") = arg;
     register uint64_t x16out asm("x19");
@@ -158,22 +158,25 @@ int main(int argc, char **argv)
 
     uint64_t rc = 0;
     if (strcmp(mode, "overrun") == 0) {
-        if (call_fake(1) != 0x4000)
+        if (call_fake(0x100) != 0x4000)
             rc = 2;             /* 首个事件 ret 错 */
         if (!rc)
-            call_fake(2);       /* 超消费 → exit(9) */
+            call_fake(0x100);   /* 超消费 → exit(9) */
         rc = rc ? rc : 90;      /* 未 bail: 失败 */
     } else if (strcmp(mode, "mismatch") == 0) {
         call_fake(1);           /* → exit(11) */
         rc = 91;
     } else if (strcmp(mode, "fuse") == 0) {
         for (uint64_t i = 0; i < n; i++)
-            call_fake(i + 1);   /* 第 3 次消费后 → exit(77/78) */
+            call_fake(0x100 + i); /* 第 3 次消费后 → exit(77/78) */
         rc = 92;                /* 未融合退出: 失败 */
+    } else if (strcmp(mode, "argmis") == 0) {
+        call_fake(0x200);       /* 参数与录制 size 不符 → exit(12) */
+        rc = 93;
     } else {
         uint64_t exp[3] = {0x4000, 0x4111, 0x4222};
         for (uint64_t i = 0; i < n; i++) {
-            uint64_t r = call_fake(i + 1);
+            uint64_t r = call_fake(0x100 + i);
             if (r != exp[i]) {
                 rc = 10 + i;    /* 返回值错 */
                 break;
