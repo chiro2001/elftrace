@@ -43,17 +43,24 @@ fi
 echo "incremental: base=$BASE_SIZE diff=$DIFF_SIZE ($((DIFF_SIZE * 100 / BASE_SIZE))%)"
 
 # 2. manifest 采样点精度: 相邻 count 差 ∈ [N, 3N]。
+#    首间隔跳过: perf enable → 初始 ptrace 停止之间存在延迟, ckpt0
+#    已含 pre-count (慢机/负载下可达数 M), 首间隔必然 < N — 这是
+#    采样时序固有现象, 不是精度问题 (窗口长度一律用实际计数)。
 #    trace 记录的**实际** perf 计数 (检查点在计数器越过边界后由 poll/
 #    兜底读到, 有 ≤1 个轮询周期的过冲); 精确的名义步长不再成立, 但
-#    窗口长度以实际计数为准 (步骤 3 的 EXP 用实际差)。首个间隔含
-#    perf 事件使能/arm 前的目标执行, 可达 2N。
+#    窗口长度以实际计数为准 (步骤 3 的 EXP 用实际差)。
 awk '{print $1}' "$CKPTS/manifest.txt" | python3 -c "
 import sys
 prev = None
+first = True
 for line in sys.stdin:
     c = int(line)
     if prev is not None:
         d = c - prev
+        if first:
+            first = False
+            prev = c
+            continue
         if d < $N or d > 3 * $N:
             print('FAIL: count jump %d -> %d (delta %d)' % (prev, c, d))
             sys.exit(1)

@@ -62,7 +62,7 @@ static int parse_elf(const char *path)
     return 0;
 }
 
-static long do_ptrace(enum __ptrace_request req, pid_t pid, void *a, void *b)
+static long do_ptrace(int req, pid_t pid, void *a, void *b)
 {
     errno = 0;
     long r = ptrace(req, pid, a, b);
