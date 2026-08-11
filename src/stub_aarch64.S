@@ -125,7 +125,9 @@ rst_desc:
     .quad 0                    /* replay_size @0xC0 (builder 填) */
     .quad 0                    /* replay_cur @0xC8 (stub 运行时维护) */
     .quad 0                    /* tls @0xD0 (builder 填: aarch64 TPIDR_EL0) */
-    .space 0x100 - (.-rst_desc)  /* 补足 256B */
+    .quad 0                    /* alloc_cursor_abs @0x100 (builder 填) */
+    .quad 0                    /* alloc_total_abs @0x108 (builder 填) */
+    .space 0x110 - (.-rst_desc)  /* 补足 272B (aarch64: 含 alloc 槽) */
 
 /* ===================== FPU 状态 (NT_FPREGSET 528B) ===================== */
 .org STUB_FPU_OFF
@@ -2271,6 +2273,33 @@ mlr_entry_next:
     sub  x18, x18, #1
     b    mlr_entry
 
+/* alloc 重放欠消费检查 (位于遥测区之后、退出代码之前的空闲区):
+ * 切片结束时游标必须 == 总事件数。失配 = 控制流分歧 (少走了录制中的
+ * 分配路径), 写遥测 reason=10 并 exit(65)。 */
+.org STUB_ALLOC_UNDERCHECK_OFF
+alloc_undercheck:
+    ldr  x0, [x16, #RST_DESC_ALLOC_TOTAL_ABS]
+    cbz  x0, se_exit
+    ldr  x0, [x0]               /* total 值 (desc 槽里是槽绝对地址) */
+    ldr  x1, [x16, #RST_DESC_ALLOC_CURSOR_ABS]
+    ldr  x2, [x1]
+    cmp  x2, x0
+    b.eq se_exit
+    movz x4, #(STUB_TELEMETRY_OFF & 0xffff)
+    movk x4, #(STUB_TELEMETRY_OFF >> 16), lsl #16
+    add  x3, x16, x4                /* tel_abs */
+    movz x5, #0x4554
+    movk x5, #0x4D4C, lsl #16       /* "TELM" */
+    str  x5, [x3]
+    movz x5, #10                    /* reason=10: alloc 欠消费 */
+    str  x5, [x3, #8]
+    str  x2, [x3, #0x18]            /* ordinal = cursor */
+    str  x0, [x3, #0x20]            /* limit = total */
+    mov  x0, #65
+    mov  x8, #94
+    svc  #0
+    b    .
+
 /* ===================== strict: 退出代码 =====================
  * 唯一路径退出/循环结束跳到这里: 真实 exit_group(0)。 */
 .org STUB_STRICT_EXIT_OFF
@@ -2284,14 +2313,14 @@ strict_exit_code:
     movk x17, #(STUB_STRICT_EXIT_OFF >> 16), lsl #16
     sub  x16, x16, x17              /* blob base */
     ldr  x0, [x16, #RST_DESC_PROBE_ENABLED]
-    cbz  x0, se_exit
+    cbz  x0, alloc_undercheck
     mov  x0, #AT_FDCWD
     ldr  x1, [x16, #RST_DESC_PROBE_PATH_ABS]
     mov  x2, #0x241                 /* O_WRONLY|O_CREAT|O_TRUNC */
     mov  x3, #0644
     mov  x8, #56                    /* openat */
     svc  #0
-    tbnz x0, #63, se_exit
+    tbnz x0, #63, alloc_undercheck
     mov  x19, x0                    /* fd */
     ldr  x0, [x16, #RST_DESC_PROBE_BUF_ABS]
     movz x3, #0x4C45                /* "ELPR" LE */
@@ -2307,6 +2336,7 @@ strict_exit_code:
     mov  x0, x19
     mov  x8, #57                    /* close */
     svc  #0
+    b    alloc_undercheck
 se_exit:
     mov  x0, #0
     mov  x8, #94

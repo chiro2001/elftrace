@@ -29,7 +29,8 @@ OBJS    := $(BUILD)/main.o $(BUILD)/util.o $(BUILD)/freeze.o $(BUILD)/collect.o 
 	$(BUILD)/build.o $(BUILD)/dump.o $(BUILD)/dwarf.o $(BUILD)/trace.o \
 	$(BUILD)/inject.o $(BUILD)/bundle.o $(BUILD)/bundle_main.o \
 	$(BUILD)/stub_blob_$(ARCH).o $(BUILD)/disasm.o $(BUILD)/a64.o \
-	$(BUILD)/atomic_a64.o $(BUILD)/atomic_trace.o $(BUILD)/alloc_trace.o
+	$(BUILD)/atomic_a64.o $(BUILD)/atomic_trace.o $(BUILD)/alloc_trace.o \
+	$(BUILD)/alloc_build.o
 
 all: $(TOOLS)
 

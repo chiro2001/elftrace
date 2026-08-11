@@ -28,25 +28,33 @@
 
 /* ---- 固定区域偏移 ---- */
 #define STUB_DESC_OFF       0x0000
-#define STUB_FPU_OFF        0x0100
+#if defined(__aarch64__)
+/* aarch64: desc 256B + alloc 重放游标/总数槽 (0x100/0x108), 后续区 +0x10 */
+#define STUB_DESC_SIZE      0x110
+#define STUB_DESC_SHIFT     0x10
+#else
+#define STUB_DESC_SIZE      0x100
+#define STUB_DESC_SHIFT     0x00
+#endif
+#define STUB_FPU_OFF        (STUB_DESC_SIZE)
 #define STUB_FPU_CAP        0x1000       /* xstate 最大容量 4096B */
-#define STUB_SIGMASK_OFF    0x1100
-#define STUB_SIGACTS_OFF    0x1108
+#define STUB_SIGMASK_OFF    (STUB_FPU_OFF + 0x1000)
+#define STUB_SIGACTS_OFF    (STUB_SIGMASK_OFF + 8)
 #define STUB_SIGACTS_SIZE   (64 * 40)    /* 64 x elftrace_sigact */
 #if defined(__aarch64__)
 /* aarch64: regs 272B (34x8), 后续区整体后移 */
-#define STUB_REGS_OFF       0x1B08
+#define STUB_REGS_OFF       (STUB_SIGACTS_OFF + 0xA00)
 #define STUB_REGS_SIZE      (34 * 8)     /* aarch64 struct pt_regs */
-#define STUB_MAPS_BUF       0x1C20
+#define STUB_MAPS_BUF       (STUB_REGS_OFF + 0x118)
 #define STUB_MAPS_SIZE      0x1000
-#define STUB_IPC_ATTR       0x2C20
-#define STUB_IPC_SIGACT     0x2CA0
-#define STUB_STACK_OFF      0x2CD0
+#define STUB_IPC_ATTR       (STUB_MAPS_BUF + 0x1000)
+#define STUB_IPC_SIGACT     (STUB_IPC_ATTR + 0x80)
+#define STUB_STACK_OFF      (STUB_IPC_SIGACT + 0x30)
 #define STUB_STACK_SIZE     0x2000       /* 8KB */
 #define STUB_STACK_TOP      (STUB_STACK_OFF + STUB_STACK_SIZE)
-#define STUB_FRAME_OFF      0x4CD0       /* rt_sigreturn 信号帧 (aarch64 大) */
+#define STUB_FRAME_OFF      STUB_STACK_TOP /* rt_sigreturn 信号帧 (aarch64 大) */
 #define STUB_FRAME_SIZE     0x1600       /* 5632B: siginfo+ucontext+fpsimd */
-#define STUB_ENTRY_OFF      0x62D0
+#define STUB_ENTRY_OFF      (STUB_FRAME_OFF + STUB_FRAME_SIZE)
 #else
 #define STUB_REGS_OFF       0x1B08
 #define STUB_REGS_SIZE      (27 * 8)     /* x86_64 struct pt_regs */
@@ -71,6 +79,7 @@
 #define STUB_STRICT_COMP_OFF (STUB_STRICT_AREA_OFF)
 #define STUB_STRICT_LOOP_OFF (STUB_STRICT_AREA_OFF + 0x900)
 #define STUB_STRICT_COUNT_OFF (STUB_STRICT_AREA_OFF + 0x940)
+#define STUB_ALLOC_UNDERCHECK_OFF (STUB_STRICT_AREA_OFF + 0xC80)
 #define STUB_STRICT_EXIT_OFF (STUB_FIXED_SIZE - 0x100)
 #define STUB_STRICT_BAIL_OFF (STUB_FIXED_SIZE - 0x40)
 
@@ -121,6 +130,8 @@
 #define RST_DESC_PROBE_BUF_ABS  0xE8 /* probe 缓冲区绝对地址 (含 16B 头) */
 #define RST_DESC_PROBE_BUF_SIZE 0xF0 /* probe 已用字节数 (stub 运行时维护) */
 #define RST_DESC_PROBE_PATH_ABS 0xF8 /* probe 输出路径字符串绝对地址 */
+#define RST_DESC_ALLOC_CURSOR_ABS 0x100 /* alloc 重放游标槽绝对地址 (0=无, aarch64) */
+#define RST_DESC_ALLOC_TOTAL_ABS  0x108 /* alloc 重放总事件数槽绝对地址 */
 
 /* probe 文件头: magic "ELPR" + ver, 随后按记录顺序:
  *   dirty:  {vaddr u64, data[4096]}

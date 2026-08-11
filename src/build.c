@@ -27,6 +27,7 @@
 #include "arch.h"
 #include "a64.h"
 #include "atomic_a64.h"
+#include "alloc_build.h"
 
 /* --atomic-force-cas-pc: 仅对显式列出的 LSE CAS 站点生成强制成功
  * 跳板。默认不 patch 任何 LSE CAS: 对 CPython GIL/libc 锁这类
@@ -42,6 +43,75 @@ static size_t g_n_force_cas = 0;
  * (对 lockfree 负载即入队 CAS 的 desired, 1:1)。 */
 static uint64_t g_malloc_replay_pcs[16];
 static size_t g_n_malloc_replay = 0;
+
+/* ---- trace --alloc-replay 侧车 (allocs/) ---- */
+struct alloc_build {
+    int have;
+    uint64_t pcs[4];            /* libc 入口运行时地址 */
+    uint32_t first[4];          /* 原首条指令 (快照含记录跳板, 需还原) */
+    int kinds[4];
+    size_t n_funcs;
+    uint64_t *ck_counts;        /* 每检查点累计事件数 (ckpt_000001..) */
+    size_t n_ck;
+    uint8_t *events;            /* 全局事件流 (32B/条) */
+    size_t n_events;
+};
+
+static void alloc_build_load(const char *dir, struct alloc_build *ab)
+{
+    memset(ab, 0, sizeof(*ab));
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/allocs/funcs.bin", dir);
+    FILE *f = fopen(p, "rb");
+    if (!f)
+        return;
+    while (ab->n_funcs < 4) {
+        uint8_t rec[16];
+        if (fread(rec, 1, 16, f) != 16)
+            break;
+        memcpy(&ab->pcs[ab->n_funcs], rec, 8);
+        memcpy(&ab->first[ab->n_funcs], rec + 8, 4);
+        memcpy(&ab->kinds[ab->n_funcs], rec + 12, 4);
+        ab->n_funcs++;
+    }
+    fclose(f);
+    for (size_t k = 0; k < 1 << 20; k++) {
+        snprintf(p, sizeof(p), "%s/allocs/ckpt_%06zu.bin", dir, k + 1);
+        FILE *cf = fopen(p, "rb");
+        if (!cf)
+            break;
+        uint64_t c = 0;
+        if (fread(&c, 1, 8, cf) == 8) {
+            ab->ck_counts = xrealloc(ab->ck_counts,
+                                     (ab->n_ck + 1) * sizeof(uint64_t));
+            ab->ck_counts[ab->n_ck++] = c;
+        }
+        fclose(cf);
+    }
+    snprintf(p, sizeof(p), "%s/allocs/events.bin", dir);
+    f = fopen(p, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz > 0) {
+            ab->events = xmalloc((size_t)sz);
+            if (fread(ab->events, 1, (size_t)sz, f) != (size_t)sz) {
+                free(ab->events);
+                ab->events = NULL;
+                sz = 0;
+            }
+            ab->n_events = (size_t)sz / 32;
+        }
+        fclose(f);
+    }
+    ab->have = ab->n_funcs > 0 && ab->n_events > 0 && ab->n_ck > 0;
+}
+
+static struct alloc_build g_alloc_build;
+
+static uint32_t a64_patch_b(uint64_t from, uint64_t to);
+static void blob_patch_u64(uint8_t *blob, uint64_t off, uint64_t val);
 
 /* --no-atomic-run-burn: 禁用整 run 烧录 (回退逐访问值回放), 对照测量
  * run-burn 的指令倍率收益 (测试/诊断用)。 */
@@ -955,6 +1025,7 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                                 struct rec_tmp *recs, size_t nrecs,
                                 int have_map,
                                 const struct atomic_build *ab,
+                                long from_ckpt, long to_ckpt,
                                 uint64_t exit_override,
                                 const uint64_t *ckpt_pcs, size_t nckpt_pcs,
                                 uint64_t count_from, uint64_t count_to,
@@ -2344,6 +2415,117 @@ synth_done:
         free(mt);
     }
 
+    /* 6.7 alloc 结果重放 (trace --alloc-replay)
+     * 事件流 (录制 {kind,size,caller,ret}) 全局 FIFO; 每个分配器入口
+     * patch 成重放跳板, 按序消费: 校验 kind → x0=录制 ret → 游标++。
+     * 超消费/kind 失配 → 遥测 + bail(67); 切片结束时游标 != 总数
+     * (欠消费) → strict 退出代码里 reason=10 + exit(65)。 */
+    if (g_alloc_build.have && exit_override) {
+        /* 窗口裁剪: ck_counts[k] 对应 trace 检查点 k+1 (arm 前无事件) */
+        uint64_t c_from = 0, c_to = 0;
+        if (g_alloc_build.n_ck) {
+            if (to_ckpt >= 0 && (size_t)to_ckpt <= g_alloc_build.n_ck)
+                c_to = g_alloc_build.ck_counts[to_ckpt - 1];
+            else
+                c_to = g_alloc_build.ck_counts[g_alloc_build.n_ck - 1];
+            if (from_ckpt > 0 && (size_t)from_ckpt <= g_alloc_build.n_ck)
+                c_from = g_alloc_build.ck_counts[from_ckpt - 1];
+        }
+        if (c_to > g_alloc_build.n_events)
+            c_to = g_alloc_build.n_events;
+        if (c_from > c_to)
+            c_from = c_to;
+        uint64_t total = c_to - c_from;
+        if (!total) {
+            warn("alloc: 窗口内无分配事件 (from %llu to %llu)",
+                 (unsigned long long)c_from, (unsigned long long)c_to);
+        } else {
+            /* 事件表 + 游标/总数 进 blob (RW) */
+            uint64_t cursor_abs = base + blob->size;
+            uint64_t v = 0;         /* 游标相对裁剪后事件表 (从 0 起) */
+            buf_append(blob, &v, 8);
+            uint64_t total_abs = base + blob->size;
+            v = total;
+            buf_append(blob, &v, 8);
+            uint64_t events_abs = base + blob->size;
+            buf_append(blob, g_alloc_build.events + c_from * 32,
+                       (size_t)total * 32);
+
+            /* 跳板页 (就近首个入口所在段) */
+            uint64_t lseg_end = 0;
+            for (size_t f = 0; f < g_alloc_build.n_funcs; f++)
+                for (size_t i = 0; i < nsegs; i++)
+                    if (g_alloc_build.pcs[f] >= segs[i].vaddr &&
+                        g_alloc_build.pcs[f] <
+                            segs[i].vaddr + segs[i].filesz) {
+                        if (segs[i].vaddr + segs[i].filesz > lseg_end)
+                            lseg_end = segs[i].vaddr + segs[i].filesz;
+                        break;
+                    }
+            size_t need = ((g_alloc_build.n_funcs * 0x280 + 0xfff) &
+                           ~0xfffULL);
+            uint64_t taddr = find_gap_near(segs, nsegs, pl, npl,
+                                           lseg_end, need, base,
+                                           blob->size);
+            if (!taddr)
+                die("alloc: cannot place replay trampoline page");
+            spload_add(&pl, &npl, &pl_cap, taddr, need,
+                       PF_R | PF_W | PF_X);
+            uint8_t *page = xcalloc(1, need);
+            size_t o = 0;
+            for (size_t f = 0; f < g_alloc_build.n_funcs; f++) {
+                uint64_t pc = g_alloc_build.pcs[f];
+                uint8_t *q = NULL;
+                for (size_t i = 0; i < nsegs; i++) {
+                    if (pc >= segs[i].vaddr &&
+                        pc < segs[i].vaddr + segs[i].filesz) {
+                        q = blob->data + payload_off +
+                            segs[i].payload_off +
+                            (pc - segs[i].vaddr);
+                        break;
+                    }
+                }
+                if (!q) {
+                    warn("alloc: entry %#llx not in payload", pc);
+                    continue;
+                }
+                /* 快照里该入口是记录跳板分支 (arm 后检查点), 还原原指令 */
+                memcpy(q, &g_alloc_build.first[f], 4);
+                size_t bl = alloc_replay_block(
+                    page + o, taddr + o, cursor_abs, total_abs,
+                    events_abs, (uint32_t)g_alloc_build.kinds[f],
+                    tel_abs, base + STUB_STRICT_BAIL_OFF, pc);
+                if (!bl)
+                    die("alloc: replay block gen failed for %#llx", pc);
+                uint32_t bw = a64_patch_b(pc, taddr + o);
+                memcpy(q, &bw, 4);
+                o += 0x280;
+                fprintf(stderr, "alloc: replay site %#llx kind=%d "
+                        "-> %#llx (events %llu..%llu)\n",
+                        pc, g_alloc_build.kinds[f], taddr + o - 0x280,
+                        (unsigned long long)c_from,
+                        (unsigned long long)c_to);
+            }
+            for (size_t i = 0; i < npl; i++) {
+                if (pl[i].vaddr == taddr) {
+                    pl[i].filesz = need;
+                    pl[i].data = page;
+                    break;
+                }
+            }
+            blob_patch_u64(blob->data, RST_DESC_ALLOC_CURSOR_ABS,
+                           cursor_abs);
+            blob_patch_u64(blob->data, RST_DESC_ALLOC_TOTAL_ABS,
+                           total_abs);
+            fprintf(stderr, "alloc: replay window events=%llu "
+                    "(cursor %#llx total %#llx events %#llx)\n",
+                    (unsigned long long)total,
+                    (unsigned long long)cursor_abs,
+                    (unsigned long long)total_abs,
+                    (unsigned long long)events_abs);
+        }
+    }
+
     /* 7. patch 目标代码: svc/回边/退出指令 → b <跳板> */
     for (size_t i = 0; i < nsites; i++) {
         struct strict_site *st = &sites[i];
@@ -3287,6 +3469,8 @@ int build_main(int argc, char **argv)
 #if defined(__aarch64__)
     if (mode_baremetal && bm_strict && ckpts && to_ckpt >= 0)
         atomic_load(ckpts, from_ckpt, to_ckpt, &ab);
+    if (mode_baremetal && bm_strict && ckpts)
+        alloc_build_load(ckpts, &g_alloc_build);
     /* atomic_load 内部 memset 重建 ab, 需重新回填 manifest 原始计数
        (atomic_orig_at 的插值 y 轴; 计数器带基线时不能用 ck_orig) */
     if (ab.have && ab.n_ck) {
@@ -4170,7 +4354,8 @@ int build_main(int argc, char **argv)
     if (mode_baremetal && bm_strict) {
         if (build_strict_aarch64(&s, &blob, base, blob_total, payload_off,
                                  segs,
-                                 recs, nrecs, have_map, &ab, exit_override,
+                                 recs, nrecs, have_map, &ab,
+                                 from_ckpt, to_ckpt, exit_override,
                                  ckpt_pcs, nckpt_pcs,
                                  ckpt_count0, ckpt_count_to,
                                  exit_count_override,

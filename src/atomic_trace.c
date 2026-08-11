@@ -19,9 +19,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-extern void inject_flush_icache(pid_t pid,
-                                const struct user_regs_struct *regs,
-                                unsigned long page, size_t len);
 #include <errno.h>
 #include <signal.h>
 #include <sys/ptrace.h>
@@ -33,6 +30,10 @@ extern void inject_flush_icache(pid_t pid,
 
 #include "elftrace.h"
 #include "collect.h"
+
+extern void inject_flush_icache(pid_t pid,
+                                const struct user_regs_struct *regs,
+                                unsigned long page, size_t len);
 #include "arch.h"
 #include "a64.h"
 #include "atomic_a64.h"

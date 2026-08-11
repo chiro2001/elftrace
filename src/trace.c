@@ -9,6 +9,7 @@
  * 计数从 trace 启动时刻起算 (相对计数); 检查点粒度 = N 条指令,
  * "第 xn 条指令" 对齐到最近检查点 (误差 < N)。
  */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

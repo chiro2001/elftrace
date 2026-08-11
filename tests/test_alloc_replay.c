@@ -1,0 +1,161 @@
+/* alloc 结果重放跳板独立单测 (qemu-aarch64 可跑)
+ *
+ * 构造假 malloc 入口 (patch 成 b <重放块>), 假事件表/游标/总数槽,
+ * 校验:
+ *   ok       : 按序消费 N 条事件, 返回录制 ret, 游标 == N;
+ *   overrun  : 消费超过总数 → bail, exit_group(9);
+ *   mismatch : 事件 kind 与重放块 kind 不符 → bail, exit_group(11)。
+ */
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include "alloc_build.h"
+#include "a64.h"
+
+#define BLK_ABS   0x40000000ULL
+#define EV_ABS    0x40010000ULL
+#define DATA_ABS  0x40020000ULL
+#define FAKE_ABS  0x40030000ULL
+#define BAIL_ABS  0x40040000ULL
+
+static void *map_fixed(uint64_t addr, size_t len)
+{
+    void *p = mmap((void *)(uintptr_t)addr, len,
+                   PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
+
+static uint64_t call_fake(uint64_t arg)
+{
+    register uint64_t r asm("x0") = arg;
+    register uint64_t x16out asm("x19");
+    register uint64_t x17out asm("x20");
+    __asm__ volatile(
+        "mov x16, %3\n\t"
+        "mov x17, %4\n\t"
+        "blr %5\n\t"
+        "mov %0, x16\n\t"
+        "mov %1, x17\n\t"
+        : "=r"(x16out), "=r"(x17out), "+r"(r)
+        : "r"(0x1111222233334444ULL), "r"(0x5555666677778888ULL),
+          "r"(FAKE_ABS)
+        : "x1", "x2", "x3", "x4", "x30", "memory");
+    if (x16out != 0x1111222233334444ULL)
+        return 0xDEAD000000000016ULL;
+    if (x17out != 0x5555666677778888ULL)
+        return 0xDEAD000000000017ULL;
+    return r;
+}
+
+/* bail 桩: 把 reason (x22) 作为 exit_group 码直接退出 */
+static void emit_bail_stub(uint8_t *p)
+{
+    uint32_t w = 0xAA1603E0U;   /* mov x0, x22 */
+    memcpy(p, &w, 4); p += 4;
+    w = 0xD2800BA8U;            /* mov x8, #93 */
+    memcpy(p, &w, 4); p += 4;
+    w = 0xD4000001U;            /* svc #0 */
+    memcpy(p, &w, 4); p += 4;
+    w = 0x14000000U;            /* b . */
+    memcpy(p, &w, 4);
+}
+
+static void setup_events(uint8_t *ev, uint64_t n, uint32_t kind)
+{
+    for (uint64_t i = 0; i < n; i++) {
+        uint8_t *e = ev + i * 32;
+        uint32_t k = kind;
+        uint64_t size = 0x100 + i;
+        uint64_t caller = 0x70000000ULL + i;
+        uint64_t ret = 0x4000 + i * 0x111;
+        memcpy(e + 0, &k, 4);
+        memcpy(e + 8, &size, 8);
+        memcpy(e + 16, &caller, 8);
+        memcpy(e + 24, &ret, 8);
+    }
+}
+
+int main(int argc, char **argv)
+{
+    const char *mode = argc > 1 ? argv[1] : "ok";
+    uint8_t *blk = map_fixed(BLK_ABS, 0x1000);
+    uint8_t *ev = map_fixed(EV_ABS, 0x1000);
+    uint8_t *data = map_fixed(DATA_ABS, 0x1000);
+    uint8_t *fake = map_fixed(FAKE_ABS, 0x1000);
+    uint8_t *bailp = map_fixed(BAIL_ABS, 0x1000);
+    if (!blk || !ev || !data || !fake || !bailp) {
+        printf("FAIL: mmap\n");
+        return 1;
+    }
+    emit_bail_stub(bailp);
+
+    uint64_t n = 0;
+    uint32_t kind = 0;
+    if (strcmp(mode, "overrun") == 0)
+        n = 1;
+    else if (strcmp(mode, "mismatch") == 0) {
+        n = 1;
+        kind = 1;               /* 块期待 calloc, 事件却是 malloc */
+    } else
+        n = 3;
+    setup_events(ev, n, 0);
+
+    uint64_t cursor_addr = DATA_ABS + 0x00;
+    uint64_t total_addr = DATA_ABS + 0x08;
+    uint64_t tel_abs = DATA_ABS + 0x100;
+    uint64_t cursor = 0, total = n;
+    memcpy((void *)(uintptr_t)cursor_addr, &cursor, 8);
+    memcpy((void *)(uintptr_t)total_addr, &total, 8);
+
+    size_t sz = alloc_replay_block(blk, BLK_ABS, cursor_addr, total_addr,
+                                   EV_ABS, kind, tel_abs, BAIL_ABS,
+                                   FAKE_ABS);
+    if (sz != 0x280) {
+        printf("FAIL: block size %zu\n", sz);
+        return 1;
+    }
+    uint32_t bw = a64_encode_b(FAKE_ABS, BLK_ABS);
+    if (!bw) {
+        printf("FAIL: patch branch\n");
+        return 1;
+    }
+    memcpy(fake, &bw, 4);
+
+    uint64_t rc = 0;
+    if (strcmp(mode, "overrun") == 0) {
+        if (call_fake(1) != 0x4000)
+            rc = 2;             /* 首个事件 ret 错 */
+        if (!rc)
+            call_fake(2);       /* 超消费 → exit(9) */
+        rc = rc ? rc : 90;      /* 未 bail: 失败 */
+    } else if (strcmp(mode, "mismatch") == 0) {
+        call_fake(1);           /* → exit(11) */
+        rc = 91;
+    } else {
+        uint64_t exp[3] = {0x4000, 0x4111, 0x4222};
+        for (uint64_t i = 0; i < n; i++) {
+            uint64_t r = call_fake(i + 1);
+            if (r != exp[i]) {
+                rc = 10 + i;    /* 返回值错 */
+                break;
+            }
+        }
+        if (!rc) {
+            memcpy(&cursor, (void *)(uintptr_t)cursor_addr, 8);
+            if (cursor != n)
+                rc = 20;        /* 游标未推进 */
+        }
+        if (!rc) {
+            uint64_t m;
+            memcpy(&m, (void *)(uintptr_t)tel_abs, 8);
+            if (m != 0)
+                rc = 21;        /* 成功路径不应写遥测 */
+        }
+    }
+    __asm__ volatile("mov x8, #93\n\t"
+                     "mov x0, %0\n\t"
+                     "svc #0\n\t" :: "r"(rc) : "x8", "x0");
+    return 1;                   /* 不可达 */
+}
