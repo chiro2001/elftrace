@@ -55,5 +55,17 @@ if [ "$rc" -ne 12 ]; then
     exit 1
 fi
 
-tf_pass "alloc replay (ok/fused/overrun/mismatch/argmis)"
+if ! "${RUN[@]}" "$TF_TMP/test_alloc_replay" calloc; then
+    echo "FAIL: alloc replay calloc zeroing (exit code != 0)"
+    exit 1
+fi
+
+"${RUN[@]}" "$TF_TMP/test_alloc_replay" callocbig
+rc=$?
+if [ "$rc" -ne 13 ]; then
+    echo "FAIL: alloc replay calloc cap (expected exit 13, got $rc)"
+    exit 1
+fi
+
+tf_pass "alloc replay (ok/fused/overrun/mismatch/argmis/calloc/callocbig)"
 tf_finish

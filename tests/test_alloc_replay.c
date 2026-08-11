@@ -55,6 +55,27 @@ __attribute__((noinline)) static uint64_t call_fake(uint64_t arg)
     return r;
 }
 
+__attribute__((noinline)) static uint64_t call_calloc(uint64_t nmemb,
+                                                      uint64_t esz)
+{
+    register uint64_t r asm("x0") = nmemb;
+    register uint64_t x16out asm("x19");
+    register uint64_t x17out asm("x20");
+    __asm__ volatile(
+        "mov x1, %3\n\t"
+        "mov x16, %4\n\t"
+        "mov x17, %5\n\t"
+        "blr %6\n\t"
+        "mov %0, x16\n\t"
+        "mov %1, x17\n\t"
+        : "=r"(x16out), "=r"(x17out), "+r"(r)
+        : "r"(esz), "r"(0x1111222233334444ULL),
+          "r"(0x5555666677778888ULL),
+          "r"(FAKE_ABS)
+        : "x1", "x2", "x3", "x4", "x30", "memory");
+    return r;
+}
+
 /* bail 桩: 把 reason (x22) 作为 exit_group 码直接退出 */
 static void emit_bail_stub(uint8_t *p)
 {
@@ -126,9 +147,25 @@ int main(int argc, char **argv)
     else if (strcmp(mode, "mismatch") == 0) {
         n = 1;
         kind = 1;               /* 块期待 calloc, 事件却是 malloc */
+    } else if (strcmp(mode, "calloc") == 0 ||
+               strcmp(mode, "callocbig") == 0) {
+        n = 1;
+        kind = 1;
     } else
         n = 3;
-    setup_events(ev, n, 0);
+    /* mismatch: 事件 kind 故意与块期待不同 (块 kind=1, 事件 kind=0) */
+    setup_events(ev, n, strcmp(mode, "mismatch") == 0 ? 0 : kind);
+    if (strcmp(mode, "calloc") == 0 ||
+        strcmp(mode, "callocbig") == 0) {
+        /* 单条 calloc 事件: nmemb=4, ret=DATA+0x400 (零化目标) */
+        uint8_t *e0 = ev;
+        uint32_t k = 1;
+        uint64_t size = 4, caller = 0x70000000ULL, ret = DATA_ABS + 0x400;
+        memcpy(e0 + 0, &k, 4);
+        memcpy(e0 + 8, &size, 8);
+        memcpy(e0 + 16, &caller, 8);
+        memcpy(e0 + 24, &ret, 8);
+    }
 
     uint64_t cursor_addr = DATA_ABS + 0x00;
     uint64_t total_addr = DATA_ABS + 0x08;
@@ -173,6 +210,25 @@ int main(int argc, char **argv)
     } else if (strcmp(mode, "argmis") == 0) {
         call_fake(0x200);       /* 参数与录制 size 不符 → exit(12) */
         rc = 93;
+    } else if (strcmp(mode, "calloc") == 0) {
+        memset((void *)(uintptr_t)(DATA_ABS + 0x400), 0xAA, 0x400);
+        uint64_t r = call_calloc(4, 0x100);
+        if (r != DATA_ABS + 0x400)
+            rc = 60;
+        else {
+            const uint8_t *z =
+                (const uint8_t *)(uintptr_t)(DATA_ABS + 0x400);
+            for (int i = 0; i < 0x400; i++)
+                if (z[i]) { rc = 61; break; }
+        }
+        if (!rc) {
+            memcpy(&cursor, (void *)(uintptr_t)cursor_addr, 8);
+            if (cursor != 1)
+                rc = 62;
+        }
+    } else if (strcmp(mode, "callocbig") == 0) {
+        call_calloc(4, 0x10000000); /* 4*256MB > 256MB 上限 → exit(13) */
+        rc = 94;
     } else {
         uint64_t exp[3] = {0x4000, 0x4111, 0x4222};
         for (uint64_t i = 0; i < n; i++) {
