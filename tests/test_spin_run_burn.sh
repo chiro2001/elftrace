@@ -3,6 +3,8 @@
 #
 # 负载: prog_spin_single —— 主线程 (切片目标) 在 worker 置位前全程
 # 单 load 自旋 (ldar; cbz → site), 之后进入 busy 循环并退出。
+# busy 尾部必须长到覆盖一个补偿后检查点间隔 (自旋采集膨胀 ~20x,
+# 触发间隔被放大后尾部太短会没有"自旋后"检查点)。
 # 窗口: 从自旋段中段取到自旋结束后的 checkpoint。
 #
 # 断言:
@@ -29,7 +31,7 @@ gcc -O2 -g -pthread -o "$TF_TMP/prog_spin_single" \
 
 # ---------- Run 1: 补偿比例校准 ----------
 rm -rf "$TF_TMP/srb_r1" "$TF_TMP/srb_r2"
-"$TF_TMP/prog_spin_single" 3000000 30000000 \
+"$TF_TMP/prog_spin_single" 3000000 300000000 \
     > "$TF_TMP/srb_r1.out" 2>&1 &
 PID=$!
 sleep 0.3
@@ -44,7 +46,7 @@ wait $PID 2>/dev/null
 }
 
 # ---------- Run 2: 正式采集 ----------
-"$TF_TMP/prog_spin_single" 3000000 30000000 \
+"$TF_TMP/prog_spin_single" 3000000 300000000 \
     > "$TF_TMP/srb_r2.out" 2>&1 &
 PID=$!
 sleep 0.3
@@ -125,7 +127,7 @@ EOF
 )
 case $? in
     0) ;;
-    2) echo "FAIL: 未找到连续自旋窗口 (spin_pc=$WIN)"; exit 1 ;;
+    2) echo "FAIL: 未找到自旋窗口 (检查点太少或自旋/尾部比例异常)"; exit 1 ;;
     *) echo "FAIL: window selection error"; exit 1 ;;
 esac
 read -r SPIN_ID SPIN_PC FROM_C TO_C SPIN_FROM SPIN_TO <<EOF
