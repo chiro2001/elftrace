@@ -217,6 +217,8 @@ struct ab_cas_run {
 struct atomic_build {
     int have;
     uint64_t r_num, r_den;      /* 采集补偿系数 r = measured/orig */
+    uint64_t *pages;            /* 记录跳板页地址 (窗口终点归一化) */
+    size_t n_pages;
     uint64_t *ck_measured;      /* 逐检查点 measured (Run 2 精确账本) */
     uint64_t *ck_orig;          /* 逐检查点原始指令数 */
     uint64_t *ck_count;         /* 逐检查点 manifest 计数 (原始空间) */
@@ -361,7 +363,10 @@ static void atomic_load(const char *dir, long from, long to,
         goto bad;
     if (end - p < n_pages * 8 + n_sites * 16)
         goto bad;
-    p += n_pages * 8;
+    ab->pages = xmalloc((n_pages ? n_pages : 1) * sizeof(uint64_t));
+    for (size_t i = 0; i < n_pages; i++)
+        ab->pages[i] = rd_u64(&p);
+    ab->n_pages = n_pages;
     ab->sites = xcalloc(n_sites, sizeof(*ab->sites));
     ab->n_sites = n_sites;
     for (size_t i = 0; i < n_sites; i++) {
@@ -1107,9 +1112,97 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                 break;
             }
         }
-        if (seg_idx < 0)
-            die("exit point %#llx not in any captured segment",
-                (unsigned long long)exit_override);
+        if (seg_idx < 0) {
+            /* 窗口终点 pc 可能是原子记录跳板页 (perf 中断常落在跳板
+               内): 归一化到窗口内 ordinal 预算最大的单 load 自旋站点,
+               由 run-burn 融合在预算处干净退出。 */
+            int fused = 0;
+#if defined(__aarch64__)
+            if (ab && ab->have && ab->n_pages) {
+                for (size_t pi = 0; pi < ab->n_pages && !fused; pi++) {
+                    if (exit_override < ab->pages[pi] ||
+                        exit_override >= ab->pages[pi] + 4096)
+                        continue;
+                    size_t best_site = SIZE_MAX;
+                    uint64_t best_budget = 0;
+                    for (size_t si = 0; si < ab->n_sites; si++) {
+                        if (ab->sites[si].kind == 4)
+                            continue;
+                        if (!ab->run_cnt[si] && !ab->synth_only[si])
+                            continue;
+                        uint64_t budget = ab->sites[si].to_ord -
+                                          ab->sites[si].from_ord;
+                        if (budget < best_budget)
+                            continue;
+                        int sseg = -1;
+                        for (size_t k2 = 0; k2 < nsegs; k2++)
+                            if (ab->sites[si].pc >= segs[k2].vaddr &&
+                                ab->sites[si].pc <
+                                    segs[k2].vaddr + segs[k2].filesz) {
+                                sseg = (int)k2;
+                                break;
+                            }
+                        if (sseg < 0)
+                            continue;
+                        const uint8_t *basep = blob->data + payload_off +
+                                               segs[sseg].payload_off;
+                        int size2;
+                        unsigned rt2, rn2;
+                        int kind2;
+                        struct a64_ld_addr ad2;
+                        uint32_t sb;
+                        uint64_t sbe;
+                        int ok = 0;
+                        if (ab->sites[si].kind == 2 ||
+                            ab->sites[si].kind == 3) {
+                            if (a64_is_plain_load(
+                                    ab->sites[si].orig_insn, &size2,
+                                    &rt2, &rn2, &kind2, &ad2))
+                                ok = a64_find_spin_loop(
+                                    basep, segs[sseg].filesz,
+                                    ab->sites[si].pc,
+                                    segs[sseg].vaddr, rt2, &sb, &sbe);
+                        } else if (a64_is_load_any(
+                                       ab->sites[si].orig_insn,
+                                       &size2, &rt2, &rn2, &kind2)) {
+                            ok = a64_find_spin_loop(
+                                basep, segs[sseg].filesz,
+                                ab->sites[si].pc,
+                                segs[sseg].vaddr, rt2, &sb, &sbe);
+                        }
+                        if (ok) {
+                            best_site = si;
+                            best_budget = budget;
+                        }
+                    }
+                    if (best_site != SIZE_MAX) {
+                        fprintf(stderr,
+                                "strict: exit pc %#llx in atomic "
+                                "trampoline, fuse to spin site %#llx "
+                                "(ordinal budget %llu)\n",
+                                (unsigned long long)exit_override,
+                                (unsigned long long)ab->sites[best_site].pc,
+                                (unsigned long long)best_budget);
+                        exit_override = ab->sites[best_site].pc;
+                        fused = 1;
+                    }
+                }
+            }
+#endif
+            if (!fused)
+                die("exit point %#llx not in any captured segment",
+                    (unsigned long long)exit_override);
+            for (size_t i = 0; i < nsegs; i++) {
+                if (exit_override >= segs[i].vaddr &&
+                    exit_override < segs[i].vaddr + segs[i].filesz) {
+                    seg_idx = (int)i;
+                    break;
+                }
+            }
+            if (seg_idx < 0)
+                die("exit point %#llx not in any captured segment",
+                    (unsigned long long)exit_override);
+        }
         uint64_t head = 0, backedge = 0;
         const uint8_t *code = blob->data + payload_off +
                               segs[seg_idx].payload_off;

@@ -67,7 +67,9 @@ def u64():
 assert u64() == 0x53495445 and u64() == 1
 n_sites = u64(); u64(); u64(); n_pages = u64()
 u64(); u64(); u64()
-off += n_pages * 8
+tramp_pages = []
+for i in range(n_pages):
+    tramp_pages.append(u64())
 sites = []
 for i in range(n_sites):
     pc = u64(); w, kind = struct.unpack_from("<II", b, off); off += 8
@@ -90,19 +92,22 @@ best = max(range(n_sites), key=lambda i: tot[i] if sites[i][1] <= 3 else -1)
 if tot[best] < 1000000:
     sys.exit(2)
 pc = sites[best][0]
-# 自旋站点 pc 的检查点 (计数仍在增长) 索引列表
+# 计数仍在增长、且 pc 不在记录跳板页的检查点 (跳板页 pc 作为窗口终点
+# 由 build 归一化到自旋站点, 但作为窗口起点会导致切片从采集跳板恢复)
 hits = []
 prev = [counts(k)[best] for k in range(n)]
 for k in range(1, n):
-    if pcs[k] == pc and prev[k] > prev[k - 1]:
+    if prev[k] > prev[k - 1] and not any(
+            pp <= pcs[k] < pp + 4096 for pp in tramp_pages):
         hits.append(k)
-if len(hits) < 3:
+if len(hits) < 5:
     sys.exit(2)
-from_k = hits[1]
-to_k = hits[3]
+from_k = hits[2]
+to_k = hits[4]
 if to_k - from_k < 1 or prev[to_k] <= prev[from_k]:
     sys.exit(2)
-print(best, hex(pc), cnt[from_k], cnt[to_k], prev[from_k], prev[to_k])
+print(best, hex(pc), cnt[from_k], cnt[to_k], prev[from_k], prev[to_k],
+      hex(pcs[to_k]))
 EOF
 )
 case $? in
@@ -110,12 +115,13 @@ case $? in
     2) echo "FAIL: 未找到两端都在自旋内且 pc==站点 的检查点对 (重试/加密检查点)"; exit 1 ;;
     *) echo "FAIL: window selection error"; exit 1 ;;
 esac
-read -r SPIN_ID SPIN_PC FROM_C TO_C SPIN_FROM SPIN_TO <<EOF
+read -r SPIN_ID SPIN_PC FROM_C TO_C SPIN_FROM SPIN_TO TO_PC <<EOF
 $WIN
 EOF
 T_SPIN_EST=$(( (SPIN_TO - SPIN_FROM) * 2 ))
 echo "atomic: fused window pc=$SPIN_PC from=$FROM_C to=$TO_C " \
-     "spin_accesses=$((SPIN_TO - SPIN_FROM)) T_spin_est=$T_SPIN_EST"
+     "spin_accesses=$((SPIN_TO - SPIN_FROM)) T_spin_est=$T_SPIN_EST " \
+     "to_pc=$TO_PC"
 
 tf_build /dev/null "$TF_TMP/ss_slice.elf" --mode baremetal --bm-strict \
     --checkpoints "$TF_TMP/ss_r2" \
