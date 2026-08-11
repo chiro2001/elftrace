@@ -1056,8 +1056,8 @@ static void emit_replay_tel(uint8_t **pp, uint64_t tel_abs,
     uint64_t t = tel_abs;
     put32(&p, movz_x(16, (uint32_t)t & 0xffff, 0));
     put32(&p, movk_x(16, ((uint32_t)t >> 16) & 0xffff, 1));
-    put32(&p, movk_x(16, ((uint32_t)t >> 32) & 0xffff, 2));
-    put32(&p, movk_x(16, ((uint32_t)t >> 48) & 0xffff, 3));
+    put32(&p, movk_x(16, ((uint64_t)t >> 32) & 0xffff, 2));
+    put32(&p, movk_x(16, ((uint64_t)t >> 48) & 0xffff, 3));
     put32(&p, movz_x(14, 0x4554, 0));       /* "TELM" LE */
     put32(&p, movk_x(14, 0x4D4C, 1));
     put32(&p, str_x_imm(16, 14, 0));        /* magic */
