@@ -138,10 +138,12 @@ T=$((TO_C - FROM_C))
     echo "FAIL: window too small T=$T"; exit 1; }
 echo "atomic: spin window pc=$SPIN_PC site=$SPIN_ID from=$FROM_C to=$TO_C T=$T"
 echo "atomic: spin accesses=$((SPIN_TO - SPIN_FROM)) (窗口内)"
-# T_orig 用 build 账本 T_ref (ck_orig 差: measured − Σord×(base−1)):
-# manifest 名义计数 (k×every) 用全局 r 缩放, 自旋阶段会被低缩放
-# (~5x 而非 ~20x), 不是精确原始口径。
-T_ORIG=0
+# 预期原始指令数 (切片主线程口径) = 站点访问数 × 原生循环体 (ldar+cbz
+# = 2)。注意: build 账本 T_ref (ck_orig 差) 含同进程 worker 线程指令
+# (perf 按 pid 计数), 对单线程切片会系统性偏大, 只作参考输出。
+T_SPIN_EST=$(( (SPIN_TO - SPIN_FROM) * 2 ))
+[ "$T_SPIN_EST" -gt 10000000 ] || {
+    echo "FAIL: T_spin_est 过小 ($T_SPIN_EST)"; exit 1; }
 
 # ---------- 测量: 基线 (逐访问) vs run-burn ----------
 measure() {  # $1 = 标签, $2 = 额外构建参数
@@ -152,14 +154,6 @@ measure() {  # $1 = 标签, $2 = 额外构建参数
         --stack-reserve 67108864 $extra \
         > "$TF_TMP/srb_build.log" 2>&1 || {
         echo "FAIL: build $label"; exit 1; }
-    if [ "$label" = burn ]; then
-        T_ORIG=$(grep -oE "T_ref=[0-9]+" "$TF_TMP/srb_build.log" \
-            | head -1 | cut -d= -f2)
-        T_ORIG=${T_ORIG:-0}
-        [ "$T_ORIG" -gt 10000000 ] || {
-            echo "FAIL: build 无有效 T_ref (T_orig=$T_ORIG)"; exit 1; }
-        echo "atomic: T_orig=$T_ORIG (build 账本原始指令口径)"
-    fi
     local rc
     timeout 120 perf stat -e instructions "$TF_TMP/srb_slice.elf" \
         > /dev/null 2> "$TF_TMP/srb.perf"
@@ -186,10 +180,10 @@ grep -q "run-burn spin site" "$TF_TMP/srb_build.log" || {
     echo "FAIL: run-burn 未命中自旋站点 (构建日志无 run-burn spin site)"
     exit 1; }
 
-MB=$((A_BASE * 100 / T_ORIG))
-MR=$((A_BURN * 100 / T_ORIG))
+MB=$((A_BASE * 100 / T_SPIN_EST))
+MR=$((A_BURN * 100 / T_SPIN_EST))
 echo "atomic: multiplier base=$(printf '%d.%02d' $((MB / 100)) $((MB % 100)))x " \
-     "burn=$(printf '%d.%02d' $((MR / 100)) $((MR % 100)))x (T_orig=$T_ORIG)"
+     "burn=$(printf '%d.%02d' $((MR / 100)) $((MR % 100)))x (T_spin_est=$T_SPIN_EST)"
 
 if [ "$A_BURN" -lt "$A_BASE" ]; then
     tf_pass "atomic run-burn 降低动态指令数 (A_burn=$A_BURN < A_base=$A_BASE)"
