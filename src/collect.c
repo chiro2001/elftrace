@@ -202,7 +202,7 @@ static void parse_fdinfo(pid_t pid, struct cfdinfo *fi)
 {
     char path[64];
     char buf[512];
-    int fd = open(path, O_RDONLY);
+    int fd;
     ssize_t n;
 
     snprintf(path, sizeof(path), "/proc/%d/fdinfo/%llu", pid,

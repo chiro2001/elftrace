@@ -23,6 +23,7 @@
 #include <sys/uio.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 
 #include "util.h"
 #include "arch.h"
@@ -617,6 +618,43 @@ static int alloc_events_dump(struct alloc_trace_ctx *ctx)
             fwrite(ev, 1, n_new * ALLOC_EVENT_SIZE, f);
             ctx->dump_event_ptr += n_new * ALLOC_EVENT_SIZE;
             total += n_new;
+        } else {
+            char mpath[64];
+            snprintf(mpath, sizeof(mpath), "/proc/%d/mem", ctx->pid);
+            int mfd = open(mpath, O_RDONLY);
+            ssize_t got = -1;
+            int err = 0, err_open = 0;
+            if (mfd < 0)
+                err_open = errno;
+            if (mfd >= 0) {
+                errno = 0;
+                got = pread(mfd, ev, n_new * ALLOC_EVENT_SIZE,
+                            (off_t)ctx->dump_event_ptr);
+                err = errno;
+                uint64_t one = 0;
+                ssize_t g1 = pread(mfd, &one, 1,
+                                   (off_t)ctx->dump_event_ptr - 4096);
+                int e1 = errno;
+                ssize_t g2 = pread(mfd, &one, 1,
+                                   (off_t)ctx->dump_event_ptr);
+                int e2 = errno;
+                fprintf(stderr,
+                        "alloc: dump FAIL detail open_errno=%d "
+                        "pread=%zd/%d one_at_-4k=%zd/%d one_at=%zd/%d\n",
+                        err_open, got, err, g1, e1, g2, e2);
+                close(mfd);
+            }
+            if (mfd < 0) {
+                struct rlimit rl;
+                getrlimit(RLIMIT_NOFILE, &rl);
+                fprintf(stderr,
+                        "alloc: dump read FAIL addr=%#llx len=%zu "
+                        "open_errno=%d rlim={%lu,%lu}\n",
+                        (unsigned long long)ctx->dump_event_ptr,
+                        n_new * ALLOC_EVENT_SIZE, err_open,
+                        (unsigned long)rl.rlim_cur,
+                        (unsigned long)rl.rlim_max);
+            }
         }
         free(ev);
     }
@@ -646,6 +684,15 @@ int alloc_trace_ckpt(struct alloc_trace_ctx *ctx, size_t ckpt_no)
                     (unsigned long long)cnt,
                     (unsigned long long)ret);
         }
+        uint64_t ep = 0, ee = 0, ovf = 0;
+        if (atmem_rw(ctx->pid, 0, ctx->abuf_addr + 24, &ep, 8) == 0 &&
+            atmem_rw(ctx->pid, 0, ctx->abuf_addr + 32, &ee, 8) == 0 &&
+            atmem_rw(ctx->pid, 0, ctx->abuf_addr + 40, &ovf, 8) == 0)
+            fprintf(stderr,
+                    "alloc: ckpt %zu event_ptr=%llu events_end=%llu "
+                    "overflow=%llu\n",
+                    ckpt_no, (unsigned long long)ep,
+                    (unsigned long long)ee, (unsigned long long)ovf);
     }
     char path[600];
     snprintf(path, sizeof(path), "%s/allocs/ckpt_%06zu.bin",
