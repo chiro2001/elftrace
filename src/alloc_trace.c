@@ -424,7 +424,9 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
     /* 原函数会访问其栈帧上方的溢出区 (glibc sp+偏移), 与跳板保存槽
        冲突 (曾把 caller x30 槽写坏 → 返回地址变事件地址 → SIGBUS)。
        压 0x200 缓冲垫, 原函数帧与保存槽隔离。 */
-    put32(p, 0xD10803FFU);      /* sub sp,sp,#0x200 */
+    put32(p, 0xD10843FFU);      /* sub sp,sp,#0x800 (缓冲垫加大:
+                                   原函数会访问帧上方溢出区, 0x200 曾被
+                                   踩穿破坏保存槽 → event_ptr 提交错乱) */
     if (emit_saved_insn(&p, saved_insn, orig_pc,
                         block_abs + (uint64_t)(p - out)) < 0)
         return 0;               /* 不可重定位 */
@@ -473,7 +475,7 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
     /* ret_label (sp=E-312): 提交事件 (ret + pad=0 + event_ptr 前进),
        弹栈到 E, ret 调用者。x16 可能已被原函数破坏, 先从 base 槽恢复。 */
     uint8_t *ret_label = p;
-    put32(p, 0x910803FFU);      /* add sp,sp,#0x200 (弹回缓冲垫) */
+    put32(p, 0x910843FFU);      /* add sp,sp,#0x800 (弹回缓冲垫) */
     put32(p, aldr(16, 31, 80)); /* ldr x16,[sp,#80] (base 槽 E-32) */
     put32(p, astr(0, 16, ALLOC_DIAG_RET_OFF));  /* 诊断: 最近返回值 */
     put32(p, aldr(18, 31, 0));  /* event (E-112) */
@@ -738,15 +740,18 @@ int alloc_trace_ckpt(struct alloc_trace_ctx *ctx, size_t ckpt_no)
                     (unsigned long long)cnt,
                     (unsigned long long)ret);
         }
-        uint64_t ep = 0, ee = 0, ovf = 0;
+        uint64_t ep = 0, ee = 0, ovf = 0, next_pad = 0;
         if (atmem_rw(ctx->pid, 0, ctx->abuf_addr + 24, &ep, 8) == 0 &&
             atmem_rw(ctx->pid, 0, ctx->abuf_addr + 32, &ee, 8) == 0 &&
             atmem_rw(ctx->pid, 0, ctx->abuf_addr + 40, &ovf, 8) == 0)
+            atmem_rw(ctx->pid, 0, ep, &next_pad, 4);
+        if (ep)
             fprintf(stderr,
                     "alloc: ckpt %zu event_ptr=%llu events_end=%llu "
-                    "overflow=%llu\n",
+                    "overflow=%llu next_pad=%llu\n",
                     ckpt_no, (unsigned long long)ep,
-                    (unsigned long long)ee, (unsigned long long)ovf);
+                    (unsigned long long)ee, (unsigned long long)ovf,
+                    (unsigned long long)next_pad);
     }
     char path[600];
     snprintf(path, sizeof(path), "%s/allocs/ckpt_%06zu.bin",
@@ -771,6 +776,23 @@ int alloc_trace_finish(struct alloc_trace_ctx *ctx)
             (unsigned long long)(ctx ? ctx->total_events : 0),
             ctx ? ctx->armed : 0);
     if (ctx->armed) {
+        /* 环溢出标记: 事件缓冲满后记录停止, 事件流不完整。
+           build 必须拒绝装配覆盖丢失事件的窗口。 */
+        uint64_t ovf = 0;
+        if (atmem_rw(ctx->pid, 0, ctx->abuf_addr + 40, &ovf, 8) == 0 &&
+            ovf) {
+            char op[600];
+            snprintf(op, sizeof(op), "%s/allocs/overflow.bin", ctx->out);
+            FILE *of = fopen(op, "wb");
+            if (of) {
+                fwrite(&ovf, 1, 8, of);
+                fclose(of);
+            }
+            fprintf(stderr,
+                    "alloc: EVENT BUFFER OVERFLOW (8MB, %llu events) — "
+                    "事件流不完整\n",
+                    (unsigned long long)ctx->total_events);
+        }
         for (size_t i = 0; i < ctx->n_funcs; i++) {
             uint64_t blk = ctx->funcs[i].page + ctx->funcs[i].page_off;
             uint64_t ret = 0, cnt = 0;
@@ -865,8 +887,12 @@ int alloc_trace_arm(struct alloc_trace_ctx **ctx_out, pid_t pid,
         ctx->n_funcs++;
     }
 
-    /* mmap 事件缓冲区 (8MB) */
+    /* mmap 事件缓冲区 (默认 8MB; ELFTRACE_ALLOC_BUF_SIZE 可调, 测试
+       溢出门禁用) */
     uint64_t buf_size = 8 << 20;
+    const char *bs = getenv("ELFTRACE_ALLOC_BUF_SIZE");
+    if (bs && *bs)
+        buf_size = strtoull(bs, NULL, 0);
     uint64_t ret = 0;
     if (inject_syscall(pid, regs, 222 /* SYS_mmap */, 0, buf_size,
                        7 /* RWX */, 0x22 /* PRIVATE|ANON */, -1, 0,

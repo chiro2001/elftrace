@@ -110,4 +110,19 @@ done
 
 tf_cleanup alloc_ckpts
 tf_pass "alloc replay e2e (events consumed, rc=0, zero syscalls, ratio <=5%)"
+
+# 溢出门禁负测: 注入 overflow.bin (模拟真实溢出标记), build 必须拒绝。
+printf '\x01\x00\x00\x00\x00\x00\x00\x00' > "$CKPT/allocs/overflow.bin"
+if timeout 120 "$ELFTRACE" build /dev/null -o "$TF_TMP/alloc_ovf.elf" \
+    --mode baremetal --bm-strict --checkpoints "$CKPT" \
+    --from 1 --to 2 --stack-reserve 268435456 \
+    > "$TF_TMP/alloc_ovf.log" 2>&1; then
+    echo "FAIL: 溢出后 build 未拒绝"
+    exit 1
+fi
+grep -q "事件缓冲溢出" "$TF_TMP/alloc_ovf.log" \
+    || { echo "FAIL: 拒绝原因不对"; exit 1; }
+rm -f "$CKPT/allocs/overflow.bin"
+echo "alloc e2e: overflow gate OK (build 拒绝)"
+
 tf_finish

@@ -48,6 +48,7 @@ static size_t g_n_malloc_replay = 0;
 /* ---- trace --alloc-replay 侧车 (allocs/) ---- */
 struct alloc_build {
     int have;
+    int overflow;               /* 事件缓冲溢出 (事件流不完整) */
     uint64_t pcs[4];            /* libc 入口运行时地址 */
     uint32_t first[4];          /* 原首条指令 (快照含记录跳板, 需还原) */
     int kinds[4];
@@ -107,6 +108,14 @@ static void alloc_build_load(const char *dir, struct alloc_build *ab)
         fclose(f);
     }
     ab->have = ab->n_funcs > 0 && ab->n_events > 0 && ab->n_ck > 0;
+    snprintf(p, sizeof(p), "%s/allocs/overflow.bin", dir);
+    f = fopen(p, "rb");
+    if (f) {
+        uint64_t o = 0;
+        if (fread(&o, 1, 8, f) == 8 && o)
+            ab->overflow = 1;
+        fclose(f);
+    }
 }
 
 static struct alloc_build g_alloc_build;
@@ -2455,6 +2464,9 @@ synth_done:
      * 超消费/kind 失配 → 遥测 + bail(67); 切片结束时游标 != 总数
      * (欠消费) → strict 退出代码里 reason=10 + exit(65)。 */
     if (g_alloc_build.have && exit_override) {
+        if (g_alloc_build.overflow)
+            die("alloc: 事件缓冲溢出 (8MB), 事件流不完整 — 拒绝装配 "
+                "alloc-replay 切片 (缩短采集或增大缓冲)");
         /* 窗口裁剪: ck_counts[k] 对应 trace 检查点 k+1 (arm 前无事件) */
         uint64_t c_from = 0, c_to = 0;
         if (g_alloc_build.n_ck) {
