@@ -1924,7 +1924,57 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                                    &size, &rt, &rn, &kind))
                         die("atomic: bad orig insn at %#llx",
                             (unsigned long long)st->pc);
-                    if (ab->run_cnt[st->ab_id] == 0) {
+                    uint32_t spin_body = 0;
+                    uint64_t spin_backedge = 0;
+                    int spin_loop =
+                        a64_find_spin_loop(segp, segs[gi].filesz,
+                                           st->pc, segs[gi].vaddr,
+                                           rt, &spin_body,
+                                           &spin_backedge);
+                    if (g_no_atomic_run_burn)
+                        spin_loop = 0;
+                    /* 退出点在自旋循环内 (load 站点或回边):
+                       K 融合 —— 不建独立退出站点, burn 块在 ordinal
+                       预算 (load_limit) 处干净退出 (rc=0), 无需通用
+                       counter。常量单 run (run_cnt==0) 且窗口结束在
+                       自旋内时同样融合 (burn 块末 run 烧到预算)。 */
+                    int fused_exit =
+                        spin_loop &&
+                        (exit_override == st->pc ||
+                         exit_override == spin_backedge);
+                    int use_burn =
+                        spin_loop &&
+                        (ab->run_cnt[st->ab_id] > 0 || fused_exit);
+                    if (use_burn) {
+                        bl = a64_atomic_replay_burn_block(
+                            page + o, taddr + o, runs_abs,
+                            ab->run_cnt[st->ab_id] +
+                                (ab->run_cnt[st->ab_id] ||
+                                 ab->synth_only[st->ab_id] ? 1 : 0),
+                            size, rt, rn, st->pc + 4,
+                            ab->sites[st->ab_id].to_ord -
+                                ab->sites[st->ab_id].from_ord,
+                            base + STUB_STRICT_BAIL_OFF,
+                            fused_exit ? base + STUB_STRICT_EXIT_OFF : 0,
+                            tel_abs,
+                            kind, adp, spin_body);
+                        fprintf(stderr,
+                                "atomic: run-burn spin site %#llx "
+                                "body=%u -> %#llx%s\n",
+                                (unsigned long long)st->pc,
+                                spin_body,
+                                (unsigned long long)(taddr + o),
+                                fused_exit ? " [fused-exit]" : "");
+                        if (fused_exit && exit_rm == SIZE_MAX) {
+                            for (size_t x = 0; x < nsites; x++)
+                                if (sites[x].pc == exit_override &&
+                                    sites[x].kind >= 1 &&
+                                    sites[x].kind <= 3) {
+                                    exit_rm = x;
+                                    break;
+                                }
+                        }
+                    } else if (ab->run_cnt[st->ab_id] == 0) {
                         /* 单段常量站点: 快速回放块 (值内嵌) */
                         bl = a64_atomic_replay_block_fast(
                             page + o, taddr + o, size, rt, rn, adp,
@@ -1935,66 +1985,16 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                         ab->runs[ab->run_off[st->ab_id]].value,
                         ab->runs[ab->run_off[st->ab_id]].addr);
                     } else {
-                        uint32_t spin_body = 0;
-                        uint64_t spin_backedge = 0;
-                        int use_burn =
-                            a64_find_spin_loop(segp, segs[gi].filesz,
-                                               st->pc, segs[gi].vaddr,
-                                               rt, &spin_body,
-                                               &spin_backedge);
-                        if (g_no_atomic_run_burn)
-                            use_burn = 0;
-                        int fused_exit = 0;
-                        if (use_burn) {
-                            /* 退出点在自旋循环内 (load 站点或回边):
-                               K 融合 —— 不建独立退出站点, burn 块在
-                               ordinal 预算 (load_limit) 处干净退出
-                               (rc=0), 无需通用 counter。 */
-                            if (exit_override == st->pc ||
-                                exit_override == spin_backedge)
-                                fused_exit = 1;
-                        }
-                        if (use_burn) {
-                            bl = a64_atomic_replay_burn_block(
-                                page + o, taddr + o, runs_abs,
-                                ab->run_cnt[st->ab_id] +
-                                    (ab->run_cnt[st->ab_id] ||
-                                     ab->synth_only[st->ab_id] ? 1 : 0),
-                                size, rt, rn, st->pc + 4,
-                                ab->sites[st->ab_id].to_ord -
-                                    ab->sites[st->ab_id].from_ord,
-                                base + STUB_STRICT_BAIL_OFF,
-                                fused_exit ? base + STUB_STRICT_EXIT_OFF : 0,
-                                tel_abs,
-                                kind, adp, spin_body);
-                            fprintf(stderr,
-                                    "atomic: run-burn spin site %#llx "
-                                    "body=%u -> %#llx%s\n",
-                                    (unsigned long long)st->pc,
-                                    spin_body,
-                                    (unsigned long long)(taddr + o),
-                                    fused_exit ? " [fused-exit]" : "");
-                            if (fused_exit && exit_rm == SIZE_MAX) {
-                                for (size_t x = 0; x < nsites; x++)
-                                    if (sites[x].pc == exit_override &&
-                                        sites[x].kind >= 1 &&
-                                        sites[x].kind <= 3) {
-                                        exit_rm = x;
-                                        break;
-                                    }
-                            }
-                        } else {
-                            bl = a64_atomic_replay_block(
-                                page + o, taddr + o, runs_abs,
-                                ab->run_cnt[st->ab_id] +
-                                    (ab->run_cnt[st->ab_id] ||
-                                     ab->synth_only[st->ab_id] ? 1 : 0),
-                                size, rt, rn, st->pc + 4,
-                                ab->sites[st->ab_id].to_ord -
-                                    ab->sites[st->ab_id].from_ord,
-                                base + STUB_STRICT_BAIL_OFF, tel_abs,
-                                kind, adp);
-                        }
+                        bl = a64_atomic_replay_block(
+                            page + o, taddr + o, runs_abs,
+                            ab->run_cnt[st->ab_id] +
+                                (ab->run_cnt[st->ab_id] ||
+                                 ab->synth_only[st->ab_id] ? 1 : 0),
+                            size, rt, rn, st->pc + 4,
+                            ab->sites[st->ab_id].to_ord -
+                                ab->sites[st->ab_id].from_ord,
+                            base + STUB_STRICT_BAIL_OFF, tel_abs,
+                            kind, adp);
                     }
                 }
                 if (!bl)
