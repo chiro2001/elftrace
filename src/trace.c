@@ -514,6 +514,13 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
     collect_snapshot_free_last(&tc->prev_b);
     collect_snapshot_copy_last(&tc->prev_b, &sn);
     tc->have_prev_b = 1;
+#if defined(__aarch64__)
+    /* 原子账本必须在目标仍停止时读: perf 计数与站点 ordinal 同一
+       时刻, 否则 resume 后计数超前 (可差一个 syscall 间隔),
+       measured−overhead 的 orig 会系统性偏大。 */
+    if (tc->atomic)
+        atomic_trace_ckpt(tc->atomic, tc->ckpt_no, perf_count_now(tc));
+#endif
     ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);   /* 保持 syscall 捕获模式 */
 
     snprintf(manifest, sizeof(manifest), "%s/manifest.txt", tc->out);
@@ -535,11 +542,6 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
     }
     fprintf(stderr, "trace: ckpt %zu @ count %llu pc %#llx\n", tc->ckpt_no,
             (unsigned long long)tc->count, (unsigned long long)REG_PC(sn.regs));
-
-#if defined(__aarch64__)
-    if (tc->atomic)
-        atomic_trace_ckpt(tc->atomic, tc->ckpt_no, perf_count_now(tc));
-#endif
 
     collect_free(&sn);
     if (tc->ckpt_no > 0 && tc->ckpt_no % 5 == 0)

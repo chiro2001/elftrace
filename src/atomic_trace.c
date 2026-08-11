@@ -850,6 +850,9 @@ int atomic_trace_ckpt(struct atomic_trace_ctx *ctx, size_t ckpt_no,
         }
         overhead += ctx->total_events *
                     (ctx->append_insns ? ctx->append_insns : 0);
+        /* LSE CAS 事件走独立缓冲区, 追加路径 23 条 (a64_cas_record_block
+           实测), 之前漏算会使带 CAS 负载的 orig 偏大。 */
+        overhead += ctx->total_cas_events * 23;
         uint64_t orig = measured > overhead ? measured - overhead : 0;
         ctx->ckpt_measured = xrealloc(ctx->ckpt_measured,
                                       (ctx->n_ckpts + 1) * sizeof(uint64_t));
