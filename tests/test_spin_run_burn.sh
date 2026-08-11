@@ -119,7 +119,8 @@ for k in range(from_k + 1, n):
         break
 if to_k is None:
     sys.exit(2)
-print(best, hex(sites[best][0]), cnt[from_k], cnt[to_k])
+print(best, hex(sites[best][0]), cnt[from_k], cnt[to_k],
+      sc[from_k], sc[to_k])
 EOF
 )
 case $? in
@@ -127,26 +128,22 @@ case $? in
     2) echo "FAIL: 未找到连续自旋窗口 (spin_pc=$WIN)"; exit 1 ;;
     *) echo "FAIL: window selection error"; exit 1 ;;
 esac
-read -r SPIN_HITS SPIN_PC FROM_C TO_C <<EOF
+read -r SPIN_ID SPIN_PC FROM_C TO_C SPIN_FROM SPIN_TO <<EOF
 $WIN
 EOF
 T=$((TO_C - FROM_C))
 [ "$T" -gt 100000000 ] || {
     echo "FAIL: window too small T=$T"; exit 1; }
-echo "atomic: spin window pc=$SPIN_PC hits=$SPIN_HITS from=$FROM_C to=$TO_C T=$T"
+echo "atomic: spin window pc=$SPIN_PC site=$SPIN_ID from=$FROM_C to=$TO_C T=$T"
 
-# 采集膨胀: manifest 计数是插桩后的 measured 指令; 预期指令数应折算回
-# 原始口径 (compensation.txt: r_num=measured, r_den=orig, orig=meas*den/num)
-RN=$(awk '/^r_num/{print $2}' "$TF_TMP/srb_r2/atomics/compensation.txt")
-RD=$(awk '/^r_den/{print $2}' "$TF_TMP/srb_r2/atomics/compensation.txt")
-if [ -n "${RN:-}" ] && [ -n "${RD:-}" ] && [ "${RN:-0}" -gt 0 ]; then
-    T_ORIG=$((T * RD / RN))
-else
-    T_ORIG=$T
-fi
+# 采集膨胀: manifest 计数是插桩后的 measured 指令, compensation.txt 的
+# r_num/r_den 在自旋主导窗口下已损坏 (overhead 估算超过 measured, orig
+# 被 clamp 到 measured → r=1.0, 见 srb3 实测)。预期原始指令数直接用
+# 自旋站点访问数 × 原生循环体指令数 (ldar+cbz = 2)。
+T_ORIG=$(( (SPIN_TO - SPIN_FROM) * 2 ))
 [ "$T_ORIG" -gt 10000000 ] || {
-    echo "FAIL: T_orig too small ($T_ORIG, r=$RN/$RD)"; exit 1; }
-echo "atomic: compensation r=$RN/$RD T_orig=$T_ORIG (原始指令口径)"
+    echo "FAIL: T_orig too small ($T_ORIG, spin $SPIN_FROM->$SPIN_TO)"; exit 1; }
+echo "atomic: spin accesses=$((SPIN_TO - SPIN_FROM)) T_orig=$T_ORIG (原始口径)"
 
 # ---------- 测量: 基线 (逐访问) vs run-burn ----------
 measure() {  # $1 = 标签, $2 = 额外构建参数
