@@ -268,10 +268,9 @@ static void atomic_comp_load(const char *dir, struct atomic_build *ab)
 }
 
 /* measured 计数 → 原始计数: 逐检查点线性插值。
- * y 轴优先用 manifest 计数 (ck_count, 原始空间, 每检查点 k*every);
- * 旧逻辑用 ck_orig (measured−overhead, 与 manifest 同空间仅在计数器
- * 零基线时成立 — HTTP pool 的 Run2 计数器带 9.4e9 基线时窗口映射与
- * syscall 过滤全部错位)。无账本时退化为单 r。 */
+ * y 轴用 ck_orig (measured − Σord×(base−1), 已修复 clamp 与基线问题),
+ * 并相对首检查点零基化, 与 manifest 名义计数 (k×every) 同轴;
+ * 无账本时退化为单 r (同样零基)。 */
 static uint64_t atomic_orig_at(const struct atomic_build *ab,
                                uint64_t measured)
 {
@@ -281,35 +280,33 @@ static uint64_t atomic_orig_at(const struct atomic_build *ab,
                               ab->r_num);
         return measured;
     }
-    int use_manifest = ab->ck_count && ab->n_ck >= 2 &&
-                       ab->ck_count[1] != 0;
+    uint64_t bm = ab->ck_measured[0];
+    uint64_t bo = ab->ck_orig[0];
+    if (measured <= bm)
+        return 0;
+    uint64_t x = measured - bm;
     for (size_t i = 0; i + 1 < ab->n_ck; i++) {
-        if (measured <= ab->ck_measured[i + 1]) {
-            uint64_t m0 = ab->ck_measured[i];
-            uint64_t m1 = ab->ck_measured[i + 1];
-            uint64_t o0 = use_manifest ? ab->ck_count[i]
-                                       : ab->ck_orig[i];
-            uint64_t o1 = use_manifest ? ab->ck_count[i + 1]
-                                       : ab->ck_orig[i + 1];
+        uint64_t m0 = ab->ck_measured[i] - bm;
+        uint64_t m1 = ab->ck_measured[i + 1] - bm;
+        uint64_t o0 = ab->ck_orig[i] - bo;
+        uint64_t o1 = ab->ck_orig[i + 1] - bo;
+        if (x <= m1) {
             if (m1 == m0)
                 return o1;
-            return o0 + (uint64_t)(((__uint128_t)(measured - m0) *
+            return o0 + (uint64_t)(((__uint128_t)(x - m0) *
                                     (o1 - o0)) / (m1 - m0));
         }
     }
     if (ab->n_ck >= 2) {
-        uint64_t m0 = ab->ck_measured[ab->n_ck - 2];
-        uint64_t m1 = ab->ck_measured[ab->n_ck - 1];
-        uint64_t o0 = use_manifest ? ab->ck_count[ab->n_ck - 2]
-                                   : ab->ck_orig[ab->n_ck - 2];
-        uint64_t o1 = use_manifest ? ab->ck_count[ab->n_ck - 1]
-                                   : ab->ck_orig[ab->n_ck - 1];
-        if (m1 > m0 && measured > m1)
-            return o1 + (uint64_t)(((__uint128_t)(measured - m1) *
+        uint64_t m0 = ab->ck_measured[ab->n_ck - 2] - bm;
+        uint64_t m1 = ab->ck_measured[ab->n_ck - 1] - bm;
+        uint64_t o0 = ab->ck_orig[ab->n_ck - 2] - bo;
+        uint64_t o1 = ab->ck_orig[ab->n_ck - 1] - bo;
+        if (m1 > m0 && x > m1)
+            return o1 + (uint64_t)(((__uint128_t)(x - m1) *
                                     (o1 - o0)) / (m1 - m0));
     }
-    return use_manifest ? ab->ck_count[ab->n_ck - 1]
-                        : ab->ck_orig[ab->n_ck - 1];
+    return ab->ck_orig[ab->n_ck - 1] - bo;
 }
 
 static uint64_t rd_u64(const uint8_t **p)
@@ -3090,20 +3087,19 @@ int build_main(int argc, char **argv)
             fclose(mf);
         }
     }
-    /* 指标伴随行: T_nominal=CLI 窗口, T_ref=build 实际实现的
-       manifest 原始计数窗口, T_ledger=账本 orig 差 (计数器空间,
-       仅健康校验), health_x1000=measured 增量/名义增量 (应≈r,
-        偏离 [0.7,1.4] 表示补偿校准或计数器异常, 指标判 INVALID)。
+    /* 指标伴随行: T_nominal=CLI 窗口, T_ref=build 实际实现的窗口原始
+       指令数 (账本 ck_orig 差: measured − Σord×(base−1), 零基),
+       T_ledger 同 T_ref (保留兼容), health_x1000=measured 增量/原始
+       增量 (应≈r; 偏离 [0.7,1.4] 表示补偿校准或计数器异常)。
        由测试解析, 作为补偿比例的分母与健康信号。 */
     if (ab.have && ab.n_ck && from_ckpt >= 0 &&
         (size_t)from_ckpt < ab.n_ck &&
         to_ckpt >= 0 && (size_t)to_ckpt < ab.n_ck) {
         uint64_t tn = ckpt_count_to != UINT64_MAX
                           ? ckpt_count_to - ckpt_count0 : 0;
-        uint64_t tr = ab.ck_count[to_ckpt] -
-                      ab.ck_count[from_ckpt];
-        uint64_t tl = ab.ck_orig[to_ckpt] -
+        uint64_t tr = ab.ck_orig[to_ckpt] -
                       ab.ck_orig[from_ckpt];
+        uint64_t tl = tr;
         uint64_t md = ab.ck_measured[to_ckpt] -
                       ab.ck_measured[from_ckpt];
         uint64_t health = tr ? (md * 1000) / tr : 0;

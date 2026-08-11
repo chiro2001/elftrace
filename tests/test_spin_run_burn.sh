@@ -136,13 +136,15 @@ T=$((TO_C - FROM_C))
     echo "FAIL: window too small T=$T"; exit 1; }
 echo "atomic: spin window pc=$SPIN_PC site=$SPIN_ID from=$FROM_C to=$TO_C T=$T"
 
-# 采集膨胀: manifest 计数是插桩后的 measured 指令, compensation.txt 的
-# r_num/r_den 在自旋主导窗口下已损坏 (overhead 估算超过 measured, orig
-# 被 clamp 到 measured → r=1.0, 见 srb3 实测)。预期原始指令数直接用
-# 自旋站点访问数 × 原生循环体指令数 (ldar+cbz = 2)。
-T_ORIG=$(( (SPIN_TO - SPIN_FROM) * 2 ))
-[ "$T_ORIG" -gt 10000000 ] || {
-    echo "FAIL: T_orig too small ($T_ORIG, spin $SPIN_FROM->$SPIN_TO)"; exit 1; }
+# 采集补偿修复后 Run2 manifest 计数即原始口径 (每检查点 k×every,
+# 触发间隔按 r 放大)。健康检查: 自旋主导窗口的 T 应≈站点访问数×原生
+# 循环体 (ldar+cbz=2); 若补偿失效 T 会是 ~20x, 立即判 FAIL。
+T_SPIN_EST=$(( (SPIN_TO - SPIN_FROM) * 2 ))
+if [ "$T" -lt $((T_SPIN_EST / 2)) ] || [ "$T" -gt $((T_SPIN_EST * 3)) ]; then
+    echo "FAIL: 补偿口径异常 T=$T vs 站点估算 $T_SPIN_EST"
+    exit 1
+fi
+T_ORIG=$T
 echo "atomic: spin accesses=$((SPIN_TO - SPIN_FROM)) T_orig=$T_ORIG (原始口径)"
 
 # ---------- 测量: 基线 (逐访问) vs run-burn ----------

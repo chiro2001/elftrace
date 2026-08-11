@@ -49,6 +49,7 @@ struct asite {
     size_t seg;                 /* 所属可执行段索引 */
     uint64_t page;              /* 记录页地址 */
     uint32_t page_off;          /* 块偏移 */
+    unsigned base, append;      /* 该站点记录跳板的稳态/追加路径指令数 */
 };
 
 /* CAS 扫描误报过滤: 候选指令的下一条必须是 ret 或分支 (真实 CAS
@@ -644,6 +645,8 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
                      (unsigned long long)sites[i].pc);
                 continue;
             }
+            sites[i].base = cnt.base;
+            sites[i].append = cnt.append;
             if (i == 0) {
                 ctx->base_insns = cnt.base;
                 ctx->append_insns = cnt.append;
@@ -832,17 +835,22 @@ int atomic_trace_ckpt(struct atomic_trace_ctx *ctx, size_t ckpt_no,
     }
     free(sb);
     atomic_events_append(ctx);      /* 先补齐事件数, 再统计补偿 */
-    /* 补偿: overhead = Σ ord×base + 事件数×append; orig = measured −
-       overhead */
+    /* 补偿: overhead = Σ ord×(base−1) + 事件数×append; orig = measured
+       − overhead。
+       base 含站点 b 与跳板稳态 (含被替换的原生 load 本身), 每次访问
+       相对原生只多 base−1 条; 这样 orig 还原出原生指令口径。 */
     if (ctx->n_ckpts < 1024 * 1024) {
         uint64_t overhead = 0;
         for (size_t i = 0; i < ctx->n_sites; i++) {
             uint64_t ord;
             memcpy(&ord, state + i * A64_ATB_STATE_SIZE, 8);
-            overhead += ord * ctx->base_insns;
+            unsigned per = ctx->sites[i].base > 1
+                               ? ctx->sites[i].base - 1 : 0;
+            overhead += ord * per;
         }
-        overhead += ctx->total_events * ctx->append_insns;
-        uint64_t orig = measured > overhead ? measured - overhead : measured;
+        overhead += ctx->total_events *
+                    (ctx->append_insns ? ctx->append_insns : 0);
+        uint64_t orig = measured > overhead ? measured - overhead : 0;
         ctx->ckpt_measured = xrealloc(ctx->ckpt_measured,
                                       (ctx->n_ckpts + 1) * sizeof(uint64_t));
         ctx->ckpt_overhead = xrealloc(ctx->ckpt_overhead,
@@ -1010,11 +1018,18 @@ static void atomic_write_compensation(struct atomic_trace_ctx *ctx)
     FILE *f = fopen(path, "w");
     if (!f)
         return;
+    /* r 用"末检查点相对首检查点"的增量, 而不是绝对值:
+       计数器带基线 (HTTP pool Run2 曾 9.4e9) 时绝对值 r≈1,
+       触发缩放/窗口换算全部失效。 */
+    uint64_t m0 = ctx->ckpt_measured[0];
+    uint64_t o0 = ctx->ckpt_orig[0];
     uint64_t m = ctx->ckpt_measured[ctx->n_ckpts - 1];
     uint64_t o = ctx->ckpt_orig[ctx->n_ckpts - 1];
+    uint64_t dn = m > m0 ? m - m0 : 0;
+    uint64_t dd = o > o0 ? o - o0 : 1;
     fprintf(f, "# elftrace atomic compensation v1\n");
-    fprintf(f, "r_num %llu\n", (unsigned long long)m);
-    fprintf(f, "r_den %llu\n", (unsigned long long)o);
+    fprintf(f, "r_num %llu\n", (unsigned long long)dn);
+    fprintf(f, "r_den %llu\n", (unsigned long long)dd);
     fprintf(f, "base_insns %u\n", ctx->base_insns);
     fprintf(f, "append_insns %u\n", ctx->append_insns);
     fprintf(f, "# idx measured overhead orig\n");
@@ -1027,8 +1042,9 @@ static void atomic_write_compensation(struct atomic_trace_ctx *ctx)
     fclose(f);
     fprintf(stderr, "atomic: compensation r=%llu/%llu (R_est=%.2f%%), "
             "%zu checkpoints\n",
-            (unsigned long long)m, (unsigned long long)o,
-            o ? 100.0 * (double)(m - o) / (double)m : 0.0, ctx->n_ckpts);
+            (unsigned long long)dn, (unsigned long long)dd,
+            dd ? 100.0 * (double)(dn - dd) / (double)dn : 0.0,
+            ctx->n_ckpts);
 }
 
 /* 结束: INTERRUPT 停止 → 转储事件 → 恢复站点 → munmap 缓冲区 */

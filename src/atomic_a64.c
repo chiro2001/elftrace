@@ -579,6 +579,7 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
                                struct a64_atom_counts *counts)
 {
     uint8_t *p = out;
+    uint8_t *done = NULL;
     unsigned rt, rn;
     int size;
     int kind;
@@ -679,7 +680,7 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
         int rt_off = pl.off[rt];
         if (rt_off < 0)
             return 0;
-        uint8_t *done = p;
+        done = p;
         put32(&p, str_x_imm(31, 13, (unsigned)rt_off));
         emit_plan_restore(&p, &pl);
 
@@ -698,15 +699,17 @@ size_t a64_atomic_record_block(uint8_t *out, uint64_t block_abs,
     uint64_t b_off = (uint64_t)(p - out);
     put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
 
-    /* 路径指令数: 代码区 = 稳态 + 追加路径(14) + 溢出路径(3);
-       追加/溢出只在不稳态执行。跳过路径不做 ordinal(3)+compare(5),
-       但 value/addr 拷贝在 TLS 检查之前, 两路径都有。 */
+    /* 实际执行路径指令数 (从生成期标签统计, 不依赖 code_n):
+       steady = [入口..b.eq] + [done..b ret], 减入口字面量 2 槽;
+       skip   = [入口..TLS b.ne] + [done..b ret] (不做 ordinal+compare);
+       追加路径实测 16 条 (last_* 更新 2 + 事件写入 12 + 跳 done 2)。 */
     if (counts) {
-        size_t code_n = (size_t)(p - out) / 4;
-        unsigned steady = (unsigned)code_n - 14 - 3;
-        counts->base = steady + 1;          /* +1 = 站点处 b */
-        counts->append = 14;
-        counts->skip = steady - 8 + 1;
+        size_t head = (size_t)(same_b - out) / 4 + 1 - 2;
+        size_t tail = (size_t)(p - done) / 4;
+        counts->base = (unsigned)(head + tail) + 1;  /* +1 = 站点处 b */
+        counts->append = 16;
+        counts->skip = (unsigned)((size_t)(tls_bne - out) / 4 + 1 - 2 +
+                                  tail);
     }
 
     /* 数据区 */
@@ -733,6 +736,7 @@ size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
                              int record_all)
 {
     uint8_t *p = out;
+    uint8_t *done = NULL;
     unsigned rn;
 
     if (!ad || rt == 31)
@@ -831,7 +835,7 @@ size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
         int rt_off = pl.off[rt];
         if (rt_off < 0)
             return 0;
-        uint8_t *done = p;
+        done = p;
         put32(&p, str_x_imm(31, 13, (unsigned)rt_off));
         emit_plan_restore(&p, &pl);
 
@@ -853,13 +857,16 @@ size_t a64_load_record_block(uint8_t *out, uint64_t block_abs,
     uint64_t b_off = (uint64_t)(p - out);
     put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
 
-    /* 路径指令数 (与原子版同口径) */
+    /* 实际执行路径指令数 (同原子版口径):
+       record_all 时每次访问都走追加路径, append 已含在 base 内。 */
     if (counts) {
-        size_t code_n = (size_t)(p - out) / 4;
-        unsigned steady = (unsigned)code_n - 14 - 3;
-        counts->base = steady + 1;          /* +1 = 站点处 b */
-        counts->append = 14;
-        counts->skip = steady - 8 + 1;
+        const uint8_t *h = same_b ? same_b : skip_b;
+        size_t head = (size_t)(h - out) / 4 + 1 - 2;
+        size_t tail = (size_t)(p - done) / 4;
+        counts->base = (unsigned)(head + tail) + 1;  /* +1 = 站点处 b */
+        counts->append = record_all ? 0 : 16;
+        counts->skip = (unsigned)((size_t)(tls_bne - out) / 4 + 1 - 2 +
+                                  tail);
     }
 
     /* 数据区 */
@@ -913,6 +920,7 @@ size_t a64_cas_record_block(uint8_t *out, uint64_t block_abs,
 
     memset(out, 0, A64_ATOM_BLOCK_SIZE);
     uint8_t *p = out;
+    uint8_t *done = NULL;
 
     /* 入口 (4 指令 + 8B 字面量 = 0x18 字节, 代码从 0x18 开始) */
     put32(&p, 0xA9BF47F0U);     /* stp x16,x17,[sp,#-16]! */
@@ -1011,7 +1019,7 @@ size_t a64_cas_record_block(uint8_t *out, uint64_t block_abs,
         int rs_off = pl.off[rs];
         if (rs_off < 0)
             return 0;
-        uint8_t *done = p;
+        done = p;
         put32(&p, str_x_imm(31, 13, (unsigned)rs_off));
         emit_plan_restore(&p, &pl);
 
@@ -1029,12 +1037,16 @@ size_t a64_cas_record_block(uint8_t *out, uint64_t block_abs,
     uint64_t b_off = (uint64_t)(p - out);
     put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
 
+    /* 实际执行路径指令数: steady = [入口..b.eq] + [done..b ret] 减
+       入口字面量 2 槽; 追加路径实测 23 条 (五元组 last_* 5 + 事件
+       写入 16 + 跳 done 2)。 */
     if (counts) {
-        size_t code_n = (size_t)(p - out) / 4;
-        unsigned steady = (unsigned)code_n - 17 - 3;
-        counts->base = steady + 1;
-        counts->append = 17;
-        counts->skip = steady - 12 + 1;
+        size_t head = (size_t)(same_b - out) / 4 + 1 - 2;
+        size_t tail = (size_t)(p - done) / 4;
+        counts->base = (unsigned)(head + tail) + 1;  /* +1 = 站点处 b */
+        counts->append = 23;
+        counts->skip = (unsigned)((size_t)(tls_bne - out) / 4 + 1 - 2 +
+                                  tail);
     }
 
     uint64_t v = tls;           memcpy(out + CASREC_TLS_OFF, &v, 8);
