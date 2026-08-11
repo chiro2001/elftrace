@@ -115,6 +115,10 @@ static uint32_t cbnz_x(int32_t off, unsigned rt)
     /* cbnz xrt, #off (64 位计数器) */
     return 0xB5000000U | (((uint32_t)(off / 4) & 0x7FFFF) << 5) | rt;
 }
+static uint32_t cbz_x(int32_t off, unsigned rt)
+{
+    return 0xB4000000U | (((uint32_t)(off / 4) & 0x7FFFF) << 5) | rt;
+}
 
 /* ---- 逐站点最小保存集 ----
  * 跳板只保存自己会破坏的寄存器: 基础 scratch 集 + 站点 Rt/Rn (保证
@@ -1527,11 +1531,16 @@ size_t a64_atomic_replay_burn_block(uint8_t *out, uint64_t block_abs,
             put32(&p, movz_x(28, 0, 0));
         put32(&p, add_xr_lsl(27, 27, 28, (unsigned)ad->shift));
     }
-    /* 地址校验: 失配 = 对象身份分歧信号, 回退真实读 */
+    /* 地址校验: 失配 = 对象身份分歧信号, 回退真实读。
+       run.addr==0 表示合成 run (常量自旋无 RLE 事件, 无 last_addr):
+       跳过校验 (固定地址单 load 循环, 基址在循环内不变)。 */
     put32(&p, ldr_x_imm(24, 28, 8));    /* run.addr */
+    uint8_t *za_b = p;
+    put32(&p, cbz_x(0, 28));            /* cbz x28, no_check (占位) */
     put32(&p, cmp_x(27, 28));
     uint8_t *ne_b = p;
     put32(&p, bcond(0, 1));     /* b.ne use_real (占位) */
+    uint8_t *no_check = p;
     /* run 首访问 (ordinal == run.start): 逐访问路径 */
     put32(&p, cmp_x(25, 19));
     uint8_t *eq_b = p;
@@ -1664,6 +1673,7 @@ size_t a64_atomic_replay_burn_block(uint8_t *out, uint64_t block_abs,
         int32_t d6 = (int32_t)(burn_last - last_b);
         int32_t d7 = (int32_t)(burn_last - cap_b);
         int32_t d8 = (int32_t)(per_access - na_b);
+        int32_t d9 = (int32_t)(no_check - za_b);
         uint32_t w7 = a64_encode_b(block_abs + (uint64_t)(set_jmp - out),
                                    block_abs + (uint64_t)(set - out));
         uint32_t w8 = a64_encode_b(block_abs + (uint64_t)(set_jmp2 - out),
@@ -1677,6 +1687,7 @@ size_t a64_atomic_replay_burn_block(uint8_t *out, uint64_t block_abs,
         w = bcond(d6, 8);   memcpy(last_b, &w, 4);
         w = bcond(d7, 8);   memcpy(cap_b, &w, 4);
         w = bcond(d8, 1);   memcpy(na_b, &w, 4);
+        w = cbz_x(d9, 28);  memcpy(za_b, &w, 4);
         memcpy(set_jmp, &w7, 4);
         memcpy(set_jmp2, &w8, 4);
         {
