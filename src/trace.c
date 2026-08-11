@@ -38,6 +38,28 @@
 #include "atomic_trace.h"
 #include "alloc_trace.h"
 
+#if defined(__aarch64__)
+extern void inject_flush_icache(pid_t pid,
+                                const struct user_regs_struct *regs,
+                                unsigned long page, size_t len);
+
+/* 写 4 字节到目标 pc (POKEDATA 按 8B 字写, 必须保留相邻 4B) */
+static void boundary_write_insn(pid_t pid, uint64_t pc, uint32_t insn,
+                                const struct user_regs_struct *regs)
+{
+    uint64_t wa = pc & ~7ULL;
+    uint64_t w = 0;
+    struct iovec li = {.iov_base = &w, .iov_len = 8};
+    struct iovec ri = {.iov_base = (void *)(uintptr_t)wa, .iov_len = 8};
+    if (process_vm_readv(pid, &li, 1, &ri, 1, 0) == 8) {
+        memcpy((uint8_t *)&w + (pc - wa), &insn, 4);
+        ptrace(PTRACE_POKEDATA, pid, (void *)(uintptr_t)wa,
+               (void *)(uintptr_t)w);
+        inject_flush_icache(pid, regs, wa & ~0xfffUL, 4096);
+    }
+}
+#endif
+
 int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child,
                 uint64_t *inj_page);
 
@@ -59,6 +81,17 @@ struct trace_ctx {
     uint64_t every_eff;         /* 实际触发间隔 (补偿后 = every×r) */
     uint64_t next_trigger;      /* 下一次 read-counter 触发阈值 (measured) */
     uint64_t last_ckpt_count;   /* 上一检查点的实际 perf 计数 */
+    uint64_t last_ckpt_pc;      /* 上一检查点的 PC */
+    /* --boundary-pc: 冷边界 brk 插桩 (记录 perf 计数 + alloc/syscall
+       游标; build 在该边界退出并对齐 T_exec) */
+    uint64_t boundary_pc;
+    int boundary_rel;           /* --boundary-pc +off: 相对主程序基址 */
+    uint64_t boundary_off;
+    uint32_t boundary_orig;
+    int boundary_armed;
+    int boundary_singlestep;
+    FILE *boundary_f;
+    uint64_t boundary_ord;
     size_t ckpt_no;
     size_t cow_ok, cow_fail;
     pid_t *cow_children;
@@ -512,6 +545,14 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
     }
 #endif
 
+    /* 冷边界 brk: 检查点期间临时拆下, 确保快照含真实原指令
+       (否则 build 的 count 退出跳板会把 brk 当原指令执行 → SIGTRAP) */
+#if defined(__aarch64__)
+    if (tc->boundary_armed)
+        boundary_write_insn(tc->pid, tc->boundary_pc,
+                            tc->boundary_orig, &sn.regs);
+#endif
+
     /* 冻结期间直接读全量内存并即时写检查点 (diff 链) */
     collect_memory(tc->pid, &sn);
     snprintf(path, sizeof(path), "%s/ckpt_%06zu.elftrace", tc->out,
@@ -537,6 +578,11 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
         atomic_trace_ckpt(tc->atomic, tc->ckpt_no, perf_count_now(tc));
     if (tc->alloc)
         alloc_trace_ckpt(tc->alloc, tc->ckpt_no);
+#endif
+#if defined(__aarch64__)
+    if (tc->boundary_armed)
+        boundary_write_insn(tc->pid, tc->boundary_pc,
+                            0xD4200A00U, &sn.regs);
 #endif
     ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);   /* 保持 syscall 捕获模式 */
 
@@ -564,6 +610,7 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
             tc->ckpt_no, (unsigned long long)tc->count,
             (unsigned long long)actual_count,
             (unsigned long long)REG_PC(sn.regs));
+    tc->last_ckpt_pc = REG_PC(sn.regs);
     fprintf(stderr, "trace: ckpt %zu actual perf count %llu\n",
             tc->ckpt_no, (unsigned long long)perf_count_now(tc));
 
@@ -602,6 +649,15 @@ int trace_main(int argc, char **argv)
             tc.atomic_enabled = 1;
         } else if (strcmp(argv[i], "--alloc-replay") == 0) {
             tc.alloc_enabled = 1;
+        } else if (strcmp(argv[i], "--boundary-pc") == 0 &&
+                   i + 1 < argc) {
+            const char *v = argv[++i];
+            if (v[0] == '+') {
+                tc.boundary_rel = 1;
+                tc.boundary_off = strtoull(v + 1, NULL, 0);
+            } else {
+                tc.boundary_pc = strtoull(v, NULL, 0);
+            }
         } else if (strcmp(argv[i], "--atomic-buf-size") == 0 &&
                    i + 1 < argc) {
             tc.atomic_buf_size = strtoull(argv[++i], NULL, 0);
@@ -680,6 +736,32 @@ int trace_main(int argc, char **argv)
     ckpt_take(&tc, 1);
 
 #if defined(__aarch64__)
+    /* --boundary-pc +0xNNN: 相对主程序基址 (ckpt0 PC 所在页) */
+    if (tc.boundary_rel && tc.boundary_off) {
+        /* ckpt0 PC 可能在 libc/动态链接器里; 主程序基址用快照段表里
+           最低的可执行段 (排除 ld.so/libc/vdso/内核区) */
+        uint64_t main_base = 0;
+        for (size_t i = 0; i < tc.last.nsegs; i++) {
+            const char *nm = tc.last.segs[i].name;
+            if (!nm || !(tc.last.segs[i].flags & ET_SEG_X))
+                continue;
+            if (strstr(nm, "libc") || strstr(nm, "ld-") ||
+                strstr(nm, "vdso") || strstr(nm, "vvar") ||
+                nm[0] == '[')
+                continue;
+            if (!main_base || tc.last.segs[i].vaddr < main_base)
+                main_base = tc.last.segs[i].vaddr;
+        }
+        if (!main_base)
+            main_base = tc.last_ckpt_pc & ~0xfffULL;
+        tc.boundary_pc = (main_base & ~0xfffULL) + tc.boundary_off;
+        fprintf(stderr, "trace: boundary pc relative +%#llx -> %#llx\n",
+                (unsigned long long)tc.boundary_off,
+                (unsigned long long)tc.boundary_pc);
+    }
+#endif
+
+#if defined(__aarch64__)
     /* 武装原子记录: 再 INTERRUPT 停止目标 → 注入/扫描/patch →
        恢复 PTRACE_SYSCALL 运行 */
     if (tc.atomic_enabled || tc.alloc_enabled) {
@@ -704,6 +786,40 @@ int trace_main(int argc, char **argv)
 #else
     if (tc.alloc_enabled)
         warn("trace: --alloc-replay 仅 aarch64");
+#endif
+
+#if defined(__aarch64__)
+    /* 冷边界 brk 插桩: --boundary-pc 处埋 brk, 每次命中记录 perf 计数
+       + alloc/syscall 游标到 boundaries.bin (build 选边界退出,
+       对齐 T_exec)。目标当前处于停止态。 */
+    if (tc.boundary_pc) {
+        uint32_t w = 0;
+        struct iovec li = {.iov_base = &w, .iov_len = sizeof(w)};
+        struct iovec ri = {.iov_base = (void *)(uintptr_t)tc.boundary_pc,
+                           .iov_len = sizeof(w)};
+        if (process_vm_readv(pid, &li, 1, &ri, 1, 0) != (ssize_t)sizeof(w)) {
+            warn("trace: boundary pc %#llx 不可读",
+                 (unsigned long long)tc.boundary_pc);
+        } else {
+            tc.boundary_orig = w;
+            char bp[PATH_MAX];
+            snprintf(bp, sizeof(bp), "%s/boundaries.bin", tc.out);
+            tc.boundary_f = fopen(bp, "wb");
+            if (tc.boundary_f) {
+                struct user_regs_struct rr;
+                struct iovec io = {.iov_base = &rr, .iov_len = sizeof(rr)};
+                if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
+                           &io) == 0) {
+                    boundary_write_insn(pid, tc.boundary_pc,
+                                        0xD4200A00U /* brk #0x50 */, &rr);
+                }
+                tc.boundary_armed = 1;
+                fprintf(stderr, "trace: boundary brk armed at %#llx "
+                        "(orig %08x)\n",
+                        (unsigned long long)tc.boundary_pc, tc.boundary_orig);
+            }
+        }
+    }
 #endif
 
     /* 目标恢复运行, 用 PTRACE_SYSCALL 模式 (每次 syscall 入口/返回停止) */
@@ -763,6 +879,72 @@ int trace_main(int argc, char **argv)
                 else
                     ptrace(PTRACE_SYSCALL, pid, 0, 0);
             } else if (si == SIGTRAP) {
+#if defined(__aarch64__)
+                if (tc.boundary_armed && tc.boundary_singlestep) {
+                    /* 单步执行完原指令: 重新埋 brk, 恢复 syscall 模式 */
+                    struct user_regs_struct rr;
+                    struct iovec io = {.iov_base = &rr,
+                                       .iov_len = sizeof(rr)};
+                    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
+                               &io) == 0)
+                        boundary_write_insn(pid, tc.boundary_pc,
+                                            0xD4200A00U, &rr);
+                    tc.boundary_singlestep = 0;
+                    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+                    break;      /* 回主循环 perf 轮询 (勿 continue
+                                   饿死检查点) */
+                }
+                if (tc.boundary_armed) {
+                    struct user_regs_struct rr;
+                    struct iovec io = {.iov_base = &rr,
+                                       .iov_len = sizeof(rr)};
+                    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
+                               &io) == 0 &&
+                        (unsigned long)rr.pc == tc.boundary_pc) {
+                        /* 边界命中: 记录 count + alloc/syscall 游标 */
+                        uint64_t rec[5];
+                        rec[0] = perf_count_now(&tc);
+                        rec[1] = 0;
+                        if (tc.alloc) {
+                            uint64_t abuf =
+                                alloc_trace_abuf_addr(tc.alloc);
+                            uint64_t evp = 0;
+                            struct iovec a1 = {.iov_base = &rec[1],
+                                               .iov_len = 8};
+                            if (abuf) {
+                                struct iovec a2 = {
+                                    .iov_base = (void *)(uintptr_t)
+                                        (abuf + 24),
+                                    .iov_len = 8};
+                                process_vm_readv(pid, &a1, 1, &a2, 1, 0);
+                                evp = rec[1];
+                                /* 相对事件数: (event_ptr - base)/40 */
+                                if (evp >= abuf + 64)
+                                    rec[1] = (evp - (abuf + 64)) / 40;
+                                else
+                                    rec[1] = 0;
+                            }
+                        }
+                        rec[2] = (uint64_t)tc.n_syscalls;
+                        rec[3] = tc.boundary_ord++;
+                        rec[4] = tc.boundary_pc;
+                        if (tc.boundary_f)
+                            fwrite(rec, 1, sizeof(rec), tc.boundary_f);
+                        fprintf(stderr,
+                                "trace: boundary hit ord=%llu count=%llu "
+                                "alloc=%llu\n",
+                                (unsigned long long)rec[3],
+                                (unsigned long long)rec[0],
+                                (unsigned long long)rec[1]);
+                        /* 恢复原指令 → 单步执行 → 重埋 brk */
+                        boundary_write_insn(pid, tc.boundary_pc,
+                                            tc.boundary_orig, &rr);
+                        tc.boundary_singlestep = 1;
+                        ptrace(PTRACE_SINGLESTEP, pid, 0, 0);
+                        break;
+                    }
+                }
+#endif
                 ptrace(PTRACE_SYSCALL, pid, 0, 0);
             } else {
 #if defined(__aarch64__)
@@ -832,6 +1014,26 @@ int trace_main(int argc, char **argv)
 main_done:
 
 #if defined(__aarch64__)
+    /* 冷边界收尾: 关闭账本, 还原原指令 */
+    if (tc.boundary_armed) {
+        if (tc.boundary_f) {
+            fflush(tc.boundary_f);
+            fclose(tc.boundary_f);
+            tc.boundary_f = NULL;
+        }
+        if (kill(pid, 0) == 0)
+            {
+                struct user_regs_struct rr;
+                struct iovec io = {.iov_base = &rr, .iov_len = sizeof(rr)};
+                if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS,
+                           &io) == 0)
+                    boundary_write_insn(pid, tc.boundary_pc,
+                                        tc.boundary_orig, &rr);
+            }
+        fprintf(stderr, "trace: boundary ledger done (%llu hits)\n",
+                (unsigned long long)tc.boundary_ord);
+        tc.boundary_armed = 0;
+    }
     if (tc.atomic)
         atomic_trace_finish(tc.atomic);
     if (tc.alloc)

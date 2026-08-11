@@ -446,6 +446,7 @@ static unsigned long find_stage1_page_a64(pid_t pid, unsigned long pc,
             skip--;
             continue;
         }
+        fclose(f);
         return (unsigned long)s;
     }
     fclose(f);

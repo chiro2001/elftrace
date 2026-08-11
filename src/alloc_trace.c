@@ -72,6 +72,11 @@ struct alloc_trace_ctx {
     size_t n_ckpts;
 };
 
+uint64_t alloc_trace_abuf_addr(const struct alloc_trace_ctx *ctx)
+{
+    return ctx ? ctx->abuf_addr : 0;
+}
+
 /* ---- 注入缓冲区 tmem 读写 (与 atomic_trace 同款) ---- */
 static int atmem_rw(pid_t pid, int wr, uint64_t addr, void *buf, size_t len)
 {

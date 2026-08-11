@@ -120,6 +120,39 @@ static void alloc_build_load(const char *dir, struct alloc_build *ab)
 
 static struct alloc_build g_alloc_build;
 
+/* ---- trace --boundary-pc 冷边界账本 (boundaries.bin) ---- */
+struct boundary_rec {
+    uint64_t count, alloc, sys, ord, pc;
+};
+static struct boundary_rec *g_boundaries;
+static size_t g_n_boundaries;
+static uint64_t g_alloc_exec_end;   /* 边界处 alloc 游标 (事件表终点) */
+static uint64_t g_exec_count;       /* 边界处 perf 计数 (T_exec 终点) */
+static int g_boundary_exit;         /* 已选冷边界退出 */
+
+static void boundary_load(const char *dir)
+{
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/boundaries.bin", dir);
+    FILE *f = fopen(p, "rb");
+    if (!f)
+        return;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz >= (long)sizeof(struct boundary_rec)) {
+        g_n_boundaries = (size_t)sz / sizeof(struct boundary_rec);
+        g_boundaries = xmalloc(g_n_boundaries * sizeof(*g_boundaries));
+        if (fread(g_boundaries, sizeof(*g_boundaries), g_n_boundaries,
+                  f) != g_n_boundaries)
+            g_n_boundaries = 0;
+    }
+    fclose(f);
+    if (g_n_boundaries)
+        fprintf(stderr, "build: %zu cold boundary records\n",
+                g_n_boundaries);
+}
+
 static uint32_t a64_patch_b(uint64_t from, uint64_t to);
 static void blob_patch_u64(uint8_t *blob, uint64_t off, uint64_t val);
 
@@ -822,6 +855,11 @@ static void spload_add(struct strict_pload **pl, size_t *n, size_t *cap,
 {
     if (!memsz)
         return;
+    if (vaddr < 0x10000) {
+        warn("strict: spload vaddr %#llx below VA_MIN 0x10000 skipped",
+             (unsigned long long)vaddr);
+        return;
+    }
     if (*n == *cap) {
         *cap = *cap ? *cap * 2 : 16;
         *pl = xrealloc(*pl, *cap * sizeof(**pl));
@@ -1198,6 +1236,40 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
        在 cursor==total 处直接跳 strict exit (rc=0), 不再 patch TO
        检查点 PC 的退出点 —— 否则计数/首访退出会先触发 (游标未消费完),
        且 40M 单间隔窗口的"repeated"启发会让循环内退出点首访即退。 */
+    /* 冷边界账本选退出点: TO 后第一个边界 (count >= to_actual),
+       K = 边界序数差, alloc 表延伸到边界游标, T_exec = 边界 count 差 */
+    if (g_n_boundaries && !g_bm_exit_pc) {
+        for (size_t i = 0; i < g_n_boundaries; i++) {
+            if (g_boundaries[i].count >= count_to) {
+                uint64_t from_ord = 0;
+                for (size_t j = 0; j < g_n_boundaries; j++) {
+                    if (g_boundaries[j].count <= count_from)
+                        from_ord = g_boundaries[j].ord + 1;
+                    else
+                        break;
+                }
+                g_alloc_exec_end = g_boundaries[i].alloc;
+                g_exec_count = g_boundaries[i].count;
+                g_boundary_exit = 1;
+                g_bm_exit_pc = g_boundaries[i].pc;
+                exit_count_override = g_boundaries[i].ord >= from_ord
+                    ? g_boundaries[i].ord - from_ord + 1 : 1;
+                fprintf(stderr,
+                        "build: cold boundary exit pc=%#llx ord=%llu "
+                        "K=%llu count=%llu alloc=%llu "
+                        "(T_exec=%llu, T_req=%llu)\n",
+                        (unsigned long long)g_boundaries[i].pc,
+                        (unsigned long long)g_boundaries[i].ord,
+                        (unsigned long long)exit_count_override,
+                        (unsigned long long)g_boundaries[i].count,
+                        (unsigned long long)g_alloc_exec_end,
+                        (unsigned long long)
+                            (g_boundaries[i].count - count_from),
+                        (unsigned long long)(count_to - count_from));
+                break;
+            }
+        }
+    }
     if (g_bm_exit_pc)
         exit_override = g_bm_exit_pc;   /* 显式冷退出点覆盖 TO PC */
     int alloc_fused_exit = 0;
@@ -1762,6 +1834,13 @@ synth_done:
                     const uint8_t *q = blob->data + payload_off +
                         segs[k].payload_off +
                         (exit_override - segs[k].vaddr);
+                    uint32_t saved;
+                    memcpy(&saved, q, 4);
+                    if (saved == 0xD4200A00U)
+                        die("strict: exit %#llx captured trace brk #0x50 "
+                            "(checkpoint was armed); rerun trace with "
+                            "boundary disarm fix",
+                            (unsigned long long)exit_override);
                     memcpy(b + 16, q, 4);
                     break;
                 }
@@ -2490,17 +2569,32 @@ synth_done:
             c_to = g_alloc_build.n_events;
         if (c_from > c_to)
             c_from = c_to;
-        uint64_t window = c_to - c_from;
+        uint64_t slack = 0;
+        if (g_boundary_exit && g_alloc_exec_end > c_to) {
+            /* 边界账本: 事件表延伸到边界处 alloc 游标 */
+            slack = g_alloc_exec_end - c_to;
+            c_to = g_alloc_exec_end;
+            if (c_to > g_alloc_build.n_events)
+                c_to = g_alloc_build.n_events;
+            if (c_from > c_to)
+                c_from = c_to;
+        }
         /* slack: 显式冷退出点 (--bm-exit-pc) 时, 切片消费完窗口事件后
            继续跑尾部工作 (到 TO 边界/冷循环计数退出), 事件表多装下一
            检查点间隔的事件供其消费; 上限防御性封顶。 */
-        uint64_t slack = 0;
-        if (g_bm_exit_pc && g_alloc_build.n_ck &&
+        if (!g_boundary_exit && g_bm_exit_pc && g_alloc_build.n_ck &&
             (size_t)to_ckpt < g_alloc_build.n_ck)
             slack = g_alloc_build.ck_counts[to_ckpt] - c_to;
+        uint64_t window = c_to - c_from;
         if (slack > window * 4 + 4096)
             slack = window * 4 + 4096;
         uint64_t total = window + slack;
+        /* 事件表只到 n_events; 边界 slack 可能在文件尾之外, 越界读
+           垃圾事件会让 alloc premap 发射低地址页 (< mmap_min_addr),
+           exec 阶段即 SIGSEGV。 */
+        if (c_from + total > g_alloc_build.n_events)
+            total = g_alloc_build.n_events > c_from
+                        ? g_alloc_build.n_events - c_from : 0;
         if (!window) {
             warn("alloc: 窗口内无分配事件 (from %llu to %llu)",
                  (unsigned long long)c_from, (unsigned long long)c_to);
@@ -2530,7 +2624,8 @@ synth_done:
                 struct hm { uint64_t ptr, size; } *hm =
                     xcalloc(HMAP_CAP, sizeof(*hm));
                 uint64_t *cl = xcalloc(total ? total : 1, sizeof(*cl));
-                for (size_t e = 0; e < c_to + slack; e++) {
+                for (size_t e = 0;
+                     e < c_to + slack && e < g_alloc_build.n_events; e++) {
                     const uint8_t *ev =
                         g_alloc_build.events + e * ALLOC_EVENT_SIZE;
                     uint32_t k;
@@ -3676,6 +3771,8 @@ int build_main(int argc, char **argv)
 #if defined(__aarch64__)
     if (mode_baremetal && bm_strict && ckpts && to_ckpt >= 0)
         atomic_load(ckpts, from_ckpt, to_ckpt, &ab);
+    if (ckpts)
+        boundary_load(ckpts);
     if (mode_baremetal && bm_strict && ckpts)
         alloc_build_load(ckpts, &g_alloc_build);
     /* atomic_load 内部 memset 重建 ab, 需重新回填 manifest 原始计数
