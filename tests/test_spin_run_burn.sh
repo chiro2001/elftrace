@@ -29,7 +29,7 @@ gcc -O2 -g -pthread -o "$TF_TMP/prog_spin_single" \
 
 # ---------- Run 1: 补偿比例校准 ----------
 rm -rf "$TF_TMP/srb_r1" "$TF_TMP/srb_r2"
-"$TF_TMP/prog_spin_single" 1000000 30000000 \
+"$TF_TMP/prog_spin_single" 3000000 30000000 \
     > "$TF_TMP/srb_r1.out" 2>&1 &
 PID=$!
 sleep 0.3
@@ -44,7 +44,7 @@ wait $PID 2>/dev/null
 }
 
 # ---------- Run 2: 正式采集 ----------
-"$TF_TMP/prog_spin_single" 1000000 30000000 \
+"$TF_TMP/prog_spin_single" 3000000 30000000 \
     > "$TF_TMP/srb_r2.out" 2>&1 &
 PID=$!
 sleep 0.3
