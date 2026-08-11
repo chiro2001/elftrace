@@ -43,7 +43,8 @@ size_t alloc_replay_block(uint8_t *out, uint64_t block_abs,
                           uint64_t cursor_addr, uint64_t total_addr,
                           uint64_t events_abs, uint32_t kind,
                           uint64_t tel_abs, uint64_t bail_abs,
-                          uint64_t site_pc, uint64_t exit_abs)
+                          uint64_t site_pc, uint64_t exit_abs,
+                          uint64_t copy_len_abs)
 {
     uint8_t *p = out;
     memset(out, 0, 0x280);
@@ -81,8 +82,10 @@ size_t alloc_replay_block(uint8_t *out, uint64_t block_abs,
     p += 8;
     w = b_ldr(20, 16, 0x210);
     memcpy(p, &w, 4); p += 4;              /* events_abs */
-    w = b_add_reg(21, 20, 18, 5);
-    memcpy(p, &w, 4); p += 4;              /* x21 = x20 + x18<<5 */
+    w = 0x8B120E95U;
+    memcpy(p, &w, 4); p += 4;              /* x21 = x20 + x18<<3 */
+    w = 0x8B1216B5U;
+    memcpy(p, &w, 4); p += 4;              /* x21 += x18<<5 (40B/事件) */
     w = 0xB9400000U | (21U << 5) | 22U;
     memcpy(p, &w, 4); p += 4;              /* ldr w22,[x21] */
     w = 0xB9400000U | ((0x218U / 4) << 10) | (16U << 5) | 23U;
@@ -101,12 +104,19 @@ size_t alloc_replay_block(uint8_t *out, uint64_t block_abs,
     memcpy(p, &w, 4); p += 4;              /* b.eq +12 (跳过 8B 兜底) */
     uint8_t *argmis = p;                    /* movz x22,#12; b bail (8B) */
     p += 8;
+    w = 0xAA0003E2U;
+    memcpy(p, &w, 4); p += 4;              /* mov x2,x0 (old_ptr 暂存,
+                                               realloc 搬运用) */
     /* calloc 清零: x0=nmemb, x1=elem_size (调用参数仍有效),
        x23=录制 nmemb (arg 校验后空闲, 已保存/恢复)。
        x23 = nmemb*elem_size; 超 256MB → reason=13 bail。
        所有分支偏移用指针回填, 不手算。 */
     w = 0x9B017C17U;
     memcpy(p, &w, 4); p += 4;              /* mul x23,x0,x1 */
+    w = 0x91001EF7U;
+    memcpy(p, &w, 4); p += 4;              /* add x23,x23,#7 (8B 对齐) */
+    w = 0x927DF2F7U;
+    memcpy(p, &w, 4); p += 4;              /* and x23,x23,#~7 */
     w = 0x710006DFU;
     memcpy(p, &w, 4); p += 4;              /* cmp w22,#1 (kind==calloc) */
     uint8_t *bne1 = p;                      /* b.ne → ldr x0 (占位) */
@@ -146,6 +156,63 @@ size_t alloc_replay_block(uint8_t *out, uint64_t block_abs,
                        << 5) | 4U;
     memcpy(p, &w, 4); p += 4;              /* cbnz x4,zloop */
     uint8_t *zero_end = p;
+    /* realloc 搬运: kind==2 且 ret!=old 且 copy_len>0 时
+       memcpy(ret, old, copy_len) — 录制侧真实 realloc 的搬运在切片里
+       被跳过, 补上既保证内容正确也恢复指令工作量 (A/T 对齐)。 */
+    w = 0x71000ADFU;
+    memcpy(p, &w, 4); p += 4;              /* cmp w22,#2 */
+    uint8_t *bne3 = p;                      /* b.ne → cursor++ (占位) */
+    p += 4;
+    w = 0xF9412205U;
+    memcpy(p, &w, 4); p += 4;              /* ldr x5,[x16,#0x240] */
+    w = 0x8B120CA5U;
+    memcpy(p, &w, 4); p += 4;              /* add x5,x5,x18,lsl#3 */
+    w = b_ldr(5, 5, 0);
+    memcpy(p, &w, 4); p += 4;              /* ldr x5,[x5] copy_len */
+    w = 0x91001CA5U;
+    memcpy(p, &w, 4); p += 4;              /* add x5,x5,#7 */
+    w = 0x927DF0A5U;
+    memcpy(p, &w, 4); p += 4;              /* and x5,x5,#~7 (8B 对齐) */
+    uint8_t *cbz5 = p;                      /* cbz x5 → cursor++ (占位) */
+    p += 4;
+    uint8_t *cbz0b = p;                     /* cbz x0 → cursor++ (占位) */
+    p += 4;
+    w = 0xEB02001FU;
+    memcpy(p, &w, 4); p += 4;              /* cmp x0,x2 (ret==old?) */
+    uint8_t *beq = p;                       /* b.eq → cursor++ (占位) */
+    p += 4;
+    w = 0xAA0203E3U;
+    memcpy(p, &w, 4); p += 4;              /* mov x3,x2 (src) */
+    w = 0xAA0003E4U;
+    memcpy(p, &w, 4); p += 4;              /* mov x4,x0 (dst) */
+    uint8_t *cploop = p;
+    w = 0xF8408466U;
+    memcpy(p, &w, 4); p += 4;              /* ldr x6,[x3],#8 */
+    w = 0xF8008486U;
+    memcpy(p, &w, 4); p += 4;              /* str x6,[x4],#8 */
+    w = 0xD10020A5U;
+    memcpy(p, &w, 4); p += 4;              /* sub x5,x5,#8 */
+    w = 0xB5000000U | (((uint32_t)((cploop - p) / 4) & 0x7FFFF) << 5) |
+        5U;                                 /* cbnz x5,cploop */
+    memcpy(p, &w, 4); p += 4;
+    uint8_t *cp_end = p;
+    /* 回填 realloc 搬运段分支 */
+    {
+        uint32_t b3 = 0x54000000U |
+                      (((uint32_t)((cp_end - bne3) / 4) & 0x7FFFF) << 5) |
+                      1U;
+        memcpy(bne3, &b3, 4);
+        uint32_t c5 = 0xB4000000U |
+                      (((uint32_t)((cp_end - cbz5) / 4) & 0x7FFFF) << 5) |
+                      5U;
+        memcpy(cbz5, &c5, 4);
+        uint32_t c0 = 0xB4000000U |
+                      (((uint32_t)((cp_end - cbz0b) / 4) & 0x7FFFF) << 5);
+        memcpy(cbz0b, &c0, 4);
+        uint32_t be = 0x54000000U |
+                      (((uint32_t)((cp_end - beq) / 4) & 0x7FFFF) << 5);
+        memcpy(beq, &be, 4);
+    }
     /* 回填: bne1→after, bhi→big, bskp→after,
        bne2→zero_end, cbz0→zero_end, cbzz→zero_end */
     {
@@ -273,5 +340,6 @@ size_t alloc_replay_block(uint8_t *out, uint64_t block_abs,
     v = site_pc;     memcpy(out + 0x228, &v, 8);
     v = bail_abs;    memcpy(out + 0x230, &v, 8);
     v = exit_abs;    memcpy(out + 0x238, &v, 8);
+    v = copy_len_abs; memcpy(out + 0x240, &v, 8);
     return 0x280;
 }

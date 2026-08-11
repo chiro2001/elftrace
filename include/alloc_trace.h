@@ -7,7 +7,11 @@
  * 非目标线程只执行原函数。构建侧按同一入口 patch 回放跳板, 按序
  * 返回录制指针 (不执行真实分配器)。
  *
- * 事件 32B: {kind u32, pad u32, size u64, caller u64, ret u64}。
+ * 事件 40B (v2): {kind u32, pad u32, size u64, caller u64, ret u64,
+ *                 extra u64}。
+ *   pad:  0=COMMITTED/空闲, 1=RESERVED (在途, reserve/commit 协议),
+ *         构建/回放不读 pad;
+ *   extra: calloc=elem_size, realloc=new_size (x1), malloc/free 未用。
  * 缓冲区头 64B: magic/version/n_funcs/event_ptr/events_end/overflow/tls/
  * buf_size。
  */
@@ -31,7 +35,7 @@ enum {
 #define ALLOC_BUF_MAGIC   0x434F4C41ULL   /* "ALOC" */
 #define ALLOC_BUF_VERSION 1
 #define ALLOC_BUF_HDR_SIZE 64
-#define ALLOC_EVENT_SIZE  32
+#define ALLOC_EVENT_SIZE  40
 
 /* 跳板块 (0x300B) */
 #define ALLOC_BLOCK_SIZE 0x300

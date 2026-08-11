@@ -19,6 +19,7 @@
 #define FAKE_ABS  0x40030000ULL
 #define BAIL_ABS  0x40040000ULL
 #define EXIT_ABS  0x40050000ULL
+#define CLEN_ABS  0x40060000ULL
 
 static void *map_fixed(uint64_t addr, size_t len)
 {
@@ -47,7 +48,7 @@ __attribute__((noinline)) static uint64_t call_fake(uint64_t arg)
         : "=r"(x16out), "=r"(x17out), "+r"(r)
         : "r"(0x1111222233334444ULL), "r"(0x5555666677778888ULL),
           "r"(FAKE_ABS)
-        : "x1", "x2", "x3", "x4", "x30", "memory");
+        : "x1", "x2", "x3", "x4", "x5", "x6", "x30", "memory");
     if (x16out != 0x1111222233334444ULL)
         return 0xDEAD000000000016ULL;
     if (x17out != 0x5555666677778888ULL)
@@ -72,7 +73,7 @@ __attribute__((noinline)) static uint64_t call_calloc(uint64_t nmemb,
         : "r"(esz), "r"(0x1111222233334444ULL),
           "r"(0x5555666677778888ULL),
           "r"(FAKE_ABS)
-        : "x1", "x2", "x3", "x4", "x30", "memory");
+        : "x1", "x2", "x3", "x4", "x5", "x6", "x30", "memory");
     return r;
 }
 
@@ -92,15 +93,17 @@ static void emit_bail_stub(uint8_t *p)
 static void setup_events(uint8_t *ev, uint64_t n, uint32_t kind)
 {
     for (uint64_t i = 0; i < n; i++) {
-        uint8_t *e = ev + i * 32;
+        uint8_t *e = ev + i * 40;
         uint32_t k = kind;
         uint64_t size = 0x100 + i;
         uint64_t caller = 0x70000000ULL + i;
         uint64_t ret = 0x4000 + i * 0x111;
+        uint64_t extra = 0;
         memcpy(e + 0, &k, 4);
         memcpy(e + 8, &size, 8);
         memcpy(e + 16, &caller, 8);
         memcpy(e + 24, &ret, 8);
+        memcpy(e + 32, &extra, 8);
     }
 }
 
@@ -113,7 +116,8 @@ int main(int argc, char **argv)
     uint8_t *fake = map_fixed(FAKE_ABS, 0x1000);
     uint8_t *bailp = map_fixed(BAIL_ABS, 0x1000);
     uint8_t *exitp = map_fixed(EXIT_ABS, 0x1000);
-    if (!blk || !ev || !data || !fake || !bailp || !exitp) {
+    uint8_t *clen = map_fixed(CLEN_ABS, 0x1000);
+    if (!blk || !ev || !data || !fake || !bailp || !exitp || !clen) {
         printf("FAIL: mmap\n");
         return 1;
     }
@@ -151,20 +155,42 @@ int main(int argc, char **argv)
                strcmp(mode, "callocbig") == 0) {
         n = 1;
         kind = 1;
+    } else if (strcmp(mode, "realloc") == 0) {
+        n = 1;
+        kind = 2;
     } else
         n = 3;
     /* mismatch: 事件 kind 故意与块期待不同 (块 kind=1, 事件 kind=0) */
     setup_events(ev, n, strcmp(mode, "mismatch") == 0 ? 0 : kind);
     if (strcmp(mode, "calloc") == 0 ||
         strcmp(mode, "callocbig") == 0) {
-        /* 单条 calloc 事件: nmemb=4, ret=DATA+0x400 (零化目标) */
+        /* 单条 calloc 事件: nmemb=3, ret=DATA+0x400 (零化目标) */
         uint8_t *e0 = ev;
         uint32_t k = 1;
-        uint64_t size = 4, caller = 0x70000000ULL, ret = DATA_ABS + 0x400;
+        uint64_t size = 3, caller = 0x70000000ULL, ret = DATA_ABS + 0x400;
+        uint64_t extra = 4;          /* elem_size */
         memcpy(e0 + 0, &k, 4);
         memcpy(e0 + 8, &size, 8);
         memcpy(e0 + 16, &caller, 8);
         memcpy(e0 + 24, &ret, 8);
+        memcpy(e0 + 32, &extra, 8);
+    }
+    if (strcmp(mode, "realloc") == 0) {
+        /* realloc 事件: size 字段=old_ptr, pad=new_size, ret=新指针 */
+        uint8_t *e0 = ev;
+        uint32_t k = 2, pad = 0x80;
+        uint64_t old = DATA_ABS + 0x200, caller = 0x70000000ULL;
+        uint64_t ret = DATA_ABS + 0x400;
+        uint64_t extra = 0x80;       /* new_size */
+        memcpy(e0 + 0, &k, 4);
+        memcpy(e0 + 4, &pad, 4);
+        memcpy(e0 + 8, &old, 8);
+        memcpy(e0 + 16, &caller, 8);
+        memcpy(e0 + 24, &ret, 8);
+        memcpy(e0 + 32, &extra, 8);
+        /* copy_len 侧表: [0]=0x45 (69B, 非 8 对齐 → 跳板取整 72B) */
+        uint64_t cl = 0x45;
+        memcpy(clen, &cl, 8);
     }
 
     uint64_t cursor_addr = DATA_ABS + 0x00;
@@ -177,9 +203,12 @@ int main(int argc, char **argv)
     uint64_t exit_abs = 0;
     if (strcmp(mode, "fuse") == 0)
         exit_abs = EXIT_ABS;
+    uint64_t copy_len_abs = 0;
+    if (strcmp(mode, "realloc") == 0)
+        copy_len_abs = CLEN_ABS;
     size_t sz = alloc_replay_block(blk, BLK_ABS, cursor_addr, total_addr,
                                    EV_ABS, kind, tel_abs, BAIL_ABS,
-                                   FAKE_ABS, exit_abs);
+                                   FAKE_ABS, exit_abs, copy_len_abs);
     if (sz != 0x280) {
         printf("FAIL: block size %zu\n", sz);
         return 1;
@@ -211,14 +240,14 @@ int main(int argc, char **argv)
         call_fake(0x200);       /* 参数与录制 size 不符 → exit(12) */
         rc = 93;
     } else if (strcmp(mode, "calloc") == 0) {
-        memset((void *)(uintptr_t)(DATA_ABS + 0x400), 0xAA, 0x400);
-        uint64_t r = call_calloc(4, 0x100);
+        memset((void *)(uintptr_t)(DATA_ABS + 0x400), 0xAA, 0x20);
+        uint64_t r = call_calloc(3, 4);  /* 12B, 非 8 对齐 */
         if (r != DATA_ABS + 0x400)
             rc = 60;
         else {
             const uint8_t *z =
                 (const uint8_t *)(uintptr_t)(DATA_ABS + 0x400);
-            for (int i = 0; i < 0x400; i++)
+            for (int i = 0; i < 12; i++)
                 if (z[i]) { rc = 61; break; }
         }
         if (!rc) {
@@ -227,8 +256,24 @@ int main(int argc, char **argv)
                 rc = 62;
         }
     } else if (strcmp(mode, "callocbig") == 0) {
-        call_calloc(4, 0x10000000); /* 4*256MB > 256MB 上限 → exit(13) */
+        call_calloc(3, 0x10000000); /* 3*256MB > 256MB 上限 → exit(13) */
         rc = 94;
+    } else if (strcmp(mode, "realloc") == 0) {
+        memset((void *)(uintptr_t)(DATA_ABS + 0x200), 0x5A, 0x80);
+        memset((void *)(uintptr_t)(DATA_ABS + 0x400), 0x00, 0x80);
+        uint64_t r = call_calloc(DATA_ABS + 0x200, 0x80);
+        if (r != DATA_ABS + 0x400)
+            rc = 70;
+        else {
+            const uint8_t *src =
+                (const uint8_t *)(uintptr_t)(DATA_ABS + 0x200);
+            const uint8_t *dst =
+                (const uint8_t *)(uintptr_t)(DATA_ABS + 0x400);
+            for (int i = 0; i < 0x48; i++)
+                if (dst[i] != src[i]) { rc = 71; break; }
+            for (int i = 0x48; i < 0x80; i++)
+                if (dst[i] != 0) { rc = 72; break; }
+        }
     } else {
         uint64_t exp[3] = {0x4000, 0x4111, 0x4222};
         for (uint64_t i = 0; i < n; i++) {

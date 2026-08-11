@@ -18,6 +18,7 @@ size_t alloc_replay_block(uint8_t *out, uint64_t block_abs,
                           uint64_t cursor_addr, uint64_t total_addr,
                           uint64_t events_abs, uint32_t kind,
                           uint64_t tel_abs, uint64_t bail_abs,
-                          uint64_t site_pc, uint64_t exit_abs);
+                          uint64_t site_pc, uint64_t exit_abs,
+                          uint64_t copy_len_abs);
 
 #endif

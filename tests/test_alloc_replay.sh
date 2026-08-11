@@ -67,5 +67,10 @@ if [ "$rc" -ne 13 ]; then
     exit 1
 fi
 
-tf_pass "alloc replay (ok/fused/overrun/mismatch/argmis/calloc/callocbig)"
+if ! "${RUN[@]}" "$TF_TMP/test_alloc_replay" realloc; then
+    echo "FAIL: alloc replay realloc copy (exit code != 0)"
+    exit 1
+fi
+
+tf_pass "alloc replay (ok/fused/overrun/mismatch/argmis/calloc/callocbig/realloc)"
 tf_finish

@@ -58,6 +58,7 @@ struct trace_ctx {
     uint64_t count;             /* 已记录的指令计数 */
     uint64_t every_eff;         /* 实际触发间隔 (补偿后 = every×r) */
     uint64_t next_trigger;      /* 下一次 read-counter 触发阈值 (measured) */
+    uint64_t last_ckpt_count;   /* 上一检查点的实际 perf 计数 */
     size_t ckpt_no;
     size_t cow_ok, cow_fail;
     pid_t *cow_children;
@@ -404,10 +405,20 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
     struct collect_snapshot sn = {.pid = tc->pid};
     FILE *f;
     pid_t child = -1;
+    uint64_t actual_count = 0;
 
     if (!already_stopped && collect_interrupt_sc(tc) < 0)
         return;                 /* tracee 已退出 */
-    tc->next_trigger = perf_count_now(tc) + tc->every_eff;
+    actual_count = perf_count_now(tc);   /* 停止瞬间的真实 perf 计数 */
+    /* 重复/乱序样本: perf ring 与 syscall-stop 处理竞态可能让同一
+       计数触发两次检查点 (manifest 出现 delta=0)。实际计数未前进时
+       直接恢复运行, 不产生重复快照。 */
+    if (tc->ckpt_no > 0 && actual_count <= tc->last_ckpt_count) {
+        ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);
+        return;
+    }
+    tc->last_ckpt_count = actual_count;
+    tc->next_trigger = actual_count + tc->every_eff;
 
 #if defined(__aarch64__)
     /* 原子记录跳板中被打断: 单步到跳板结束 (检查点状态才有效) */
@@ -537,17 +548,24 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
                  tc->ckpt_no);
         const char *base = strrchr(path, '/');
         base = base ? base + 1 : path;
-        /* 第 4 字段: 该检查点时刻已捕获的 syscall 记录数 —
+        /* 第 1 字段: 该检查点时刻的**真实** perf 计数 (采集/ring 丢样
+           导致实际间隔可能是 every 的整数倍; 名义计数会让 build 的
+           T/窗口映射失真, 这是 A/T 失配的根因)。
+           第 4 字段: 该检查点时刻已捕获的 syscall 记录数 —
            build --from/--to 据此裁剪回放表 (切片从检查点 K 恢复,
            只消费 K 之后的 syscall 记录) */
         fprintf(f, "%llu 0x%llx %s %zu\n",
-                (unsigned long long)tc->count,
+                (unsigned long long)actual_count,
                 (unsigned long long)REG_PC(sn.regs), base,
                 tc->n_syscalls);
         fclose(f);
     }
-    fprintf(stderr, "trace: ckpt %zu @ count %llu pc %#llx\n", tc->ckpt_no,
-            (unsigned long long)tc->count, (unsigned long long)REG_PC(sn.regs));
+    fprintf(stderr, "trace: ckpt %zu @ count %llu (actual %llu) pc %#llx\n",
+            tc->ckpt_no, (unsigned long long)tc->count,
+            (unsigned long long)actual_count,
+            (unsigned long long)REG_PC(sn.regs));
+    fprintf(stderr, "trace: ckpt %zu actual perf count %llu\n",
+            tc->ckpt_no, (unsigned long long)perf_count_now(tc));
 
     collect_free(&sn);
     if (tc->ckpt_no > 0 && tc->ckpt_no % 5 == 0)
@@ -771,7 +789,10 @@ int trace_main(int argc, char **argv)
         /* 2. perf 溢出 → 常规检查点 */
         {
             struct pollfd pfd = {.fd = tc.perf_fd, .events = POLLIN};
-            int r = poll(&pfd, 1, 100);
+            int r = poll(&pfd, 1, 1);   /* 短超时: ring 采样在 aarch64 上
+                                           可能不可靠, 兜底按计数器值
+                                           触发; 100ms 会让目标多跑一个
+                                           周期才被读到 */
             if (r > 0 && (pfd.revents & POLLIN)) {
                 uint64_t ip;
                 while ((ip = perf_next_sample(&tc)) != 0) {

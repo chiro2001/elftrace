@@ -28,6 +28,7 @@
 #include "a64.h"
 #include "atomic_a64.h"
 #include "alloc_build.h"
+#include "alloc_trace.h"
 
 /* --atomic-force-cas-pc: 仅对显式列出的 LSE CAS 站点生成强制成功
  * 跳板。默认不 patch 任何 LSE CAS: 对 CPython GIL/libc 锁这类
@@ -101,7 +102,7 @@ static void alloc_build_load(const char *dir, struct alloc_build *ab)
                 ab->events = NULL;
                 sz = 0;
             }
-            ab->n_events = (size_t)sz / 32;
+            ab->n_events = (size_t)sz / ALLOC_EVENT_SIZE;
         }
         fclose(f);
     }
@@ -116,6 +117,8 @@ static void blob_patch_u64(uint8_t *blob, uint64_t off, uint64_t val);
 /* --no-atomic-run-burn: 禁用整 run 烧录 (回退逐访问值回放), 对照测量
  * run-burn 的指令倍率收益 (测试/诊断用)。 */
 static int g_no_atomic_run_burn = 0;
+static int g_no_alloc_fused = 0;    /* --no-alloc-fused: 禁用融合退出
+                                       (诊断/对照: 走 TO 站点退出) */
 
 /* 小编码器 (构建侧跳板生成) */
 static uint32_t b_movz(unsigned rd, unsigned imm16, unsigned hw)
@@ -1185,7 +1188,8 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
        检查点 PC 的退出点 —— 否则计数/首访退出会先触发 (游标未消费完),
        且 40M 单间隔窗口的"repeated"启发会让循环内退出点首访即退。 */
     int alloc_fused_exit = 0;
-    if (g_alloc_build.have && g_alloc_build.n_ck && exit_override) {
+    if (!g_no_alloc_fused && g_alloc_build.have &&
+        g_alloc_build.n_ck && exit_override) {
         uint64_t ac_to = 0, ac_from = 0;
         if (to_ckpt >= 0 && (size_t)to_ckpt <= g_alloc_build.n_ck)
             ac_to = g_alloc_build.ck_counts[to_ckpt - 1];
@@ -2478,8 +2482,72 @@ synth_done:
             v = total;
             buf_append(blob, &v, 8);
             uint64_t events_abs = base + blob->size;
-            buf_append(blob, g_alloc_build.events + c_from * 32,
-                       (size_t)total * 32);
+            buf_append(blob, g_alloc_build.events +
+                                  c_from * ALLOC_EVENT_SIZE,
+                       (size_t)total * ALLOC_EVENT_SIZE);
+
+            /* 3.7a realloc copy_len 侧表: 离线回放全局事件历史, 维护
+               活块 ptr→size 映射; 每个窗口 realloc 事件的搬运长度 =
+               min(old_size, new_size)。事件 pad 字段:
+               calloc=elem_size, realloc=new_size (记录端 x1)。 */
+            uint64_t copy_len_abs = 0;
+            {
+                enum { HMAP_CAP = 1 << 16 };
+                struct hm { uint64_t ptr, size; } *hm =
+                    xcalloc(HMAP_CAP, sizeof(*hm));
+                uint64_t *cl = xcalloc(total ? total : 1, sizeof(*cl));
+                for (size_t e = 0; e < c_to; e++) {
+                    const uint8_t *ev =
+                        g_alloc_build.events + e * ALLOC_EVENT_SIZE;
+                    uint32_t k;
+                    uint64_t sz, ret, extra = 0;
+                    memcpy(&k, ev, 4);
+                    memcpy(&sz, ev + 8, 8);
+                    memcpy(&ret, ev + 24, 8);
+                    if (k == 1 || k == 2)
+                        memcpy(&extra, ev + 32, 8);
+                    if (k == 0) {           /* malloc */
+                        if (ret) {
+                            size_t h = (size_t)(ret >> 12) & (HMAP_CAP - 1);
+                            hm[h].ptr = ret;
+                            hm[h].size = sz;
+                        }
+                    } else if (k == 1) {    /* calloc */
+                        if (ret) {
+                            size_t h = (size_t)(ret >> 12) & (HMAP_CAP - 1);
+                            hm[h].ptr = ret;
+                            hm[h].size = sz * extra;
+                        }
+                    } else if (k == 2) {    /* realloc */
+                        uint64_t old = sz;
+                        uint64_t new = extra;
+                        uint64_t old_size = 0;
+                        size_t h = (size_t)(old >> 12) & (HMAP_CAP - 1);
+                        if (hm[h].ptr == old)
+                            old_size = hm[h].size;
+                        if (e >= c_from && e < c_to && old_size) {
+                            uint64_t clen = old_size < new ? old_size : new;
+                            /* 复制循环按 8B 块递减, 长度必须 8 对齐
+                               (非倍数会在末块后变负数, cbnz 永不停止,
+                               写穿到未映射页 SEGV) */
+                            cl[e - c_from] = (clen + 7) & ~7ULL;
+                        }
+                        if (ret) {
+                            h = (size_t)(ret >> 12) & (HMAP_CAP - 1);
+                            hm[h].ptr = ret;
+                            hm[h].size = new;
+                        }
+                    } else {                /* free */
+                        size_t h = (size_t)(sz >> 12) & (HMAP_CAP - 1);
+                        if (hm[h].ptr == sz)
+                            hm[h].ptr = 0;
+                    }
+                }
+                copy_len_abs = base + blob->size;
+                buf_append(blob, cl, (size_t)total * 8);
+                free(cl);
+                free(hm);
+            }
 
             /* 3.7b alloc 引用页预映射 (M3 子集): 窗口事件里
                malloc/calloc/realloc 返回指针 + size 覆盖的页面, 若未被
@@ -2491,8 +2559,8 @@ synth_done:
                 uint64_t *pgs = xmalloc(ALLOC_PG_CAP * sizeof(*pgs));
                 size_t np = 0;
                 for (size_t e = 0; e < total && np < ALLOC_PG_CAP; e++) {
-                    const uint8_t *ev =
-                        g_alloc_build.events + (c_from + e) * 32;
+                    const uint8_t *ev = g_alloc_build.events +
+                                        (c_from + e) * ALLOC_EVENT_SIZE;
                     uint32_t k;
                     uint64_t sz, ret;
                     memcpy(&k, ev, 4);
@@ -2578,7 +2646,8 @@ synth_done:
                     page + o, taddr + o, cursor_abs, total_abs,
                     events_abs, (uint32_t)g_alloc_build.kinds[f],
                     tel_abs, base + STUB_STRICT_BAIL_OFF, pc,
-                    base + STUB_STRICT_EXIT_OFF);
+                    g_no_alloc_fused ? 0 : base + STUB_STRICT_EXIT_OFF,
+                    copy_len_abs);
                 if (!bl)
                     die("alloc: replay block gen failed for %#llx", pc);
                 uint32_t bw = a64_patch_b(pc, taddr + o);
@@ -3145,6 +3214,8 @@ int build_main(int argc, char **argv)
             atomic_no_value_replay = 1;
         } else if (strcmp(argv[i], "--no-atomic-run-burn") == 0) {
             g_no_atomic_run_burn = 1;
+        } else if (strcmp(argv[i], "--no-alloc-fused") == 0) {
+            g_no_alloc_fused = 1;
         } else if (strcmp(argv[i], "--census-pages") == 0 &&
                    i + 1 < argc) {
             census_pages_path = argv[++i];

@@ -221,6 +221,24 @@ static uint32_t aldr(unsigned rt, unsigned rn, unsigned imm)
     return 0xF9400000U | (((imm >> 3) & 0xfff) << 10) |
            (rn << 5) | rt;
 }
+static uint32_t aldr_w(unsigned rt, unsigned rn, unsigned imm)
+{
+    return 0xB9400000U | (((imm >> 2) & 0xfff) << 10) |
+           (rn << 5) | rt;
+}
+static uint32_t astr_w(unsigned rt, unsigned rn, unsigned imm)
+{
+    return 0xB9000000U | (((imm >> 2) & 0xfff) << 10) |
+           (rn << 5) | rt;
+}
+static uint32_t acbnz(unsigned rt, int32_t off)
+{
+    return 0x35000000U | (((uint32_t)(off / 4) & 0x7FFFF) << 5) | rt;
+}
+static uint32_t ab_uncond(int32_t off)
+{
+    return 0x14000000U | (((uint32_t)(off / 4)) & 0x3FFFFFF);
+}
 static uint32_t amov(unsigned rd, unsigned rm)
 {
     return 0xAA0003E0U | (rm << 16) | rd;
@@ -367,10 +385,6 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
     put32(p, astr(30, 31, 0));  /* str x30,[sp] */
     put32(p, 0xD10043FFU);      /* sub sp,sp,#16 (size 槽, E-64) */
     put32(p, astr(0, 31, 0));   /* str x0,[sp] */
-    /* 诊断: 调用计数++ (x15 为 caller-saved, TLS 检查后空闲) */
-    put32(p, aldr(15, 16, ALLOC_DIAG_CNT_OFF));
-    put32(p, aadd(15, 15, 1));
-    put32(p, astr(15, 16, ALLOC_DIAG_CNT_OFF));
     put32(p, 0xA9BF53F3U);      /* stp x19,x20,[sp,#-16]! (E-80) */
     put32(p, 0xD10043FFU);      /* sub sp,sp,#16 (x21 槽, E-96) */
     put32(p, astr(21, 31, 0));  /* str x21,[sp] */
@@ -382,14 +396,28 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
     put32(p, acmp(20, 19));
     uint8_t *ovf_b = p;
     put32(p, abcond(0, 8));     /* b.hi overflow (占位) */
+    /* reserve/commit: 槽 pad 字段 0=COMMITTED/空闲, 1=RESERVED (在途)。
+       入口 pad==1 → 外层分配器调用在途 (嵌套调用) → 原生执行不记录。 */
+    put32(p, aldr_w(20, 18, 4));    /* ldr w20,[x18,#4] pad */
+    uint8_t *nested_b = p;
+    put32(p, acbnz(20, 0));         /* cbnz w20,nested (占位) */
+    put32(p, amovz(20, 1, 0));      /* mov w20,#1 */
+    put32(p, astr_w(20, 18, 4));    /* str w20,[x18,#4] RESERVED */
+    /* 诊断: 调用计数++ (仅记录型调用; 溢出/嵌套不计) */
+    put32(p, aldr(15, 16, ALLOC_DIAG_CNT_OFF));
+    put32(p, aadd(15, 15, 1));
+    put32(p, astr(15, 16, ALLOC_DIAG_CNT_OFF));
     put32(p, aldr(21, 16, ALLOC_KIND_OFF));
     put32(p, astr(21, 18, 0));
+    /* pad u32: realloc=new_size(x1) / calloc=elem_size(x1);
+       malloc/free 无用 (0)。构建端离线算 realloc copy_len 用。 */
+    put32(p, astr_w(1, 18, 4));
     put32(p, aldr(21, 31, 32)); /* size (E-64, sp=E-96) */
     put32(p, astr(21, 18, 8));
     put32(p, aldr(21, 31, 48)); /* caller x30 (E-48, sp=E-96) */
     put32(p, astr(21, 18, 16));
     put32(p, astr(31, 18, 24)); /* ret = 0 (xzr) */
-    put32(p, astr(20, 17, 0));  /* hdr.event_ptr = event+32 */
+    put32(p, astr(1, 18, 32));  /* extra = x1 (calloc elem / realloc 新大小) */
     put32(p, 0xD10043FFU);      /* sub sp,sp,#16 (event 槽, E-112) */
     put32(p, astr(18, 31, 0));  /* str event,[sp] */
     put32(p, aldr(30, 16, ALLOC_RET_LABEL_OFF));
@@ -403,12 +431,23 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
     put32(p, aldr(18, 16, ALLOC_ORIG_NEXT_OFF));
     put32(p, abr(18));
 
-    /* overflow (sp=E-96): 置标志, 弹栈到 E, 原生执行 */
+    /* overflow (sp=E-96): 置标志 → unwind 原生执行 */
     uint8_t *overflow = p;
     put32(p, aldr(18, 16, ALLOC_ORIG_NEXT_OFF));
     put32(p, aldr(14, 16, ALLOC_OVERFLOW_ADDR_OFF));
     put32(p, amovz_imm(15, 1));
     put32(p, astr(15, 14, 0));
+    uint8_t *ovf_b2 = p;
+    put32(p, ab_uncond(0));     /* b unwind (占位) */
+
+    /* nested (sp=E-96): 嵌套分配器调用, 原生执行不记录 */
+    uint8_t *nested = p;
+    put32(p, aldr(18, 16, ALLOC_ORIG_NEXT_OFF));
+    uint8_t *nst_b = p;
+    put32(p, ab_uncond(0));     /* b unwind (占位) */
+
+    /* unwind (sp=E-96): 弹栈到 E, 执行原函数 */
+    uint8_t *unwind = p;
     put32(p, 0xF94003F5U);      /* ldr x21,[sp] (E-96) */
     put32(p, aadd(31, 31, 16)); /* pop x21 (E-80) */
     put32(p, 0xA8C153F3U);      /* ldp x19,x20,[sp],#16 (E-64) */
@@ -431,12 +470,18 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
         return 0;
     put32(p, abr(18));
 
-    /* ret_label (sp=E-112): 写回 ret, 弹栈到 E, ret 调用者 */
+    /* ret_label (sp=E-312): 提交事件 (ret + pad=0 + event_ptr 前进),
+       弹栈到 E, ret 调用者。x16 可能已被原函数破坏, 先从 base 槽恢复。 */
     uint8_t *ret_label = p;
-    put32(p, astr(0, 16, ALLOC_DIAG_RET_OFF));  /* 诊断: 最近返回值 */
     put32(p, 0x910803FFU);      /* add sp,sp,#0x200 (弹回缓冲垫) */
+    put32(p, aldr(16, 31, 80)); /* ldr x16,[sp,#80] (base 槽 E-32) */
+    put32(p, astr(0, 16, ALLOC_DIAG_RET_OFF));  /* 诊断: 最近返回值 */
     put32(p, aldr(18, 31, 0));  /* event (E-112) */
     put32(p, astr(0, 18, 24));  /* ret */
+    put32(p, astr_w(31, 18, 4));/* pad = 0 (COMMITTED) */
+    put32(p, aldr(17, 16, ALLOC_EVENT_PTR_ADDR_OFF));
+    put32(p, aadd(20, 18, ALLOC_EVENT_SIZE));
+    put32(p, astr(20, 17, 0));  /* hdr.event_ptr = event+32 (commit) */
     put32(p, aadd(31, 31, 16)); /* pop event (E-96) */
     put32(p, 0xF94003F5U);      /* ldr x21,[sp] (E-96) */
     put32(p, aadd(31, 31, 16)); /* pop x21 (E-80) */
@@ -451,10 +496,19 @@ size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
     {
         int32_t d1 = (int32_t)(non_target - tls_bne);
         int32_t d2 = (int32_t)(overflow - ovf_b);
+        int32_t d3 = (int32_t)(nested - nested_b);
+        int32_t d4 = (int32_t)(unwind - ovf_b2);
+        int32_t d5 = (int32_t)(unwind - nst_b);
         uint32_t w = abcond(d1, 1);
         memcpy(tls_bne, &w, 4);
         w = abcond(d2, 8);
         memcpy(ovf_b, &w, 4);
+        w = acbnz(20, d3);
+        memcpy(nested_b, &w, 4);
+        w = ab_uncond(d4);
+        memcpy(ovf_b2, &w, 4);
+        w = ab_uncond(d5);
+        memcpy(nst_b, &w, 4);
     }
 
     /* 数据区 */

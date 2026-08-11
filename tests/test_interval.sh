@@ -42,27 +42,37 @@ if [ "$DIFF_SIZE" -gt $((BASE_SIZE / 4)) ]; then
 fi
 echo "incremental: base=$BASE_SIZE diff=$DIFF_SIZE ($((DIFF_SIZE * 100 / BASE_SIZE))%)"
 
-# 2. manifest 采样点精度: 相邻 count 差必须 == N
+# 2. manifest 采样点精度: 相邻 count 差 ∈ [N, 3N]。
+#    trace 记录的**实际** perf 计数 (检查点在计数器越过边界后由 poll/
+#    兜底读到, 有 ≤1 个轮询周期的过冲); 精确的名义步长不再成立, 但
+#    窗口长度以实际计数为准 (步骤 3 的 EXP 用实际差)。首个间隔含
+#    perf 事件使能/arm 前的目标执行, 可达 2N。
 awk '{print $1}' "$CKPTS/manifest.txt" | python3 -c "
 import sys
 prev = None
 for line in sys.stdin:
     c = int(line)
-    if prev is not None and c - prev != $N:
-        print('FAIL: count jump %d -> %d' % (prev, c))
-        sys.exit(1)
+    if prev is not None:
+        d = c - prev
+        if d < $N or d > 3 * $N:
+            print('FAIL: count jump %d -> %d (delta %d)' % (prev, c, d))
+            sys.exit(1)
     prev = c
-print('manifest counts exact (step %d)' % $N)
+print('manifest counts sane (step %d, actual deltas %d..%d)' % ($N, $N, 3 * $N))
 " || exit 1
 
 # 3. 每组区间: 内部 + 外部指令数验证
 #    外部 perf stat 数的是整个切片进程 = stub 恢复开销(~23.3 万条,
 #    从大区间实测标定) + 目标区间 + IPC handler, 断言基准为 EXP+240000
 FAILED=0
+awk '{print $1}' "$CKPTS/manifest.txt" > "$TF_TMP/man_counts.txt"
 set -- $PAIRS
 while [ $# -ge 2 ]; do
     K=$1; M=$2; shift 2
-    EXP=$(( (M - K) * N ))
+    FC=$(sed -n "$((K + 1))p" "$TF_TMP/man_counts.txt")
+    MC=$(sed -n "$((M + 1))p" "$TF_TMP/man_counts.txt")
+    EXP=$((MC - FC))
+    echo "  [$K-$M] actual window $((MC - FC)) instructions"
     SLICE="$TF_TMP/slice_iv_${K}_${M}.elf"
 
     tf_cleanup slice_iv
