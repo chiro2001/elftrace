@@ -35,6 +35,7 @@
 #include "util.h"
 #include "arch.h"
 #include "atomic_trace.h"
+#include "alloc_trace.h"
 
 int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child,
                 uint64_t *inj_page);
@@ -86,8 +87,10 @@ struct trace_ctx {
     int have_prev_b;
 #if defined(__aarch64__)
     int atomic_enabled;         /* --atomic-replay */
+    int alloc_enabled;          /* --alloc-replay */
     uint64_t atomic_buf_size;   /* 事件缓冲 (默认 64MB) */
     struct atomic_trace_ctx *atomic;
+    struct alloc_trace_ctx *alloc;
 #endif
 };
 
@@ -520,6 +523,8 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
        measured−overhead 的 orig 会系统性偏大。 */
     if (tc->atomic)
         atomic_trace_ckpt(tc->atomic, tc->ckpt_no, perf_count_now(tc));
+    if (tc->alloc)
+        alloc_trace_ckpt(tc->alloc, tc->ckpt_no);
 #endif
     ptrace(PTRACE_SYSCALL, tc->pid, 0, 0);   /* 保持 syscall 捕获模式 */
 
@@ -576,6 +581,8 @@ int trace_main(int argc, char **argv)
 #if defined(__aarch64__)
         } else if (strcmp(argv[i], "--atomic-replay") == 0) {
             tc.atomic_enabled = 1;
+        } else if (strcmp(argv[i], "--alloc-replay") == 0) {
+            tc.alloc_enabled = 1;
         } else if (strcmp(argv[i], "--atomic-buf-size") == 0 &&
                    i + 1 < argc) {
             tc.atomic_buf_size = strtoull(argv[++i], NULL, 0);
@@ -667,9 +674,16 @@ int trace_main(int argc, char **argv)
                                      vr_record_all) < 0)
                     warn("trace: atomic replay unavailable, continuing "
                          "without it");
+                if (tc.alloc_enabled &&
+                    alloc_trace_arm(&tc.alloc, pid, &rr, tc.out) < 0)
+                    warn("trace: alloc replay unavailable, continuing "
+                         "without it");
             }
         }
     }
+#else
+    if (tc.alloc_enabled)
+        warn("trace: --alloc-replay 仅 aarch64");
 #endif
 
     /* 目标恢复运行, 用 PTRACE_SYSCALL 模式 (每次 syscall 入口/返回停止) */
@@ -797,6 +811,8 @@ main_done:
 #if defined(__aarch64__)
     if (tc.atomic)
         atomic_trace_finish(tc.atomic);
+    if (tc.alloc)
+        alloc_trace_finish(tc.alloc);
 #endif
     /* 诊断: 保持 ptrace 观察目标在 finish 后的运行, 捕获崩溃 PC
        (注入恢复是否完整的关键证据)。设 ELFTRACE_DEBUG_FAULT=1 启用。 */
