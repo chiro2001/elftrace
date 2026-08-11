@@ -84,6 +84,7 @@ struct atomic_trace_ctx {
     size_t n_pages;
     uint64_t dump_event_ptr;    /* 已转储事件游标 (绝对地址) */
     uint64_t total_events;      /* 已转储事件数 (补偿模型) */
+    uint64_t *site_events;      /* 按站点累计追加事件数 (补偿模型) */
     uint64_t cas_dump_ptr;      /* 已转储 CAS 事件游标 */
     uint64_t total_cas_events;
     unsigned base_insns, append_insns;
@@ -518,6 +519,7 @@ int atomic_trace_arm(struct atomic_trace_ctx **ctx_out, pid_t pid,
         return -1;
     }
     ctx->sites = sites;
+    ctx->site_events = xcalloc(n_sites, sizeof(uint64_t));
     ctx->n_sites = n_sites;
 
     /* 1. 注入事件缓冲区 (内核选址) */
@@ -769,6 +771,7 @@ fail:
                        ctx->abuf_size, 0, 0, 0, 0, &ret);
     collect_exclude_clear();
     free(ctx->pages);
+    free(ctx->site_events);
     free(sites);
     free(maps);
     free(ctx);
@@ -847,13 +850,34 @@ int atomic_trace_ckpt(struct atomic_trace_ctx *ctx, size_t ckpt_no,
             unsigned per = ctx->sites[i].base > 1
                                ? ctx->sites[i].base - 1 : 0;
             overhead += ord * per;
+            if (ctx->site_events && ctx->sites[i].append)
+                overhead += ctx->site_events[i] * ctx->sites[i].append;
         }
-        overhead += ctx->total_events *
-                    (ctx->append_insns ? ctx->append_insns : 0);
-        /* LSE CAS 事件走独立缓冲区, 追加路径 23 条 (a64_cas_record_block
-           实测), 之前漏算会使带 CAS 负载的 orig 偏大。 */
+        /* LSE CAS 事件走独立缓冲区, 追加路径 23 条
+           (a64_cas_record_block 实测)。 */
         overhead += ctx->total_cas_events * 23;
-        uint64_t orig = measured > overhead ? measured - overhead : 0;
+        uint64_t orig = 0;
+        uint64_t prev_m = ctx->n_ckpts
+                              ? ctx->ckpt_measured[ctx->n_ckpts - 1] : 0;
+        uint64_t prev_o = ctx->n_ckpts
+                              ? ctx->ckpt_orig[ctx->n_ckpts - 1] : 0;
+        if (measured < prev_m || overhead > measured) {
+            /* 账本无效 (目标可能在跳板中被打断后异常, 或计数器异常):
+               fail-closed, 沿用上一值保证单调, 避免伪 orig。 */
+            warn("atomic: ckpt %zu ledger invalid (m %llu prev %llu "
+                 "ov %llu)", ckpt_no, (unsigned long long)measured,
+                 (unsigned long long)prev_m,
+                 (unsigned long long)overhead);
+            orig = prev_o;
+        } else {
+            orig = measured - overhead;
+            if (orig < prev_o) {
+                warn("atomic: ckpt %zu orig non-monotonic (%llu < %llu), "
+                     "clamp", ckpt_no, (unsigned long long)orig,
+                     (unsigned long long)prev_o);
+                orig = prev_o;
+            }
+        }
         ctx->ckpt_measured = xrealloc(ctx->ckpt_measured,
                                       (ctx->n_ckpts + 1) * sizeof(uint64_t));
         ctx->ckpt_overhead = xrealloc(ctx->ckpt_overhead,
@@ -913,6 +937,14 @@ static int atomic_events_append(struct atomic_trace_ctx *ctx)
                     n_new * A64_ATB_EVENT_SIZE) == 0) {
             fseek(f, 0, SEEK_END);
             fwrite(ev, 1, n_new * A64_ATB_EVENT_SIZE, f);
+            if (ctx->site_events) {
+                for (uint64_t k = 0; k < n_new; k++) {
+                    uint64_t sid;
+                    memcpy(&sid, ev + k * A64_ATB_EVENT_SIZE, 8);
+                    if (sid < ctx->n_sites)
+                        ctx->site_events[sid]++;
+                }
+            }
             ctx->dump_event_ptr += n_new * A64_ATB_EVENT_SIZE;
             total += n_new;
         }
@@ -1031,6 +1063,7 @@ static void atomic_write_compensation(struct atomic_trace_ctx *ctx)
     uint64_t dn = m > m0 ? m - m0 : 0;
     uint64_t dd = o > o0 ? o - o0 : 1;
     fprintf(f, "# elftrace atomic compensation v1\n");
+    fprintf(f, "counter_scope tid\n");   /* perf 按目标线程 TID 计数 */
     fprintf(f, "r_num %llu\n", (unsigned long long)dn);
     fprintf(f, "r_den %llu\n", (unsigned long long)dd);
     fprintf(f, "base_insns %u\n", ctx->base_insns);
