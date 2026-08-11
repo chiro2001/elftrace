@@ -182,8 +182,8 @@ grep -q "run-burn spin site" "$TF_TMP/srb_build.log" || {
 
 MB=$((A_BASE * 100 / T_ORIG))
 MR=$((A_BURN * 100 / T_ORIG))
-echo "atomic: multiplier base=$((MB / 100)).$((MB % 100))x " \
-     "burn=$((MR / 100)).$((MR % 100))x (T_orig=$T_ORIG)"
+echo "atomic: multiplier base=$(printf '%d.%02d' $((MB / 100)) $((MB % 100)))x " \
+     "burn=$(printf '%d.%02d' $((MR / 100)) $((MR % 100)))x (T_orig=$T_ORIG)"
 
 if [ "$A_BURN" -lt "$A_BASE" ]; then
     tf_pass "atomic run-burn 降低动态指令数 (A_burn=$A_BURN < A_base=$A_BASE)"
@@ -191,8 +191,8 @@ else
     tf_fail "run-burn 未降低动态指令数 (A_burn=$A_BURN >= A_base=$A_BASE)"
 fi
 if awk -v b=$MR -v g=115 'BEGIN{exit !(b < g)}'; then
-    tf_pass "atomic run-burn 指令倍率 < 1.15x (multiplier=$((MR / 100)).$((MR % 100))x)"
+    tf_pass "atomic run-burn 指令倍率 < 1.15x (multiplier=$(printf '%d.%02d' $((MR / 100)) $((MR % 100)))x)"
 else
-    tf_fail "run-burn 指令倍率 >= 1.15x (multiplier=$((MR / 100)).$((MR % 100))x)"
+    tf_fail "run-burn 指令倍率 >= 1.15x (multiplier=$(printf '%d.%02d' $((MR / 100)) $((MR % 100)))x)"
 fi
 tf_finish

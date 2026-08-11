@@ -221,7 +221,7 @@ while read -r HELP FROM_C TO_C; do
     if [ "$A" -gt 0 ] && [ "$T" -gt 0 ]; then
         IM=$((A * 100 / T))
         M=$((IM / 100)).$((IM % 100))
-        echo "  rc=$RC A=$A T=$T insn_multiplier=${M}x"
+        echo "  rc=$RC A=$A T=$T insn_multiplier=$(printf '%d.%02d' $((IM / 100)) $((IM % 100)))x"
         if [ "$IM" -lt "$BEST" ]; then
             BEST=$IM
         fi
@@ -234,7 +234,7 @@ if [ "$BEST" = 99999 ]; then
     echo "FAIL: 无自旋窗口可构建运行"
     exit 1
 fi
-echo "best insn_multiplier=$(awk -v x=$BEST 'BEGIN{printf "%d.%02d", x/100, x%100}')x"
+echo "best insn_multiplier=$(awk -v x=$BEST 'BEGIN{printf "%d.%02d", int(x/100), x%100}')x"
 
 # ---------- 断言 < GOAL (当前预期红: run-burn 未实现) ----------
 G=$(awk -v x=$GOAL 'BEGIN{printf "%d", x*100 + 0.5}')

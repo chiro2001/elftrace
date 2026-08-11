@@ -247,8 +247,8 @@ while read -r FROM_C TO_C; do
         if [ "$iter" = 1 ] && [ "$A0" -gt 0 ] && [ "$T" -gt 0 ]; then
             # 一级指标: 不校准 K 时的动态指令倍率 (真实膨胀, 不被 K 吸收)
             IM=$((A0 * 100 / T))
-            echo "atomic: iter1 insn_multiplier=$((IM / 100)).$((IM % 100))x (A=$A0 T=$T)"
-            echo "$((IM / 100)).$((IM % 100))x" > "$TF_TMP/lff_multiplier.txt"
+            echo "atomic: iter1 insn_multiplier=$(printf '%d.%02d' $((IM / 100)) $((IM % 100)))x (A=$A0 T=$T)"
+            printf '%d.%02dx\n' $((IM / 100)) $((IM % 100)) > "$TF_TMP/lff_multiplier.txt"
         fi
         if [ "$iter" = 1 ] && [ "$A0" -gt 0 ]; then
             K0=$(grep -oE "K=[0-9]+" "$TF_TMP/lff_build.log" | head -1 \
