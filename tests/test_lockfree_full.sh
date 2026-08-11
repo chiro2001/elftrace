@@ -231,7 +231,7 @@ for i in range(n):
     pcs.append((pc, kind))
 def ckpt(k):
     bb = open("%s/atomics/ckpt_%06d.bin" % (d, k), "rb").read()
-    return [struct.unpack_from("<QQQ", bb, 24 + i * 24)
+    return [struct.unpack_from("<QQQ", bb, 24 + i * 24)[0]
             for i in range(n)]
 man = open(d + "/manifest.txt").read().splitlines()
 cnt = [int(l.split()[0]) for l in man]

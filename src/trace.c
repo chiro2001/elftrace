@@ -29,85 +29,12 @@
 #include <sys/ioctl.h>
 #include <limits.h>
 #include <elf.h>
-#include <dirent.h>
 
 #include "elftrace.h"
 #include "collect.h"
 #include "util.h"
 #include "arch.h"
 #include "atomic_trace.h"
-
-/* ---- stop-the-world: 冻结除目标外的全部线程, 保证内存快照一致
- * (消费者线程在冻结期间改写堆/队列 → 撕裂快照 → 切片 malloc 崩;
- * round-18 双模型"快照静止性"要求)。返回待恢复的 tid 数组,
- * stw_cont 恢复。 */
-static pid_t *stw_stop(pid_t tgid, pid_t self, size_t *n_out)
-{
-    pid_t *tids = NULL;
-    size_t n = 0, cap = 0;
-    char p[64];
-    snprintf(p, sizeof(p), "/proc/%d/task", tgid);
-    DIR *d = opendir(p);
-    if (!d)
-        return NULL;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        pid_t t = atoi(e->d_name);
-        if (!t || t == self)
-            continue;
-        if (n == cap) {
-            cap = cap ? cap * 2 : 16;
-            tids = xrealloc(tids, cap * sizeof(*tids));
-        }
-        tids[n++] = t;
-        kill(t, SIGSTOP);
-    }
-    closedir(d);
-    for (int i = 0; i < 200; i++) {
-        int all = 1;
-        for (size_t j = 0; j < n; j++) {
-            char sp[96];
-            snprintf(sp, sizeof(sp), "/proc/%d/task/%d/stat",
-                     tgid, tids[j]);
-            FILE *sf = fopen(sp, "r");
-            if (!sf) {
-                all = 0;
-                break;
-            }
-            char *line = NULL;
-            size_t lsz = 0;
-            ssize_t l = getline(&line, &lsz, sf);
-            fclose(sf);
-            char state = '?';
-            if (l > 0) {
-                char *cp = strrchr(line, ')');
-                if (cp && cp[1] && cp[2])
-                    state = cp[2];
-            }
-            free(line);
-            if (state != 'T') {
-                all = 0;
-                break;
-            }
-        }
-        if (all)
-            break;
-        usleep(5000);
-    }
-    if (n)
-        fprintf(stderr, "trace: stw froze %zu peer thread(s)\n", n);
-    *n_out = n;
-    return tids;
-}
-
-static void stw_cont(pid_t *tids, size_t n)
-{
-    if (!tids)
-        return;
-    for (size_t i = 0; i < n; i++)
-        kill(tids[i], SIGCONT);
-    free(tids);
-}
 
 int inject_fork(pid_t pid, const struct user_regs_struct *regs, pid_t *child,
                 uint64_t *inj_page);
@@ -324,11 +251,8 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
                B = 当前 (syscall 已完成, buffer 被写/rax=返回值);
                diff 基线 = 上一 syscall 边界。 */
             struct collect_snapshot b = {.pid = tc->pid};
-            size_t n_stw = 0;
-            pid_t *stw = stw_stop(tc->pid, tc->pid, &n_stw);
             collect_state_light(tc->pid, &b);
             collect_memory(tc->pid, &b);
-            stw_cont(stw, n_stw);
             tc->syscalls = xrealloc(tc->syscalls,
                                     (tc->n_syscalls + 1) *
                                     sizeof(*tc->syscalls));
@@ -352,11 +276,8 @@ static void handle_syscall_stop(struct trace_ctx *tc, int is_entry,
             return;
         }
         struct collect_snapshot sn = {.pid = tc->pid};
-        size_t n_stw = 0;
-        pid_t *stw = stw_stop(tc->pid, tc->pid, &n_stw);
         collect_state_light(tc->pid, &sn);
         collect_memory(tc->pid, &sn);
-        stw_cont(stw, n_stw);
         tc->syscalls = xrealloc(tc->syscalls,
                                 (tc->n_syscalls + 1) *
                                 sizeof(*tc->syscalls));
@@ -423,10 +344,7 @@ static int collect_interrupt_sc(struct trace_ctx *tc)
                 /* INTERRUPT 打断进行中的 syscall: 补记 —
                    diff 基线 = 上一 syscall 边界, B = 当前。 */
                 struct collect_snapshot b = {.pid = pid};
-                size_t n_stw = 0;
-                pid_t *stw = stw_stop(pid, pid, &n_stw);
                 collect_state_light(pid, &b);
-                stw_cont(stw, n_stw);
                 int64_t ret = 0;
 #if defined(__aarch64__)
                 ret = (int64_t)b.regs.regs[0];
@@ -504,12 +422,7 @@ static void ckpt_take(struct trace_ctx *tc, int already_stopped)
 #endif
 
     /* 轻量采集 (冻结 ~us): 寄存器/掩码/xstate/fds/段表 */
-    {
-        size_t n_stw = 0;
-        pid_t *stw = stw_stop(tc->pid, tc->pid, &n_stw);
     collect_state_light(tc->pid, &sn);
-        stw_cont(stw, n_stw);
-    }
     if (tc->inj_page && REG_PC(sn.regs) >= tc->inj_page &&
         REG_PC(sn.regs) < tc->inj_page + 4096) {
         /* 冻结在注入代码中: 检查点无效, 放弃 (目标恢复运行) */
