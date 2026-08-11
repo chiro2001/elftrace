@@ -77,6 +77,18 @@ uint64_t alloc_trace_abuf_addr(const struct alloc_trace_ctx *ctx)
     return ctx ? ctx->abuf_addr : 0;
 }
 
+static int alloc_events_dump(struct alloc_trace_ctx *ctx);
+
+/* 增量转储 alloc 事件 (边界命中时调用): 目标可能随后退出 (pan
+   1000 在 1000 次命中后自然结束), 收尾转储会因目标死亡静默失败,
+   events.bin 缺尾部事件 → build slack 被 clamp → 切片超消费。 */
+int alloc_trace_events_dump(struct alloc_trace_ctx *ctx)
+{
+    if (!ctx || !ctx->armed)
+        return 0;
+    return alloc_events_dump(ctx);
+}
+
 /* ---- 注入缓冲区 tmem 读写 (与 atomic_trace 同款) ---- */
 static int atmem_rw(pid_t pid, int wr, uint64_t addr, void *buf, size_t len)
 {
@@ -809,7 +821,9 @@ int alloc_trace_finish(struct alloc_trace_ctx *ctx)
                     (unsigned long long)cnt,
                     (unsigned long long)ret);
         }
-        alloc_events_dump(ctx);
+        if (alloc_events_dump(ctx) < 0)
+            warn("alloc: finish event dump failed (target likely exited); "
+                 "events.bin may be incomplete");
         /* 恢复函数入口原指令 (目标随后被 trace 终止) */
         for (size_t i = 0; i < ctx->n_funcs; i++)
             atmem_rw(ctx->pid, 1, ctx->funcs[i].pc,

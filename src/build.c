@@ -1243,7 +1243,12 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
             if (g_boundaries[i].count >= count_to) {
                 uint64_t from_ord = 0;
                 for (size_t j = 0; j < g_n_boundaries; j++) {
-                    if (g_boundaries[j].count <= count_from)
+                    /* 等号: 检查点冻结在边界 PC 且计数等于该边界记录
+                       (检查点拆下 brk 后重武装, 恢复执行同一命中),
+                       切片会重新执行该次命中 → from_ord 应为该 ord;
+                       用 < 避免 +1 跳过一个命中 (K 少 1 会提前退出,
+                       alloc 事件欠消费 exit 65)。 */
+                    if (g_boundaries[j].count < count_from)
                         from_ord = g_boundaries[j].ord + 1;
                     else
                         break;

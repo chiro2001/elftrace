@@ -56,6 +56,9 @@ struct alloc_trace_ctx;
 /* 事件缓冲基址 (trace 读事件游标用) */
 uint64_t alloc_trace_abuf_addr(const struct alloc_trace_ctx *ctx);
 
+/* 增量转储事件到 events.bin (边界命中/目标可能退出的场景) */
+int alloc_trace_events_dump(struct alloc_trace_ctx *ctx);
+
 /* 记录跳板生成器 (导出供单元测试) */
 size_t alloc_record_block(uint8_t *out, uint64_t block_abs,
                           uint32_t saved_insn, uint64_t orig_pc,

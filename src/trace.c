@@ -930,6 +930,10 @@ int trace_main(int argc, char **argv)
                         rec[4] = tc.boundary_pc;
                         if (tc.boundary_f)
                             fwrite(rec, 1, sizeof(rec), tc.boundary_f);
+                        /* 目标可能随后退出 (边界命中数与负载轮数同步),
+                           先增量转储 alloc 事件, 收尾转储靠不住 */
+                        if (tc.alloc)
+                            alloc_trace_events_dump(tc.alloc);
                         fprintf(stderr,
                                 "trace: boundary hit ord=%llu count=%llu "
                                 "alloc=%llu\n",
