@@ -131,6 +131,20 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
                                int kind,
                                const struct a64_ld_addr *ad);
 
+/* run-burn 整 run 烧录回放块 (自旋循环):
+ * 一次入口消费整个 busy run + 值变化访问, 内部按 guest 等长指令数
+ * 烧录 (body_len = 循环体指令数), 消除逐访问值回放膨胀;
+ * o == run.start 走逐访问路径, 末 run/预算越界走 limit_exit。 */
+size_t a64_atomic_replay_burn_block(uint8_t *out, uint64_t block_abs,
+                                    uint64_t runs_abs, uint64_t n_runs,
+                                    int size, unsigned rt, unsigned rn,
+                                    uint64_t ret_addr,
+                                    uint64_t load_limit, uint64_t exit_abs,
+                                    uint64_t tel_abs,
+                                    int kind,
+                                    const struct a64_ld_addr *ad,
+                                    uint32_t body_len);
+
 /* 单段常量站点的快速回放块: 窗口内值不变 (run_cnt==0, 仅合成首段)。
  * 不做游标推进/运行段查找/start 比较, 值直接内嵌; 保留命中计数+
  * 负载上限退出、地址校验 (失配回退真实读 + miss 计数) 与 ldar/ldaxr

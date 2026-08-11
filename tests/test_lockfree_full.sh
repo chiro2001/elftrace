@@ -244,6 +244,12 @@ while read -r FROM_C TO_C; do
             | grep -oE "[0-9,]+" | head -1 | tr -d ",")
         echo "atomic: iter $iter K=${K0:-def} A=$A T=$T"
         A0=${A:-0}
+        if [ "$iter" = 1 ] && [ "$A0" -gt 0 ] && [ "$T" -gt 0 ]; then
+            # 一级指标: 不校准 K 时的动态指令倍率 (真实膨胀, 不被 K 吸收)
+            IM=$((A0 * 100 / T))
+            echo "atomic: iter1 insn_multiplier=$((IM / 100)).$((IM % 100))x (A=$A0 T=$T)"
+            echo "$((IM / 100)).$((IM % 100))x" > "$TF_TMP/lff_multiplier.txt"
+        fi
         if [ "$iter" = 1 ] && [ "$A0" -gt 0 ]; then
             K0=$(grep -oE "K=[0-9]+" "$TF_TMP/lff_build.log" | head -1 \
                 | cut -d= -f2)
@@ -342,4 +348,7 @@ grep -q "exit_group" "$TF_TMP/lff_slice.strace" \
     || { echo "FAIL: no exit_group"; exit 1; }
 
 tf_pass "atomic lockfree full-queue outcome replay (rc=$RC, zero target syscalls)"
+if [ -f "$TF_TMP/lff_multiplier.txt" ]; then
+    echo "  insn_multiplier = $(cat "$TF_TMP/lff_multiplier.txt") (未校准 iter1)"
+fi
 tf_finish

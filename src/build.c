@@ -43,6 +43,10 @@ static size_t g_n_force_cas = 0;
 static uint64_t g_malloc_replay_pcs[16];
 static size_t g_n_malloc_replay = 0;
 
+/* --no-atomic-run-burn: 禁用整 run 烧录 (回退逐访问值回放), 对照测量
+ * run-burn 的指令倍率收益 (测试/诊断用)。 */
+static int g_no_atomic_run_burn = 0;
+
 /* 小编码器 (构建侧跳板生成) */
 static uint32_t b_movz(unsigned rd, unsigned imm16, unsigned hw)
 {
@@ -889,6 +893,54 @@ static uint32_t a64_patch_b(uint64_t from, uint64_t to)
             (long long)d);
     return 0x14000000U |
            (((uint32_t)((uint64_t)d >> 2)) & 0x03FFFFFFU);
+}
+
+/* 自旋循环检测 (run-burn 前置): 单 load 循环体 (循环内无其他访存站点)。
+ * 接受两种精确形态:
+ *   A. site load; cmp/tst rt; b.cond → site   (body_len=3)
+ *   B. site load; cbz/cbnz rt → site           (body_len=2)
+ * 返回 1 并输出回边 pc。 */
+static int a64_find_spin_loop(const uint8_t *code, uint64_t filesz,
+                              uint64_t site_pc, uint64_t seg_vaddr,
+                              unsigned load_rt, uint32_t *body_len,
+                              uint64_t *backedge)
+{
+    uint64_t off = site_pc - seg_vaddr;
+    if (off + 8 > filesz)
+        return 0;
+    uint32_t w1 = a64_insn(code + off + 4);
+    /* 形态 B: load; cbz/cbnz rt → site */
+    if (a64_is_cbz(w1) || a64_is_cbnz(w1)) {
+        if ((w1 & 0x1FU) == load_rt &&
+            a64_branch_target(w1, site_pc + 4) == site_pc) {
+            *body_len = 2;
+            *backedge = site_pc + 4;
+            return 1;
+        }
+        return 0;
+    }
+    if (off + 12 > filesz)
+        return 0;
+    uint32_t w2 = a64_insn(code + off + 8);
+    /* 形态 A: load; cmp/tst rt; b.cond → site */
+    int is_cmp =
+        (w1 & 0xFFC0FC1FU) == 0xEB00001FU ||
+        (w1 & 0xFFC0FC1FU) == 0x6B00001FU ||
+        (w1 & 0xFF80001FU) == 0xF100001FU ||
+        (w1 & 0xFF80001FU) == 0x7100001FU ||
+        (w1 & 0xFFC0FC1FU) == 0xEA00001FU ||
+        (w1 & 0xFFC0FC1FU) == 0x6A00001FU ||
+        (w1 & 0xFF80001FU) == 0xF240001FU ||
+        (w1 & 0xFF80001FU) == 0x7200001FU;
+    if (!is_cmp || ((w1 >> 5) & 0x1FU) != load_rt)
+        return 0;
+    if (!(a64_is_bcond(w2) || a64_is_cbz(w2) || a64_is_cbnz(w2)))
+        return 0;
+    if (a64_branch_target(w2, site_pc + 8) != site_pc)
+        return 0;
+    *body_len = 3;
+    *backedge = site_pc + 8;
+    return 1;
 }
 
 /* strict 模式构建: 收集站点 → 生成跳板/站点块 → patch 指令 →
@@ -1748,16 +1800,57 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                         ab->runs[ab->run_off[st->ab_id]].value,
                         ab->runs[ab->run_off[st->ab_id]].addr);
                     } else {
-                        bl = a64_atomic_replay_block(
-                            page + o, taddr + o, runs_abs,
-                            ab->run_cnt[st->ab_id] +
-                                (ab->run_cnt[st->ab_id] ||
-                                 ab->synth_only[st->ab_id] ? 1 : 0),
-                            size, rt, rn, st->pc + 4,
-                            ab->sites[st->ab_id].to_ord -
-                                ab->sites[st->ab_id].from_ord,
-                            base + STUB_STRICT_BAIL_OFF, tel_abs,
-                            kind, adp);
+                        uint32_t spin_body = 0;
+                        uint64_t spin_backedge = 0;
+                        int use_burn =
+                            a64_find_spin_loop(segp, segs[gi].filesz,
+                                               st->pc, segs[gi].vaddr,
+                                               rt, &spin_body,
+                                               &spin_backedge);
+                        if (g_no_atomic_run_burn)
+                            use_burn = 0;
+                        if (use_burn) {
+                            /* 退出点在自旋循环内 (load 站点或回边):
+                               禁用 run-burn —— K 计数器在那里, 整 run
+                               烧录会绕过计数 */
+                            if (exit_override == st->pc ||
+                                exit_override == spin_backedge)
+                                use_burn = 0;
+                            for (size_t x = 0;
+                                 x < nsites && use_burn; x++)
+                                if (sites[x].pc == spin_backedge &&
+                                    sites[x].kind == 2)
+                                    use_burn = 0;
+                        }
+                        if (use_burn) {
+                            bl = a64_atomic_replay_burn_block(
+                                page + o, taddr + o, runs_abs,
+                                ab->run_cnt[st->ab_id] +
+                                    (ab->run_cnt[st->ab_id] ||
+                                     ab->synth_only[st->ab_id] ? 1 : 0),
+                                size, rt, rn, st->pc + 4,
+                                ab->sites[st->ab_id].to_ord -
+                                    ab->sites[st->ab_id].from_ord,
+                                base + STUB_STRICT_BAIL_OFF, tel_abs,
+                                kind, adp, spin_body);
+                            fprintf(stderr,
+                                    "atomic: run-burn spin site %#llx "
+                                    "body=%u -> %#llx\n",
+                                    (unsigned long long)st->pc,
+                                    spin_body,
+                                    (unsigned long long)(taddr + o));
+                        } else {
+                            bl = a64_atomic_replay_block(
+                                page + o, taddr + o, runs_abs,
+                                ab->run_cnt[st->ab_id] +
+                                    (ab->run_cnt[st->ab_id] ||
+                                     ab->synth_only[st->ab_id] ? 1 : 0),
+                                size, rt, rn, st->pc + 4,
+                                ab->sites[st->ab_id].to_ord -
+                                    ab->sites[st->ab_id].from_ord,
+                                base + STUB_STRICT_BAIL_OFF, tel_abs,
+                                kind, adp);
+                        }
                     }
                 }
                 if (!bl)
@@ -2568,6 +2661,8 @@ int build_main(int argc, char **argv)
                 strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--atomic-no-value-replay") == 0) {
             atomic_no_value_replay = 1;
+        } else if (strcmp(argv[i], "--no-atomic-run-burn") == 0) {
+            g_no_atomic_run_burn = 1;
         } else if (strcmp(argv[i], "--census-pages") == 0 &&
                    i + 1 < argc) {
             census_pages_path = argv[++i];

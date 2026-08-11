@@ -101,6 +101,20 @@ static uint32_t mul_x(unsigned rd, unsigned rn, unsigned rm)
     /* madd xd,xn,xm,xzr */
     return 0x9B007C00U | (rm << 16) | (rn << 5) | rd;
 }
+static uint32_t sub_xr(unsigned rd, unsigned rn, unsigned rm)
+{
+    /* sub xd, xn, xm (shifted register, shift=0) */
+    return 0xCB000000U | (rm << 16) | (rn << 5) | rd;
+}
+static uint32_t sub_x_imm(unsigned rd, unsigned rn, unsigned imm)
+{
+    return 0xD1000000U | ((imm & 0xfff) << 10) | (rn << 5) | rd;
+}
+static uint32_t cbnz_x(int32_t off, unsigned rt)
+{
+    /* cbnz xrt, #off (64 位计数器) */
+    return 0xB5000000U | (((uint32_t)(off / 4) & 0x7FFFF) << 5) | rt;
+}
 
 /* ---- 逐站点最小保存集 ----
  * 跳板只保存自己会破坏的寄存器: 基础 scratch 集 + 站点 Rt/Rn (保证
@@ -1388,6 +1402,282 @@ size_t a64_atomic_replay_block(uint8_t *out, uint64_t block_abs,
         v = exit_abs;           memcpy(out + REP_EXIT_ABS_OFF, &v, 8);
         v = 0;                  memcpy(out + REP_MISS_OFF, &v, 8);
         v = ret_addr - 4;       memcpy(out + REP_SITE_PC_OFF, &v, 8);
+    }
+
+    return A64_ATOM_BLOCK_SIZE;
+}
+
+/* ---- run-burn 整 run 烧录回放块 ----
+ * 适用: 精确自旋循环 (site load; cmp/tst rt; b.cond → site), body_len =
+ * 循环体指令数 (当前检测只接受 3)。一次入口消费整个 busy run + 值变化
+ * 访问, 内部按 guest 等长指令数烧录, 使切片动态指令数 ≈ 录制指令数,
+ * 避免逐访问值回放 ~10× 膨胀。
+ *
+ * 语义 (单入口, 与逐访问块共用 runs 表):
+ *   - 入口 ordinal 落在 run 中段 (o > run.start) 才烧录;
+ *   - iter_busy = next.start - o (有下一 run) 或 limit - o + 1 (末 run);
+ *   - 烧录 iter_busy × body_len 条 (busy 访问全部在跳板内复现);
+ *   - 有下一 run: ordinal = next.start + 1 (变化访问已消费), cursor+1,
+ *     返回下一 run 值; 程序 cmp+b.cond 执行一次, 与录制中变化访问的
+ *     走向一致 (b.cond 不跳 → 循环退出; 跳 → 下一 run 从 next.start+1
+ *     继续消费);
+ *   - 末 run: 烧到 load_limit 后 limit_exit (reason=1, 窗口结束在自旋);
+ *   - o == run.start (run 首访问): 逐访问路径 —— 该访问可能是值变化后
+ *     的首次访问, 程序可能据此退出, 不能整 run 烧录;
+ *   - 地址失配/run 未覆盖 → 真实读回退 + miss 计数。
+ * 每 run 边界固定开销 ~50 条, 长自旋 run 下指令倍率 → 1。
+ */
+#define BURN_BODY_LEN_OFF 0x240
+
+size_t a64_atomic_replay_burn_block(uint8_t *out, uint64_t block_abs,
+                                    uint64_t runs_abs, uint64_t n_runs,
+                                    int size, unsigned rt, unsigned rn,
+                                    uint64_t ret_addr,
+                                    uint64_t load_limit, uint64_t exit_abs,
+                                    uint64_t tel_abs,
+                                    int kind,
+                                    const struct a64_ld_addr *ad,
+                                    uint32_t body_len)
+{
+    uint8_t *p = out;
+    unsigned base_rep[] = {16, 17, 18, 19, 20, 21, 22, 23,
+                           24, 25, 26, 27, 28, 29};
+    struct save_plan pl;
+    plan_save(&pl, base_rep, sizeof(base_rep) / sizeof(base_rep[0]),
+              rt, rn, ad ? (ad->mode == 1 ? ad->rm : 31) : 31);
+    int rt_off = pl.off[rt];
+    if (rt_off < 0 || rt == 31 || body_len < 2 || !exit_abs)
+        return 0;
+
+    memset(out, 0, A64_ATOM_BLOCK_SIZE);
+
+    /* 入口 (5 指令 + 8B 字面量 = 0x1C 字节) */
+    put32(&p, 0xA9BF47F0U);     /* stp x16,x17,[sp,#-16]! */
+    put32(&p, INSN_NOP);
+    put32(&p, ldr_lit(16, 8));
+    put32(&p, INSN_BR_X16);
+    put64(&p, block_abs + 0x18);
+    put32(&p, 0xD1006210U);     /* sub x16, x16, #0x18 */
+    emit_plan_save(&p, &pl);
+
+    /* 序号 = ++ordinal (x19) */
+    put32(&p, ldr_x16_imm(19, REP_ORD_OFF));
+    put32(&p, add_x(19, 19, 1));
+    put32(&p, str_x16_imm(19, REP_ORD_OFF));
+    uint8_t *lim_b = NULL;
+    put32(&p, ldr_x16_imm(17, REP_LOAD_LIMIT_OFF));
+    put32(&p, cmp_x(19, 17));
+    lim_b = p;
+    put32(&p, bcond(0, 8));     /* b.hi limit_exit (占位) */
+
+    /* 游标推进 (与逐访问块同逻辑): 光标指到 start <= ordinal 的 run */
+    put32(&p, ldr_x16_imm(20, REP_CURSOR_OFF));
+    put32(&p, ldr_x16_imm(21, REP_NRUNS_OFF));
+    put32(&p, ldr_x16_imm(22, REP_RUNS_ABS_OFF));
+    uint8_t *loop_top = p;
+    put32(&p, add_x(23, 20, 1));
+    put32(&p, cmp_x(23, 21));
+    uint8_t *hs_b = p;
+    put32(&p, bcond(0, 2));     /* b.hs have (占位) */
+    put32(&p, movz_x(24, 24, 0));
+    put32(&p, mul_x(24, 23, 24));
+    put32(&p, add_xr(24, 24, 22));
+    put32(&p, ldr_x_imm(24, 25, 0));    /* next.start */
+    put32(&p, cmp_x(25, 19));
+    uint8_t *hi_b = p;
+    put32(&p, bcond(0, 8));     /* b.hi have (占位) */
+    put32(&p, mov_x(20, 23));
+    put32(&p, bcond((int32_t)(loop_top - p), 14));  /* b.al loop */
+    uint8_t *have = p;
+    put32(&p, str_x16_imm(20, REP_CURSOR_OFF));
+    put32(&p, movz_x(24, 24, 0));
+    put32(&p, mul_x(24, 20, 24));
+    put32(&p, add_xr(24, 24, 22));
+    put32(&p, ldr_x_imm(24, 25, 0));    /* run.start */
+    put32(&p, cmp_x(25, 19));
+    uint8_t *lo_b = p;
+    put32(&p, bcond(0, 8));     /* b.hi use_real (占位) */
+
+    /* 有效地址 → x27 */
+    if (rn == 31)
+        put32(&p, add_x(27, 31, (unsigned)pl.save_size));
+    else
+        put32(&p, ldr_x_imm(31, 27, (unsigned)pl.off[rn]));
+    if (ad && ad->mode == 0) {
+        if (ad->imm != 0)
+            put32(&p, add_x(27, 27, (unsigned)ad->imm));
+    } else if (ad && ad->mode == 1) {
+        if (ad->rm < 31)
+            put32(&p, ldr_x_imm(31, 28, (unsigned)pl.off[ad->rm]));
+        else
+            put32(&p, movz_x(28, 0, 0));
+        put32(&p, add_xr_lsl(27, 27, 28, (unsigned)ad->shift));
+    }
+    /* 地址校验: 失配 = 对象身份分歧信号, 回退真实读 */
+    put32(&p, ldr_x_imm(24, 28, 8));    /* run.addr */
+    put32(&p, cmp_x(27, 28));
+    uint8_t *ne_b = p;
+    put32(&p, bcond(0, 1));     /* b.ne use_real (占位) */
+    /* run 首访问 (ordinal == run.start): 逐访问路径 */
+    put32(&p, cmp_x(25, 19));
+    uint8_t *eq_b = p;
+    put32(&p, bcond(0, 0));     /* b.eq per_access (占位) */
+
+    /* ---- 烧录路径: 有下一 run ---- */
+    put32(&p, add_x(23, 20, 1));
+    put32(&p, cmp_x(23, 21));
+    uint8_t *last_b = p;
+    put32(&p, bcond(0, 8));     /* b.hs burn_last (占位) */
+    put32(&p, movz_x(24, 24, 0));
+    put32(&p, mul_x(24, 23, 24));
+    put32(&p, add_xr(24, 24, 22));
+    put32(&p, ldr_x_imm(24, 25, 0));    /* next.start */
+    /* 下一 run 地址必须与本次一致 (单 load 循环地址不变; 失配安全回退) */
+    put32(&p, ldr_x_imm(24, 28, 8));    /* next.addr */
+    put32(&p, cmp_x(27, 28));
+    uint8_t *na_b = p;
+    put32(&p, bcond(0, 1));     /* b.ne per_access (占位) */
+    /* 下一 run 起点越过窗口预算 (合成末 run) → 按末 run 烧到 limit */
+    put32(&p, ldr_x16_imm(17, REP_LOAD_LIMIT_OFF));
+    put32(&p, add_x(28, 17, 1));
+    put32(&p, cmp_x(25, 28));
+    uint8_t *cap_b = p;
+    put32(&p, bcond(0, 8));     /* b.hi burn_last (占位) */
+    put32(&p, sub_xr(26, 25, 19));      /* iter_busy = next.start - o */
+    uint8_t *burn_loop = p;
+    for (uint32_t i = 0; i + 2 < body_len; i++)
+        put32(&p, INSN_NOP);
+    put32(&p, sub_x_imm(26, 26, 1));
+    put32(&p, cbnz_x((int32_t)(burn_loop - p), 26));
+    /* 变化访问已消费: ordinal = next.start + 1, cursor+1, 值=下一 run */
+    put32(&p, add_x(19, 25, 1));
+    put32(&p, str_x16_imm(19, REP_ORD_OFF));
+    put32(&p, add_x(20, 20, 1));
+    put32(&p, str_x16_imm(20, REP_CURSOR_OFF));
+    put32(&p, movz_x(24, 24, 0));
+    put32(&p, mul_x(24, 20, 24));
+    put32(&p, add_xr(24, 24, 22));
+    put32(&p, ldr_x_imm(24, 23, 16));   /* 下一 run.value */
+    /* 真实屏障 load (acquire/排他监视器语义) */
+    put32(&p, ad ? a64_ldval_insn(ad->ldr_kind, size, 27, 29)
+                 : kind == 1 ? a64_ldaxr_insn(size, 27, 29)
+                             : kind == 2 ? a64_ldr_insn(size, 27, 29)
+                                         : a64_ldar_insn(size, 27, 29));
+    uint8_t *set_jmp = p;
+    put32(&p, 0x14000000U);     /* b set (占位) */
+
+    /* ---- 末 run 烧录: 烧到 load_limit 后 limit_exit ---- */
+    uint8_t *burn_last = p;
+    put32(&p, ldr_x16_imm(17, REP_LOAD_LIMIT_OFF));
+    put32(&p, sub_xr(26, 17, 19));
+    put32(&p, add_x(26, 26, 1));        /* accesses = limit - o + 1 */
+    uint8_t *burn_loop_last = p;
+    for (uint32_t i = 0; i + 2 < body_len; i++)
+        put32(&p, INSN_NOP);
+    put32(&p, sub_x_imm(26, 26, 1));
+    put32(&p, cbnz_x((int32_t)(burn_loop_last - p), 26));
+    put32(&p, add_x(19, 17, 1));
+    put32(&p, str_x16_imm(19, REP_ORD_OFF));
+    uint8_t *last_exit_jmp = p;
+    put32(&p, 0x14000000U);     /* b limit_exit (占位) */
+
+    /* ---- 逐访问路径 (run 首访问) ---- */
+    uint8_t *per_access = p;
+    put32(&p, ad ? a64_ldval_insn(ad->ldr_kind, size, 27, 29)
+                 : kind == 1 ? a64_ldaxr_insn(size, 27, 29)
+                             : kind == 2 ? a64_ldr_insn(size, 27, 29)
+                                         : a64_ldar_insn(size, 27, 29));
+    put32(&p, ldr_x_imm(24, 23, 16));   /* run.value */
+    uint8_t *set_jmp2 = p;
+    put32(&p, 0x14000000U);     /* b set (占位) */
+
+    /* ---- 真实读回退 ---- */
+    uint8_t *use_real = p;
+    put32(&p, ldr_x16_imm(18, REP_MISS_OFF));
+    put32(&p, add_x(18, 18, 1));
+    put32(&p, str_x16_imm(18, REP_MISS_OFF));
+    if (rn == 31)
+        put32(&p, add_x(27, 31, (unsigned)pl.save_size));
+    else
+        put32(&p, ldr_x_imm(31, 27, (unsigned)pl.off[rn]));
+    if (ad && ad->mode == 0) {
+        if (ad->imm != 0)
+            put32(&p, add_x(27, 27, (unsigned)ad->imm));
+    } else if (ad && ad->mode == 1) {
+        if (ad->rm < 31)
+            put32(&p, ldr_x_imm(31, 28, (unsigned)pl.off[ad->rm]));
+        else
+            put32(&p, movz_x(28, 0, 0));
+        put32(&p, add_xr_lsl(27, 27, 28, (unsigned)ad->shift));
+    }
+    put32(&p, ad ? a64_ldval_insn(ad->ldr_kind, size, 27, 29)
+                 : kind == 1 ? a64_ldaxr_insn(size, 27, 29)
+                             : kind == 2 ? a64_ldr_insn(size, 27, 29)
+                                         : a64_ldar_insn(size, 27, 29));
+    put32(&p, mov_x(23, 29));
+
+    /* ---- set: 写 Rt 保存槽, 恢复, 返回 ---- */
+    uint8_t *set = p;
+    put32(&p, str_x_imm(31, 23, (unsigned)rt_off));
+    emit_plan_restore(&p, &pl);
+    uint64_t b_off = (uint64_t)(p - out);
+    put32(&p, a64_encode_b(block_abs + b_off, ret_addr));
+
+    /* ---- limit_exit (reason=1: ordinal 预算) ---- */
+    uint8_t *limit_exit = p;
+    put32(&p, movz_x(22, 1, 0));
+    if (tel_abs) {
+        emit_replay_tel(&p, tel_abs, REP_SITE_PC_OFF);
+    } else {
+        put32(&p, ldr_x16_imm(16, REP_EXIT_ABS_OFF));
+        put32(&p, INSN_BR_X16);
+    }
+
+    /* 回填 */
+    {
+        int32_t d1 = (int32_t)(have - hs_b);
+        int32_t d2 = (int32_t)(have - hi_b);
+        int32_t d3 = (int32_t)(use_real - lo_b);
+        int32_t d4 = (int32_t)(use_real - ne_b);
+        int32_t d5 = (int32_t)(per_access - eq_b);
+        int32_t d6 = (int32_t)(burn_last - last_b);
+        int32_t d7 = (int32_t)(burn_last - cap_b);
+        int32_t d8 = (int32_t)(per_access - na_b);
+        uint32_t w7 = a64_encode_b(block_abs + (uint64_t)(set_jmp - out),
+                                   block_abs + (uint64_t)(set - out));
+        uint32_t w8 = a64_encode_b(block_abs + (uint64_t)(set_jmp2 - out),
+                                   block_abs + (uint64_t)(set - out));
+        uint32_t w;
+        w = bcond(d1, 2);   memcpy(hs_b, &w, 4);
+        w = bcond(d2, 8);   memcpy(hi_b, &w, 4);
+        w = bcond(d3, 8);   memcpy(lo_b, &w, 4);
+        w = bcond(d4, 1);   memcpy(ne_b, &w, 4);
+        w = bcond(d5, 0);   memcpy(eq_b, &w, 4);
+        w = bcond(d6, 8);   memcpy(last_b, &w, 4);
+        w = bcond(d7, 8);   memcpy(cap_b, &w, 4);
+        w = bcond(d8, 1);   memcpy(na_b, &w, 4);
+        memcpy(set_jmp, &w7, 4);
+        memcpy(set_jmp2, &w8, 4);
+        {
+            uint32_t w9 = a64_encode_b(
+                block_abs + (uint64_t)(last_exit_jmp - out),
+                block_abs + (uint64_t)(limit_exit - out));
+            memcpy(last_exit_jmp, &w9, 4);
+            uint32_t w6 = bcond((int32_t)(limit_exit - lim_b), 8);
+            memcpy(lim_b, &w6, 4);
+        }
+    }
+
+    {
+        uint64_t v = 0;         memcpy(out + REP_ORD_OFF, &v, 8);
+        v = 0;                  memcpy(out + REP_CURSOR_OFF, &v, 8);
+        v = runs_abs;           memcpy(out + REP_RUNS_ABS_OFF, &v, 8);
+        v = n_runs;             memcpy(out + REP_NRUNS_OFF, &v, 8);
+        v = load_limit;         memcpy(out + REP_LOAD_LIMIT_OFF, &v, 8);
+        v = exit_abs;           memcpy(out + REP_EXIT_ABS_OFF, &v, 8);
+        v = 0;                  memcpy(out + REP_MISS_OFF, &v, 8);
+        v = ret_addr - 4;       memcpy(out + REP_SITE_PC_OFF, &v, 8);
+        v = body_len;           memcpy(out + BURN_BODY_LEN_OFF, &v, 8);
     }
 
     return A64_ATOM_BLOCK_SIZE;
