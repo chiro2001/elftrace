@@ -1320,6 +1320,67 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
         }
     }
 
+    /* 2.5 常量 ldar/ldaxr 自旋站点 + 融合退出: 无窗口事件 (值不变,
+       RLE 无事件) 时合成首段, 使 burn 块能按 from_val 烧录并在
+       ordinal 预算处干净退出。仅当退出点融合到该自旋 (站点/回边,
+       含跳板页归一化) 时启用 —— 否则保持不 patch, 靠真实读+syscall
+       diff 让自旋自然退出。 */
+#if defined(__aarch64__)
+    if (ab && ab->have && exit_override && ab->n_sites) {
+        if (!ab->run_off || !ab->runs)
+            goto synth_done;
+        for (size_t i = 0; i < ab->n_sites; i++) {
+            if (ab->run_cnt[i] || ab->synth_only[i])
+                continue;
+            if (ab->sites[i].kind == 4 ||
+                (ab->sites[i].kind != 0 && ab->sites[i].kind != 1))
+                continue;
+            if (ab->sites[i].to_ord <= ab->sites[i].from_ord ||
+                !ab->sites[i].from_addr)
+                continue;
+            int sseg = -1;
+            for (size_t k2 = 0; k2 < nsegs; k2++)
+                if (ab->sites[i].pc >= segs[k2].vaddr &&
+                    ab->sites[i].pc <
+                        segs[k2].vaddr + segs[k2].filesz) {
+                    sseg = (int)k2;
+                    break;
+                }
+            if (sseg < 0)
+                continue;
+            const uint8_t *basep = blob->data + payload_off +
+                                   segs[sseg].payload_off;
+            int size2;
+            unsigned rt2, rn2;
+            int kind2;
+            struct a64_ld_addr ad2;
+            uint32_t sb;
+            uint64_t sbe;
+            int ok = 0;
+            if (a64_is_load_any(ab->sites[i].orig_insn, &size2,
+                                &rt2, &rn2, &kind2))
+                ok = a64_find_spin_loop(
+                    basep, segs[sseg].filesz, ab->sites[i].pc,
+                    segs[sseg].vaddr, rt2, &sb, &sbe);
+            if (!ok)
+                continue;
+            if (exit_override != ab->sites[i].pc &&
+                exit_override != sbe)
+                continue;
+            ab->runs[ab->run_off[i]].start = 1;
+            ab->runs[ab->run_off[i]].addr = ab->sites[i].from_addr;
+            ab->runs[ab->run_off[i]].value = ab->sites[i].from_val;
+            ab->synth_only[i] = 1;
+            fprintf(stderr,
+                    "atomic: fused constant-ldar spin %#llx synth run "
+                    "(val %#llx)\n",
+                    (unsigned long long)ab->sites[i].pc,
+                    (unsigned long long)ab->sites[i].from_val);
+        }
+    }
+synth_done:
+#endif
+
     /* 2.6 原子回放站点 (trace --atomic-replay):
        - 所有 ldar 站点恢复原始指令 (快照里是记录跳板分支);
        - 窗口内有事件的站点建回放跳板 (kind 4), 无事件的不 patch
