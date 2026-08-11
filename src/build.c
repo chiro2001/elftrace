@@ -1173,8 +1173,32 @@ static int build_strict_aarch64(const struct snap *s, struct buf *blob,
                  scanned);
     }
 
-    /* 2. 退出点: 唯一路径埋 exit; 循环内 patch 回边 */
-    if (exit_override) {
+    /* 2. 退出点: 唯一路径埋 exit; 循环内 patch 回边。
+       alloc 融合退出: 窗口内有分配事件时, 由最后一个分配事件的重放块
+       在 cursor==total 处直接跳 strict exit (rc=0), 不再 patch TO
+       检查点 PC 的退出点 —— 否则计数/首访退出会先触发 (游标未消费完),
+       且 40M 单间隔窗口的"repeated"启发会让循环内退出点首访即退。 */
+    int alloc_fused_exit = 0;
+    if (g_alloc_build.have && g_alloc_build.n_ck && exit_override) {
+        uint64_t ac_to = 0, ac_from = 0;
+        if (to_ckpt >= 0 && (size_t)to_ckpt <= g_alloc_build.n_ck)
+            ac_to = g_alloc_build.ck_counts[to_ckpt - 1];
+        else
+            ac_to = g_alloc_build.ck_counts[g_alloc_build.n_ck - 1];
+        if (from_ckpt > 0 && (size_t)from_ckpt <= g_alloc_build.n_ck)
+            ac_from = g_alloc_build.ck_counts[from_ckpt - 1];
+        if (ac_to > g_alloc_build.n_events)
+            ac_to = g_alloc_build.n_events;
+        if (ac_from > ac_to)
+            ac_from = ac_to;
+        alloc_fused_exit = (ac_to - ac_from) > 0;
+        if (alloc_fused_exit)
+            fprintf(stderr, "strict: alloc fused exit (events %llu..%llu, "
+                    "total %llu); TO checkpoint exit site skipped\n",
+                    (unsigned long long)ac_from, (unsigned long long)ac_to,
+                    (unsigned long long)(ac_to - ac_from));
+    }
+    if (exit_override && !alloc_fused_exit) {
         int seg_idx = -1;
         for (size_t i = 0; i < nsegs; i++) {
             if (exit_override >= segs[i].vaddr &&
@@ -2494,7 +2518,8 @@ synth_done:
                 size_t bl = alloc_replay_block(
                     page + o, taddr + o, cursor_abs, total_abs,
                     events_abs, (uint32_t)g_alloc_build.kinds[f],
-                    tel_abs, base + STUB_STRICT_BAIL_OFF, pc);
+                    tel_abs, base + STUB_STRICT_BAIL_OFF, pc,
+                    base + STUB_STRICT_EXIT_OFF);
                 if (!bl)
                     die("alloc: replay block gen failed for %#llx", pc);
                 uint32_t bw = a64_patch_b(pc, taddr + o);

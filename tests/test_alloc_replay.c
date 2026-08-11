@@ -18,6 +18,7 @@
 #define DATA_ABS  0x40020000ULL
 #define FAKE_ABS  0x40030000ULL
 #define BAIL_ABS  0x40040000ULL
+#define EXIT_ABS  0x40050000ULL
 
 static void *map_fixed(uint64_t addr, size_t len)
 {
@@ -85,11 +86,32 @@ int main(int argc, char **argv)
     uint8_t *data = map_fixed(DATA_ABS, 0x1000);
     uint8_t *fake = map_fixed(FAKE_ABS, 0x1000);
     uint8_t *bailp = map_fixed(BAIL_ABS, 0x1000);
-    if (!blk || !ev || !data || !fake || !bailp) {
+    uint8_t *exitp = map_fixed(EXIT_ABS, 0x1000);
+    if (!blk || !ev || !data || !fake || !bailp || !exitp) {
         printf("FAIL: mmap\n");
         return 1;
     }
     emit_bail_stub(bailp);
+    /* exit 桩: 校验 cursor==3 → exit_group(77), 否则 78 */
+    {
+        uint32_t w = 0x58000102U;   /* ldr x2,[pc,#32] → index 8 */
+        memcpy(exitp, &w, 4);
+        w = 0xF9400043U;            /* ldr x3,[x2] (cursor) */
+        memcpy(exitp + 4, &w, 4);
+        w = 0xD2800064U;            /* mov x4,#3 */
+        memcpy(exitp + 8, &w, 4);
+        w = 0xEB04007FU;            /* cmp x3,x4 */
+        memcpy(exitp + 12, &w, 4);
+        w = 0x9A9F07E0U;            /* cset x0, ne (eq→0) */
+        memcpy(exitp + 16, &w, 4);
+        w = 0x11013400U;            /* add w0,w0,#77 (eq→77, ne→78) */
+        memcpy(exitp + 20, &w, 4);
+        w = 0xD2800BA8U;            /* mov x8,#93 */
+        memcpy(exitp + 24, &w, 4);
+        w = 0xD4000001U;            /* svc #0 */
+        memcpy(exitp + 28, &w, 4);
+        memcpy(exitp + 32, &(uint64_t){DATA_ABS + 0x00}, 8);
+    }
 
     uint64_t n = 0;
     uint32_t kind = 0;
@@ -109,9 +131,12 @@ int main(int argc, char **argv)
     memcpy((void *)(uintptr_t)cursor_addr, &cursor, 8);
     memcpy((void *)(uintptr_t)total_addr, &total, 8);
 
+    uint64_t exit_abs = 0;
+    if (strcmp(mode, "fuse") == 0)
+        exit_abs = EXIT_ABS;
     size_t sz = alloc_replay_block(blk, BLK_ABS, cursor_addr, total_addr,
                                    EV_ABS, kind, tel_abs, BAIL_ABS,
-                                   FAKE_ABS);
+                                   FAKE_ABS, exit_abs);
     if (sz != 0x280) {
         printf("FAIL: block size %zu\n", sz);
         return 1;
@@ -133,6 +158,10 @@ int main(int argc, char **argv)
     } else if (strcmp(mode, "mismatch") == 0) {
         call_fake(1);           /* → exit(11) */
         rc = 91;
+    } else if (strcmp(mode, "fuse") == 0) {
+        for (uint64_t i = 0; i < n; i++)
+            call_fake(i + 1);   /* 第 3 次消费后 → exit(77/78) */
+        rc = 92;                /* 未融合退出: 失败 */
     } else {
         uint64_t exp[3] = {0x4000, 0x4111, 0x4222};
         for (uint64_t i = 0; i < n; i++) {

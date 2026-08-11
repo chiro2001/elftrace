@@ -43,7 +43,7 @@ size_t alloc_replay_block(uint8_t *out, uint64_t block_abs,
                           uint64_t cursor_addr, uint64_t total_addr,
                           uint64_t events_abs, uint32_t kind,
                           uint64_t tel_abs, uint64_t bail_abs,
-                          uint64_t site_pc)
+                          uint64_t site_pc, uint64_t exit_abs)
 {
     uint8_t *p = out;
     memset(out, 0, 0x280);
@@ -99,6 +99,19 @@ size_t alloc_replay_block(uint8_t *out, uint64_t block_abs,
     memcpy(p, &w, 4); p += 4;              /* cursor++ */
     w = b_str(18, 17, 0);
     memcpy(p, &w, 4); p += 4;              /* [cursor]=cursor */
+    /* 融合退出: cursor==total (窗口最后一个分配事件消费完) →
+       br exit_abs; 不返回调用者, 切片在最后一个分配调用处干净结束。
+       exit_abs==0 时禁用 (逐事件返回, 靠 TO 站点/循环计数退出)。 */
+    w = b_ldr(20, 16, 0x238);
+    memcpy(p, &w, 4); p += 4;              /* exit_abs */
+    w = 0xB4000094U;
+    memcpy(p, &w, 4); p += 4;              /* cbz x20, +16 (跳过 3 条) */
+    w = 0xEB13025FU;
+    memcpy(p, &w, 4); p += 4;              /* cmp x18,x19 */
+    w = 0x54000041U;
+    memcpy(p, &w, 4); p += 4;              /* b.ne +8 (跳过 br) */
+    w = 0xD61F0280U;
+    memcpy(p, &w, 4); p += 4;              /* br x20 */
     w = 0xA8C17FF7U;
     memcpy(p, &w, 4); p += 4;              /* ldp x23,xzr,[sp],#16 */
     w = 0xA8C15BF5U;
@@ -159,5 +172,6 @@ size_t alloc_replay_block(uint8_t *out, uint64_t block_abs,
     v = tel_abs;     memcpy(out + 0x220, &v, 8);
     v = site_pc;     memcpy(out + 0x228, &v, 8);
     v = bail_abs;    memcpy(out + 0x230, &v, 8);
+    v = exit_abs;    memcpy(out + 0x238, &v, 8);
     return 0x280;
 }

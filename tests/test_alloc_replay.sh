@@ -27,6 +27,13 @@ if ! "${RUN[@]}" "$TF_TMP/test_alloc_replay" ok; then
     exit 1
 fi
 
+"${RUN[@]}" "$TF_TMP/test_alloc_replay" fuse
+rc=$?
+if [ "$rc" -ne 77 ]; then
+    echo "FAIL: alloc replay fused exit (expected 77, got $rc)"
+    exit 1
+fi
+
 "${RUN[@]}" "$TF_TMP/test_alloc_replay" overrun
 rc=$?
 if [ "$rc" -ne 9 ]; then
@@ -41,5 +48,5 @@ if [ "$rc" -ne 11 ]; then
     exit 1
 fi
 
-tf_pass "alloc replay (3 events ok, overrun=9, mismatch=11)"
+tf_pass "alloc replay (3 events ok, fused=77, overrun=9, mismatch=11)"
 tf_finish
