@@ -42,12 +42,12 @@ if [ "$DIFF_SIZE" -gt $((BASE_SIZE / 4)) ]; then
 fi
 echo "incremental: base=$BASE_SIZE diff=$DIFF_SIZE ($((DIFF_SIZE * 100 / BASE_SIZE))%)"
 
-# 2. manifest 采样点精度 (sanity): 相邻 count 差 ∈ [N/2, 3N]。
-#    检查点读取时机有过冲抖动 (计数越过边界后由 poll/兜底读到,
-#    过冲量随负载变化, 相邻两次过冲可能一增一减 → delta 可略低于
-#    N); 精确的名义步长不成立, 窗口长度一律以实际计数为准 (步骤 3
-#    的 EXP 用实际差, 才是真正的 5% 精度断言)。首间隔另含 perf
-#    enable → 初始 ptrace 停止的 pre-count, 一并跳过。
+# 2. manifest 采样点精度 (sanity): 相邻 count 差 ∈ [N/10, 5N]。
+#    检查点读取时机有过冲抖动, 且内核 perf 节流 (KVM/慢机中断
+#    延迟) 会临时禁用计数器 → delta 可远低于 N 或高于 3N。精确的
+#    名义步长不成立, 窗口长度一律以实际计数为准 (步骤 3 的 EXP
+#    用实际差, 才是真正的 5% 精度断言)。首间隔另含 perf enable →
+#    初始 ptrace 停止的 pre-count, 一并跳过。
 awk '{print $1}' "$CKPTS/manifest.txt" | python3 -c "
 import sys
 prev = None
@@ -60,11 +60,11 @@ for line in sys.stdin:
             first = False
             prev = c
             continue
-        if d < $N / 2 or d > 3 * $N:
+        if d < $N / 10 or d > 5 * $N:
             print('FAIL: count jump %d -> %d (delta %d)' % (prev, c, d))
             sys.exit(1)
     prev = c
-print('manifest counts sane (step %d, actual deltas %d..%d)' % ($N, $N / 2, 3 * $N))
+print('manifest counts sane (step %d, actual deltas %d..%d)' % ($N, $N / 10, 5 * $N))
 " || exit 1
 
 # 3. 每组区间: 内部 + 外部指令数验证
