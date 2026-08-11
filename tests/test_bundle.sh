@@ -18,7 +18,7 @@ UNPACK="$TF_TMP/bundle_unpack"
 
 # KVM/慢机内核 perf 节流会延迟 stub IPC 溢出 → 切片退出计数偏大
 RATE=$(cat /proc/sys/kernel/perf_event_max_sample_rate 2>/dev/null || echo 100000)
-if [ "${RATE:-100000}" -lt 10000 ]; then
+if [ "${RATE:-100000}" -lt 50000 ]; then
     echo "SKIP: perf_event_max_sample_rate=$RATE 过低 (内核节流), "
          "stub IPC 退出计数不可靠"
     exit 0

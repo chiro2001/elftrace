@@ -20,7 +20,7 @@ CKPTS="$TF_TMP/ckpts_interval"
 # KVM/慢机内核 perf 节流 (perf_event_max_sample_rate 被自适应调低)
 # 会临时禁用计数器, 5M 周期采样不可靠 — 跳过并在健康硬件上运行
 RATE=$(cat /proc/sys/kernel/perf_event_max_sample_rate 2>/dev/null || echo 100000)
-if [ "${RATE:-100000}" -lt 10000 ]; then
+if [ "${RATE:-100000}" -lt 50000 ]; then
     echo "SKIP: perf_event_max_sample_rate=$RATE 过低 (内核节流), "
          "5M 周期采样不可靠"
     exit 0

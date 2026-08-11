@@ -13,7 +13,8 @@ int main(int argc, char **argv)
 {
     int rounds = argc > 1 ? atoi(argv[1]) : 300;
     const char *path = argc > 2 ? argv[2] : "/tmp/elftrace_sqlite.db";
-    remove(path);
+    if (strcmp(path, ":memory:") != 0)
+        remove(path);
 
     sqlite3 *db = NULL;
     char *err = NULL;
